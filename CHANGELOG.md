@@ -5,6 +5,35 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### Added
+
+- Packet `muse-02` foundations.
+  - Runtime deps: `litellm` (the routing/metering engine muse embeds as a
+    library), `cryptography` (AES-256-GCM for the vault), `tenacity` (per-candidate
+    retry backoff), `psycopg` + `psycopg-pool` (postgres), `pyyaml`
+    (`config/routes.yaml`). Each is justified in `README.md`.
+  - `muse/errors.py` — the error taxonomy. Subclasses of `ProviderError` split on
+    one question: would the identical call plausibly succeed a moment later?
+    `RETRYABLE_PROVIDER_ERRORS` is the list the router retries on, so an unlisted
+    error ends the request on the first candidate.
+  - `muse/redaction.py` — `Secret` (a `str` whose `repr`/`str`/`__format__` are
+    the redaction marker, with a constant-time `__eq__`) and `redact()`, which
+    scrubs a credential out of provider-supplied text before it becomes a log line
+    or a `problem+json` body.
+  - `muse/contracts.py` — core's `eventType`, `serviceName` and `subject`
+    patterns, with validators. The patterns are a copy of
+    `core/schemas/event-envelope.schema.json`; `tests/test_contracts.py` asserts
+    the copy is byte-identical whenever `MUSE_CORE_SCHEMAS` points at a core
+    checkout.
+  - `muse/db.py` — the `Database` protocol (execute / fetchone / transaction) and
+    `PsycopgDatabase` over a *pool*, so a transaction is an isolated handle rather
+    than shared state.
+  - `migrations/00001_outbox_events.sql` — core's outbox table, column for column,
+    with core's own patterns as CHECK constraints and the partial index the
+    publisher's claim query needs.
+  - `migrations/00002_vault_secrets.sql` — one encrypted key per provider. No
+    plaintext column, by design.
+
 ## [0.1.0] — 2026-09-30
 
 Initial scaffold (packet `muse-01`). No LLM logic yet — see `AGENTS.md`.
