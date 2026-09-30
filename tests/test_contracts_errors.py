@@ -38,6 +38,7 @@ from muse.vault import Vault, load_vault_key
 
 from .conftest import AUTH_HEADERS, asgi_client, write_routes
 from .support.fake_database import FakeDatabase
+from .support.test_app import auth_for
 
 pytestmark = [pytest.mark.anyio, pytest.mark.unit]
 
@@ -81,6 +82,7 @@ def app_that_raises(error: Exception):
         vault=Vault(database, load_vault_key({"MUSE_VAULT_KEY": KEY})),
         meter=Meter(database),
         credentials=StaticCredentials({}),
+        auth=auth_for(),
     )
     return create_app(container=container)
 
@@ -285,6 +287,7 @@ async def test_a_supplied_container_survives_the_lifespan_untouched(tmp_path, mo
         vault=Vault(database, load_vault_key({"MUSE_VAULT_KEY": KEY})),
         meter=Meter(database),
         credentials=StaticCredentials({}),
+        auth=auth_for(),
     )
     app = create_app(container=supplied)
     async with app.router.lifespan_context(app):

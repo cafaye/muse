@@ -23,7 +23,7 @@ from muse.vault import Vault
 
 from .conftest import asgi_client
 from .support.fake_database import FakeDatabase
-from .support.test_app import TEST_KEY
+from .support.test_app import TEST_KEY, auth_for
 
 pytestmark = [pytest.mark.anyio, pytest.mark.unit]
 
@@ -51,6 +51,7 @@ def container_for(database: FakeDatabase) -> Container:
         vault=Vault(database, TEST_KEY),
         meter=Meter(database),
         credentials=StaticCredentials({}),
+        auth=auth_for(),
     )
 
 

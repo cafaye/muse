@@ -51,16 +51,19 @@ from pathlib import Path
 
 from muse.errors import (
     AllCandidatesFailed,
+    AuthError,
     CircuitOpen,
     ConfigError,
     ContentPolicyError,
     ContractError,
     CredentialUnavailable,
+    InsufficientScope,
     InvalidErrorType,
     InvalidEventType,
     InvalidServiceName,
     InvalidSubject,
     MeteringError,
+    MissingAccount,
     MuseError,
     PriceUnavailable,
     ProviderAuthError,
@@ -73,6 +76,8 @@ from muse.errors import (
     ResponseShapeError,
     RouteConfigError,
     RouteNotFound,
+    SigningKeysUnavailable,
+    Unauthenticated,
     UnclassifiedError,
     VaultConfigError,
     VaultDecryptError,
@@ -205,6 +210,33 @@ _TABLE: dict[type[BaseException], str] = {
     # signal rather than an incident, which is what `policy_denied` is for. `internal_error`
     # was the alternative and it would page on a missing price-table row.
     PriceUnavailable: "policy_denied",
+    # --- the caller's credential (packet muse-06) ---------------------------------
+    # The base means "we refused a credential", and every subclass below is a more
+    # specific version of that. `policy_denied` for all three because core's definition
+    # is exactly this: "a rule cafaye itself owns refused the operation — authorization".
+    #
+    # A rate of these is a business signal (a mis-scoped integration, a credential
+    # somebody is guessing at) and not an incident, which is precisely why they are not
+    # `internal_error`: an auth failure rate on the incident dashboard would train
+    # everyone to ignore that page.
+    AuthError: "policy_denied",
+    # The token is absent, forged, expired, or otherwise not usable. A caller-side
+    # correction: get a fresh credential.
+    Unauthenticated: "policy_denied",
+    # The token is *good* and lacks the capability this operation needs. Separated from
+    # `Unauthenticated` because the responder differs: this one is fixed by asking for a
+    # scope, not by re-authenticating.
+    InsufficientScope: "policy_denied",
+    # A verified token with no tenant. Deliberately NOT `invalid_request` and not
+    # `internal_error`: the request is well-formed and muse is not broken, so the class
+    # that would say either is wrong, and `policy_denied` says what actually happened —
+    # a cafaye-owned rule (core's `account_id` requirement) refused the operation.
+    MissingAccount: "policy_denied",
+    # identity's key set could not be fetched. The one auth failure that is NOT the
+    # caller's fault and NOT an authorization decision, so it gets the class that means
+    # "a dependency is broken": muse is up, identity is not. Reporting this as
+    # `policy_denied` would put an outage on the same dashboard as a fraud signal.
+    SigningKeysUnavailable: "dependency_unavailable",
     # --- the whole route --------------------------------------------------------------
     # No credential is stored for this provider. Ours to fix, never the caller's.
     CredentialUnavailable: "internal_error",

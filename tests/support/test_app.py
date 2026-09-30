@@ -12,7 +12,11 @@ the *real* meter, with no socket (AGENTS.md rule 3) and no provider.
 
 from __future__ import annotations
 
+import time
+
+from muse.auth import TokenVerifier
 from muse.breaker import BreakerRegistry
+from muse.jwks import JwksClient
 from muse.main import Container, Settings, create_app
 from muse.metering import Meter
 from muse.providers import ProviderRegistry
@@ -24,11 +28,36 @@ from muse.telemetry import Telemetry
 from muse.vault import Vault, load_vault_key
 
 from .fake_database import FakeDatabase
+from .jwks import AUDIENCE, ISSUER, Identity
 
 #: A valid vault key for tests. Generated once and pinned: a test that minted a fresh
 #: key per app could not compare two apps' ciphertexts, and "the test key" in a
 #: fixture is one less thing to reason about than a generator call.
 TEST_KEY = load_vault_key({"MUSE_VAULT_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="})
+
+#: The identity the whole suite verifies against. Module-level because `AUTH_HEADERS` is
+#: a module-level constant in `conftest.py`: one published key, one minted token, and no
+#: test can sign a token for a key that is not the one the app will fetch.
+IDENTITY = Identity()
+
+
+def auth_for(identity: Identity = IDENTITY, *, clock=time.time) -> TokenVerifier:
+    """A verifier wired to `identity`, for a container that is not the default one.
+
+    `clock` is a parameter because the token's `exp` is a wall-clock second and a test
+    that wants to be *about* expiry passes a clock that says otherwise — the whole
+    technique `Router(clock=..., unit=...)` uses (AGENTS.md rule 14).
+    """
+    return TokenVerifier(
+        issuer=ISSUER,
+        audience=AUDIENCE,
+        jwks=JwksClient(
+            f"{ISSUER}/.well-known/jwks.json",
+            identity.fetch,
+            clock=time.monotonic,
+        ),
+        clock=clock,
+    )
 
 
 def build_test_app(
@@ -40,6 +69,7 @@ def build_test_app(
     scrub_secrets: tuple[Secret, ...] = (),
     telemetry: Telemetry | None = None,
     breakers: BreakerRegistry | None = None,
+    auth: TokenVerifier | None = None,
 ):
     """An app whose container holds exactly what the test passed in.
 
@@ -51,6 +81,10 @@ def build_test_app(
     which is the whole point: two tracers would produce two disjoint traces under one
     trace id, and a test asserting the provider span nests under the request span
     would pass against one and fail against production.
+
+    `auth` defaults to a real verifier over `IDENTITY`, not to a permissive stub. Every
+    test in this suite therefore drives signature verification, which is the only way
+    the auth tests can claim the other tests are unaffected by them.
     """
     resolver = credentials or StaticCredentials({})
     vault = Vault(database, TEST_KEY)
@@ -63,6 +97,7 @@ def build_test_app(
         vault=vault,
         meter=Meter(database),
         credentials=resolver,
+        auth=auth or auth_for(),
         scrub_secrets=scrub_secrets,
         telemetry=telemetry if telemetry is not None else Telemetry.noop(),
     )

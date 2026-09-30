@@ -170,7 +170,7 @@ async def test_the_running_app_emits_every_correlation_header_the_document_promi
 
     from .conftest import AUTH_HEADERS, asgi_client
     from .support.fake_database import FakeDatabase
-    from .support.test_app import TEST_KEY
+    from .support.test_app import TEST_KEY, auth_for
     from .support.tracing import recording_telemetry
 
     documented = spec()["paths"]["/v1/route"]["post"]["responses"]
@@ -192,6 +192,7 @@ async def test_the_running_app_emits_every_correlation_header_the_document_promi
             vault=Vault(database, TEST_KEY),
             meter=Meter(database),
             credentials=StaticCredentials({}),
+            auth=auth_for(),
             telemetry=telemetry,
         )
     )

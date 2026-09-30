@@ -11,9 +11,11 @@ Four things live here and each answers a convention in core's
   models are not, and a caller's retry logic branches on exactly that difference;
   422 for a well-formed request that is semantically wrong; 500 only for a bug in
   muse, whose type and message never reach the caller.
-- **The auth stub.** Header presence and the `Bearer` scheme, nothing more. Real JWT
-  verification lands with the guard contract. It is a stub in both directions: it does
-  not accept a missing header, and it does not pretend to check the token.
+- **The bearer check.** Signature verified against identity's published JWKS with the
+  algorithm pinned, then issuer, audience, expiry, and every required claim, then the
+  capability the operation needs and the tenant the request runs as. A valid signature
+  is not an authorization: a correctly signed token carrying no scope is refused.
+  `muse.auth` is the whole of it; this module is the HTTP shape around it.
 - **`X-Trace-Id` in the header and the body.** Support starts from that id, so a
   success that has one and a 401 that does not is a service you cannot debug at 3am.
   An *incoming* id is echoed only if it looks like an opaque token; anything else is
@@ -38,11 +40,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from muse.auth import SCOPE, Principal, TokenVerifier, bearer_token, require_scope
 from muse.errors import (
     AllCandidatesFailed,
+    AuthError,
+    InsufficientScope,
+    MissingAccount,
     MuseError,
     RouteConfigError,
     RouteNotFound,
+    SigningKeysUnavailable,
+    Unauthenticated,
 )
 
 #: core's error type URIs. Stable, machine-readable, and the last segment is the same
@@ -142,18 +150,6 @@ def problem(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class Caller:
-    """Who the request claims to be, as far as v1 can tell.
-
-    Deliberately almost nothing. The stub reads no token, so there is no `sub` and no
-    `scopes` to record — and a field that is always empty is a field a later packet
-    fills in rather than one this one guesses at.
-    """
-
-    credential_present: bool
-
-
 def trace_id_for(request: Request) -> str:
     return getattr(request.state, "trace_id", uuid.uuid4().hex)
 
@@ -171,24 +167,54 @@ def new_trace_id(incoming: str | None) -> str:
     return uuid.uuid4().hex
 
 
-def require_bearer(request: Request) -> Caller:
-    """The auth stub: the header is present and carries a bearer token.
+async def require_bearer(request: Request, scope: str = SCOPE) -> Principal:
+    """The verified caller, or raise.
 
-    A presence check and a scheme check, and nothing else. It does not verify a
-    signature, does not check expiry, and does not read scopes — that lands with the
-    guard contract, and a half-implemented check that looks like a real one is worse
-    than a stub that says it is one.
+    Header shape, then signature, then claims, then capability, then tenancy — in that
+    order, because each step is cheaper than the next and refusing early is what keeps a
+    malformed token from costing a key fetch.
+
+    `scope` is the capability the *operation* needs and is a parameter rather than a
+    constant so a future operation states its own rather than inheriting this one's.
     """
-    header = request.headers.get("Authorization", "")
-    scheme, _, token = header.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise _Unauthorized("a bearer credential is required")
-    return Caller(credential_present=True)
+    verifier: TokenVerifier = request.app.state.container.auth
+    token = bearer_token(request.headers.get("Authorization"))
+    if token is None:
+        raise Unauthenticated("a bearer credential is required")
+
+    principal = await verifier.verify(token)
+    require_scope(principal, scope)
+    return principal
 
 
-class _Unauthorized(MuseError):
-    """The stub's own failure, so the handler below does not have to distinguish it
-    from every other `MuseError` by type."""
+#: The status and reserved code each authentication failure renders as.
+#:
+#: A table rather than a chain of `except` clauses, so the mapping is one readable fact
+#: and adding an auth failure is adding a row. The exact type is the key, not the class
+#: hierarchy — the same discipline as `muse.errors.is_retryable` and `muse.errortype`,
+#: and for the same reason: a new `AuthError` subclass must be a *decision* about its
+#: status rather than inheriting one by accident.
+#:
+#: `SigningKeysUnavailable` is 503 because identity being down is not the caller's
+#: credential being bad; reporting it as a 401 sends the caller to re-authenticate
+#: against a healthy service and then retry forever.
+_AUTH_STATUS: dict[type[AuthError], tuple[str, int]] = {
+    SigningKeysUnavailable: ("unavailable", 503),
+    MissingAccount: ("unauthorized", 401),
+    Unauthenticated: ("unauthorized", 401),
+    InsufficientScope: ("forbidden", 403),
+}
+
+#: What an `AuthError` with no row above renders as. **Refusal, not admission**: a new
+#: failure that nobody has classified yet answers 401 rather than 200, because the whole
+#: point of the check is that an unclassified refusal cannot become a served request.
+_UNCLASSIFIED_AUTH = ("unauthorized", 401)
+
+
+def auth_problem(request: Request, error: AuthError) -> JSONResponse:
+    """The problem envelope for an auth failure, with the right status for its kind."""
+    code, status = _AUTH_STATUS.get(type(error), _UNCLASSIFIED_AUTH)
+    return problem(request, code, status, str(error))
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,10 +252,13 @@ def build_router() -> APIRouter:
         ),
     )
     async def route_completion(request: Request) -> Response:
+        # Authentication before the body is read, and before any provider is contacted:
+        # an unauthenticated request must not be able to make muse spend money, and it
+        # must not be able to learn whether a model name routes at all.
         try:
-            require_bearer(request)
-        except _Unauthorized as error:
-            return problem(request, "unauthorized", 401, str(error))
+            await require_bearer(request)
+        except AuthError as error:
+            return auth_problem(request, error)
 
         try:
             body = RouteRequestBody.model_validate(await request.json())
@@ -385,10 +414,10 @@ def register_error_handlers(app: FastAPI) -> None:
 
 __all__ = [
     "TRACE_HEADER",
-    "Caller",
     "Problem",
     "RouteRequestBody",
     "RouteResponseBody",
+    "auth_problem",
     "build_router",
     "new_trace_id",
     "problem",

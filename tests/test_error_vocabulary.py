@@ -41,16 +41,19 @@ import pytest
 from muse import errors as error_module
 from muse.errors import (
     AllCandidatesFailed,
+    AuthError,
     CircuitOpen,
     ConfigError,
     ContentPolicyError,
     ContractError,
     CredentialUnavailable,
+    InsufficientScope,
     InvalidErrorType,
     InvalidEventType,
     InvalidServiceName,
     InvalidSubject,
     MeteringError,
+    MissingAccount,
     MuseError,
     PriceUnavailable,
     ProviderAuthError,
@@ -63,6 +66,8 @@ from muse.errors import (
     ResponseShapeError,
     RouteConfigError,
     RouteNotFound,
+    SigningKeysUnavailable,
+    Unauthenticated,
     UnclassifiedError,
     VaultConfigError,
     VaultDecryptError,
@@ -120,6 +125,17 @@ EXPECTED: dict[type[BaseException], str] = {
     # --- the whole route --------------------------------------------------------
     CredentialUnavailable: "internal_error",
     AllCandidatesFailed: "dependency_unavailable",
+    # --- the caller's credential (packet muse-06) -------------------------------
+    # All four are `policy_denied` but one is not: core's definition is "a rule cafaye
+    # itself owns refused the operation — authorization", which is exactly what a
+    # refused credential is. `SigningKeysUnavailable` is the exception because its
+    # responder is identity's operators rather than the caller's, and putting an outage
+    # on the same dashboard as a fraud signal is how both get ignored.
+    AuthError: "policy_denied",
+    Unauthenticated: "policy_denied",
+    InsufficientScope: "policy_denied",
+    MissingAccount: "policy_denied",
+    SigningKeysUnavailable: "dependency_unavailable",
 }
 
 
