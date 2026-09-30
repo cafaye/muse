@@ -145,36 +145,31 @@ class JwksClient:
     async def keys(self) -> jwk.KeySet:
         """The key set, refreshing if stale. Raises if it cannot be fetched."""
         async with self._lock:
-            stale = self._stale()
-            if stale:
-                await self._load()
-            if self._state.cache is None:  # pragma: no cover - _load raises first
-                raise SigningKeysUnavailable("the signing keys are not available")
-            return self._state.cache.keys
+            cached = self._state.cache
+            if cached is None or self._stale(cached):
+                return await self._load()
+            return cached.keys
 
     # --- the policy --------------------------------------------------------
 
     async def _keys_for(self, kid: str) -> jwk.KeySet | None:
         cached = self._state.cache
-        fresh = not self._stale()
 
-        if fresh and cached is not None:
+        if cached is not None and not self._stale(cached):
             # The hot path, and the one that must cost nothing.
-            if self._publishes(kid):
+            if _publishes(cached.keys, kid):
                 return cached.keys
             # Unknown to us, and we looked for it recently enough that looking again
             # would be an unfunded fetch. This is the amplification control.
             if self._may_look_again(kid):
-                await self._load()
-                return self._answer(kid)
+                return self._answer(await self._load(), kid)
             # We hold a usable key set that simply does not name this key, so the answer
             # is a refusal and not another fetch.
             return None
 
         # Stale, or cold: we have nothing to answer with until a fetch succeeds.
         if self._may_refresh():
-            await self._load()
-            return self._answer(kid)
+            return self._answer(await self._load(), kid)
 
         # Cold *and* inside the interval, which means the last attempt failed. This is
         # the case that a naive implementation gets wrong: "no cache" looks like a
@@ -183,18 +178,22 @@ class JwksClient:
         # both cheaper and more honest: we cannot check the token, so we say so.
         raise SigningKeysUnavailable(f"the signing keys at {self._url} could not be retrieved")
 
-    def _answer(self, kid: str) -> jwk.KeySet | None:
-        """The cached set if it publishes `kid`, else record the miss and say no."""
-        cached = self._state.cache
-        if cached is None:  # pragma: no cover - _load raises rather than returning None
-            raise SigningKeysUnavailable("the signing keys are not available")
-        if self._publishes(kid):
-            return cached.keys
+    def _answer(self, keys: jwk.KeySet, kid: str) -> jwk.KeySet | None:
+        """The freshly fetched set if it publishes `kid`, else record the miss and say
+        no.
+
+        Takes the keys rather than reading the cache, so there is no window in which it
+        could be handed a cache some other request has replaced.
+        """
+        if _publishes(keys, kid):
+            return keys
         self._state.unknown[kid] = self._clock()
         return None
 
-    async def _load(self) -> None:
-        """Fetch and replace the cache. Never leaves a partial state behind.
+    async def _load(self) -> jwk.KeySet:
+        """Fetch and replace the cache, returning the new set.
+
+        Never leaves a partial state behind.
 
         A failure is a `SigningKeysUnavailable` rather than a silently-empty cache: a
         client that kept the last good set would be serving requests against a key set
@@ -231,18 +230,18 @@ class JwksClient:
         # Replaced on success, never merged: a merge is a set that only ever grows, and
         # a withdrawn key that never leaves.
         self._state.unknown.clear()
+        return keys
 
     # --- the two windows, and the two questions they answer --------------------
 
-    def _stale(self) -> bool:
-        """Whether the cached set has outlived its TTL.
+    def _stale(self, cached: _Cache) -> bool:
+        """Whether `cached` has outlived its TTL.
 
-        A cold cache counts as stale, which is why the caller fetches unconditionally
-        when `cache is None` and this is not asked the question.
+        Takes the cache rather than reading it, so "does a cache exist" and "how old is
+        it" are two separate questions with two separate answers at the call site —
+        which is what lets the cold path read as a refusal rather than as a special case
+        buried here.
         """
-        cached = self._state.cache
-        if cached is None:
-            return True
         return self._clock() - cached.fetched_at >= self._ttl
 
     def _may_look_again(self, kid: str) -> bool:
@@ -270,29 +269,27 @@ class JwksClient:
             return True
         return self._clock() - last >= self._interval
 
-    def _publishes(self, kid: str) -> bool:
-        """Whether the cached set names `kid`.
-
-        `get_by_kid` rather than a hand-rolled scan: it is the library's own selection
-        and it is what `decode` will consult, so "does this set publish the key" and
-        "will the signature check find it" cannot be two different answers. It raises on
-        a miss, which is the miss.
-        """
-        cached = self._state.cache
-        if cached is None:  # pragma: no cover - guarded by the callers
-            return False
-        try:
-            cached.keys.get_by_kid(kid)
-        except JoseError:
-            return False
-        return True
-
     def __repr__(self) -> str:
         cached = self._state.cache
         kids = (
             [key.get("kid") for key in cached.keys.as_dict(private=False)["keys"]] if cached else []
         )
         return f"JwksClient(url={self._url!r}, kids={kids})"  # a kid is a public id, never a key
+
+
+def _publishes(keys: jwk.KeySet, kid: str) -> bool:
+    """Whether `keys` names `kid`.
+
+    `get_by_kid` rather than a hand-rolled scan: it is the library's own selection and
+    it is what `decode` will consult, so "does this set publish the key" and "will the
+    signature check find it" cannot be two different answers. It raises on a miss, which
+    is the miss.
+    """
+    try:
+        keys.get_by_kid(kid)
+    except JoseError:
+        return False
+    return True
 
 
 __all__ = [

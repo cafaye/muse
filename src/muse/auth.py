@@ -197,8 +197,13 @@ class TokenVerifier:
         """The payload, or refuse. The signature is checked here and nowhere else."""
         try:
             return dict(jwt.decode(token, keys, algorithms=[ALGORITHM]).claims)
-        except UnsupportedAlgorithmError as error:  # pragma: no cover - _header pins first
-            raise Unauthenticated(f"token algorithm is not accepted ({error})") from error
+        except UnsupportedAlgorithmError as error:  # pragma: no cover
+            # Unreachable while `_header` holds: it refuses anything but `ALGORITHM`
+            # before a key is fetched, so the library's own check never fires. Kept as
+            # the second line rather than deleted because it is the one that would catch
+            # a regression in `_header`, and a pinned algorithm that became unpinned
+            # should still be a 401 rather than a 500.
+            raise Unauthenticated("token algorithm is not accepted") from error
         except JoseError as error:
             raise Unauthenticated(f"token is not valid ({type(error).__name__})") from error
 

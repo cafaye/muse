@@ -117,6 +117,16 @@ anything other than the probes to answer.
 mise install          # reads mise.toml -> python 3.14, uv 0.12.20
 ```
 
+`identity` is required to serve anything but the probes: muse verifies tokens against a
+JWKS it fetches over the network, so `/v1/route` answers 503 without an issuer. The
+probes consult nothing and answer either way.
+
+```sh
+# If identity is not running on the compose network, the probes still work and the
+# endpoint 503s. This is the honest local state, not a gap.
+docker compose up --build
+```
+
 ## Quick start
 
 ```sh
