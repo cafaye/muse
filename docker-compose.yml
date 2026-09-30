@@ -1,0 +1,30 @@
+# muse — local development stack.
+#
+# This is the service alone. No database, no queue: v0 has no dependencies to
+# stand up, and adding empty services here would imply architecture that does
+# not exist yet (AGENTS.md).
+
+services:
+  muse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cafaye/muse:dev
+    container_name: muse
+    ports:
+      - "8000:8000"
+    environment:
+      # v0 has no configuration. Kept explicit so the first real setting has an
+      # obvious home and compose fails loudly on a typo'd name.
+      MUSE_ENV: development
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - /opt/venv/bin/python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status == 200 else 1)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

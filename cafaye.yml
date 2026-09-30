@@ -1,0 +1,51 @@
+# cafaye.yml — muse manifest (DRAFT)
+#
+# STATUS: draft. `core` owns the cafaye.yml schema (PLAN §4, Phase 0) and core
+# does not exist yet. This file is a worker-authored PROPOSAL so the manager has
+# something concrete to react to; it is not a validated contract. Do not build
+# tooling against it until the schema lands. Fields are expected to change.
+#
+# Drafted for: service identity, local run target, contract surface, probe
+# endpoints, and the ports the platform reserves.
+
+apiVersion: cafaye/v0
+kind: Service
+
+metadata:
+  name: muse
+  org: cafaye
+  phase: 4
+  owner: cafaye
+  summary: LLM routing, credentials vault, and token metering.
+
+spec:
+  language: python
+  runtime:
+    python: "3.14"
+    packageManager: uv
+    entrypoint: "uvicorn --factory muse.main:create_app"
+    port: 8000
+    healthcheck:
+      liveness: /healthz
+      readiness: /readyz
+
+  local:
+    dev: docker compose up --build
+    gate: bin/prime
+
+  # The published API surface. Empty in v0 apart from the probes: the OpenAPI
+  # spec for muse's real endpoints is a Phase 4 contract-test deliverable, once
+  # `core` freezes the specs this repo validates against (PLAN §3.3).
+  apis: []
+
+  events:
+    # Emitted, none. When metering lands it will publish usage events for
+    # `billing` to consume; that is a later packet, not this one.
+    emits: []
+    consumes: []
+
+  # Planned dependencies. Listed to make the Phase 4 shape visible; none are
+  # running in v0, and `/readyz` reports `db: skipped` until the vault lands.
+  dependencies: []
+
+  secrets: []
