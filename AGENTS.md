@@ -14,6 +14,13 @@ vault, metering into the outbox, and `POST /v1/route`. Streaming, tool calls,
 embeddings, images, batches and a real admin UI are *out of scope* — if you find
 yourself adding one, you are past the packet boundary without a new brief.
 
+Packet `muse-03` added the resilience and observability layer around that core:
+W3C trace propagation, OTel spans, bounded retry budgets, and per-provider circuit
+breakers (PLAN §7). Streaming, tool calls, embeddings, images and batches are still
+out of scope — and so is `Idempotency-Key`, which PLAN §7 assigned to `muse-02` and
+which is **not built**; `muse.errors.ProviderIndeterminate` documents the billing
+consequence of its absence.
+
 ## Layout
 
 ```
@@ -29,6 +36,8 @@ src/muse/db.py        the Database protocol and the psycopg adapter
 src/muse/contracts.py core's patterns, copied and checked for parity
 src/muse/redaction.py Secret, and the scrubber for provider text
 src/muse/errors.py    the error taxonomy and the retry list
+src/muse/telemetry.py W3C traceparent, and the span-attribute allowlist
+src/muse/breaker.py   the per-provider circuit breaker
 migrations/           00001_outbox_events, 00002_vault_secrets
 config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
@@ -48,8 +57,11 @@ bin/prime             the gate: uv sync && ruff && pytest
    it, watch it fail for the right reason, then implement. A test that never
    failed is a test that proves nothing (PLAN §3.1).
 3. **No socket in tests.** Drive the app over `httpx.ASGITransport`, the
-   database through an in-memory `Database`, and litellm through an injected
-   stand-in module. The suite is fast, hermetic, and parallel-safe.
+   database through an in-memory `Database`, litellm through an injected
+   stand-in module, and OpenTelemetry through `InMemorySpanExporter` (see
+   `tests/support/tracing.py`, which swaps the SDK's exporter in for the OTLP
+   one so a test reads the payload a collector would really receive). The suite
+   is fast, hermetic, and parallel-safe.
    `TestClient`/live-`uvicorn` is for the rare case that genuinely needs a real
    server. Two tests skip unless `MUSE_CORE_SCHEMAS` points at a core checkout;
    they say so rather than passing quietly.
@@ -92,18 +104,59 @@ bin/prime             the gate: uv sync && ruff && pytest
     explicit tuple, not a walk of the class hierarchy, so adding a
     `ProviderError` subclass does not silently change retry behaviour. A
     rejected credential or a malformed request advances to the next candidate
-    immediately.
-13. **No sleeps, no retry bumps, no loosened assertions** to make a flaky test
+    immediately. `is_retryable` tests the **exact type**, so `CircuitOpen` — a
+    `ProviderUnavailable` subclass — is not retried: a held-back provider is the
+    one case where a retry is least useful.
+13. **An ambiguous outcome is not a transient failure.** `ProviderIndeterminate`
+    means the request was dispatched and the answer did not arrive, so the
+    vendor may already have billed it. It is not in the retry tuple and a route
+    must opt in with `retry_indeterminate: true`. A 408 *is* retryable — that
+    is the server saying the request never arrived complete. Until muse has an
+    `Idempotency-Key` (PLAN §7 assigned it to muse; it is not built), one
+    attempt is the only answer that cannot bill a customer twice.
+14. **No sleeps, no retry bumps, no loosened assertions** to make a flaky test
     pass (PLAN §3 flake policy). Where a policy genuinely sleeps — the router's
-    backoff, the publisher's poll — the sleep is *injected*, so the suite
-    asserts on the durations the policy asked for instead of measuring elapsed
-    time. Attribute a flake first: failing test, can the diff reach that
+    backoff, the publisher's poll, the breaker's reset window, the retry budget
+    — the sleep, the **clock** and the **jitter source** are all injected, so
+    the suite asserts on the schedule the policy asked for instead of measuring
+    elapsed time. `Router(clock=..., unit=...)` is the whole technique.
+    Attribute a flake first: failing test, can the diff reach that
     surface, clean-HEAD baseline. Then fix the cause.
-14. **The committed contract is checked against the code.**
+15. **The committed contract is checked against the code.**
     `tests/test_openapi.py` asserts `openapi/v1.yaml` and the running app agree
     in both directions, and `cafaye.yml` against core's manifest schema. A
     contract nobody checks is documentation; a contract that is checked is the
-    thing the SDKs are generated from.
+    thing the SDKs are generated from. For *headers* that means driving the real
+    app and reading the real response: comparing the document to the code cannot
+    catch a header the middleware forgets to send.
+16. **A span may not carry a caller's words.** `muse.telemetry.record()` is the
+    only path from a value to a span, and it refuses anything outside
+    `ALLOWED_SPAN_ATTRIBUTES` — model, provider, token counts, cost, latency,
+    breaker state, and the error **class**. Never a prompt, a completion, a
+    header value, or caller-supplied text. `error.message` is not on the list and
+    must not be added: a vendor's content-policy rejection quotes the offending
+    content back. A `Secret` is refused on its *type*, never compared by value,
+    because a filter with a bypass is what `redaction.py` exists to argue
+    against. This is an allowlist rather than discipline at each call site
+    because the realistic leak is a well-meaning `muse.prompt` added in six
+    months, not an attacker — and `tests/test_trace_propagation.py`'s canary test
+    is the thing that catches it.
+17. **An open circuit breaker is per provider, not per request.** It refuses the
+    provider before any I/O — a refusal that never becomes a socket, which
+    `tests/test_breaker.py` asserts at the litellm seam rather than on the state.
+    The request still succeeds via the fallback. Only *transient* failures trip
+    it: a 400 or a 401 is muse sending something the provider is right to
+    refuse, and counting it would let one bad caller take the route down for
+    everybody. A success resets the count, so the threshold is over consecutive
+    failures.
+18. **Resilience config degrades, it does not refuse to boot.** Missing or
+    nonsense values fall back to the documented default
+    (`MUSE_BREAKER_THRESHOLD`, `MUSE_BREAKER_RESET_SECONDS`). This is the
+    opposite of `MUSE_VAULT_KEY` in rule 10, and the difference is the point: a
+    resilience knob's default is *safe*, so degrading costs a little load during
+    an incident, whereas a vault key's default is *dangerous*, so there is no
+    default to degrade to. A setting whose fallback is safe falls back; one
+    whose fallback is not refuses to start.
 
 ## Dependencies
 
