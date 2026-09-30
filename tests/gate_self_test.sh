@@ -34,11 +34,11 @@
 # four-line stub that prints the summary lines muse's real `bin/prime` prints,
 # captured verbatim from an actual run:
 #
-#     ============================= 898 passed in 34.96s =============================
+#     ============================= 907 passed in 102.01s ============================
 #     Required test coverage of 100% reached. Total coverage: 100.00%
 #
 # The stub exists so that thirteen breakages do not mean thirteen real gate
-# runs (each is a `uv sync --locked` plus an 898-test suite; the brief's own
+# runs (each is a `uv sync --locked` plus a 907-test suite; the brief's own
 # rule is no sleeps, and a self-test whose runtime is thirteen suites is a
 # self-test nobody runs). It is NOT evidence that muse's gate works. That is
 # the other
@@ -51,7 +51,7 @@
 #
 # Twelve of these are a checker reading two files and disagreeing. The last is
 # the run this declaration exists to refuse: the gate is real, it ran, it
-# exited 0, and its summary says `895 passed, 3 skipped` — three tests that
+# exited 0, and its summary says `904 passed, 3 skipped` — three tests that
 # never executed because they need a cafaye/core checkout. Nothing about the
 # declaration is wrong. The count is ABOVE the suite floor, so the suite
 # proof passes. Only `core-parity` catches it. That is the identity defect
@@ -328,7 +328,7 @@ expect_no_leak() {
 # refused everything would satisfy every expectation below.
 # --------------------------------------------------------------------------
 control="$(fresh_copy control)"
-install_stub "$control" '============================= 898 passed in 34.96s ============================='
+install_stub "$control" '============================= 907 passed in 102.01s ============================'
 expect_green 'the control — an unmodified declaration, proved and static — is green in both phases' \
   "$control" --prove
 
@@ -399,15 +399,15 @@ expect_red 'a proof pattern that does not compile, which would otherwise read as
 # sits BEHIND a successful match, so the gate has to actually print the line
 # for the checker's floor-reading to be the thing that refuses.
 b="$(fresh_copy proof-unmeasurable)"
-install_stub "$b" '============================= 898 passed in 34.96s ============================='
+install_stub "$b" '============================= 907 passed in 102.01s ============================'
 edit "$b/gate.yml" "match: '^=+ ([0-9]+) passed'" "match: '^=+ [0-9]+ passed'"
 expect_red 'a proof with a floor and no capture group to read the floor from' \
   "$b" 'gate.proof-invalid' --prove
 
 b="$(fresh_copy floor)"
-install_stub "$b" '============================= 898 passed in 34.96s ============================='
+install_stub "$b" '============================= 907 passed in 102.01s ============================'
 edit "$b/gate.yml" 'minimum: 890' 'minimum: 999'
-expect_red 'a gate that proves 898 tests where the declaration promised 999' "$b" 'gate.floor' --prove
+expect_red 'a gate that proves 907 tests where the declaration promised 999' "$b" 'gate.floor' --prove
 
 # A gate that ran, printed its proof, and failed. `gate.proof-missing` on its
 # own would accept a gate that printed nothing AND exited zero; this is the
@@ -416,7 +416,7 @@ b="$(fresh_copy nonzero)"
 write "$b/bin/prime" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-echo '============================= 898 passed in 34.96s ============================='
+echo '============================= 907 passed in 102.01s ============================'
 echo 'FAILED tests/test_vault.py::test_a_thing - AssertionError' >&2
 exit 1
 SH
@@ -433,7 +433,7 @@ expect_red 'a gate that proved itself and still failed' "$b" 'gate.nonzero' --pr
 # It is the identity defect — 1430 tests green against an empty database —
 # reproduced on purpose, in this repository, against this declaration.
 thirteen="$(fresh_copy skipped-tier)"
-install_stub "$thirteen" '================== 895 passed, 3 skipped in 133.32s (0:02:13) =================='
+install_stub "$thirteen" '================== 904 passed, 3 skipped in 136.68s (0:02:15) =================='
 expect_red 'a gate that exited 0 with three tests skipped: above the suite floor, and still refused' \
   "$thirteen" 'gate.proof-missing' --prove
 
@@ -444,7 +444,7 @@ expect_red 'a gate that exited 0 with three tests skipped: above the suite floor
 # than asserted. If the breakage above ever goes red for a different reason,
 # this case is what catches it.
 b="$(fresh_copy skipped-tier-without-core-parity)"
-install_stub "$b" '================== 895 passed, 3 skipped in 133.32s (0:02:13) =================='
+install_stub "$b" '================== 904 passed, 3 skipped in 136.68s (0:02:15) =================='
 "$PY" - "$b/gate.yml" <<'PY'
 import re
 import sys
@@ -498,7 +498,7 @@ write "$b/bin/prime" <<'SH'
 # way a failing assertion that formats a connection string does.
 set -uo pipefail
 echo "could not reach ${DATABASE_URL:-unset}"
-echo '============================= 898 passed in 34.96s ============================='
+echo '============================= 907 passed in 102.01s ============================'
 exit 1
 SH
 chmod +x "$b/bin/prime"

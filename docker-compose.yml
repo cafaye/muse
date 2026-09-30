@@ -9,6 +9,59 @@
 #   docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
 #   docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
 #
+# UPGRADING FROM A PRE-17 STACK — read this before `docker compose up`.
+#
+# This stack was on postgres:18 and is now on postgres:17, the fleet standard.
+#
+# FIRST, THE GOOD NEWS, and it is measured rather than assumed: with THIS compose
+# file, a stack on 18 never started at all. The 18 image moved its data directory —
+# `PGDATA` is `/var/lib/postgresql/18/docker` in postgres:18 and
+# `/var/lib/postgresql/data` in postgres:17 — so the `muse-db:/var/lib/postgresql/data`
+# mount below is the pre-18 path, and the 18 image refuses to start when it finds data
+# there. Verified: the container exits 1, and the named volume holds 0 files. So if
+# your only ever attempt was `docker compose up -d db` on this repository, you have no
+# 18 data to carry across and option 1 is the whole of what you need to do.
+#
+# If you DID get a working 18 database — by correcting the mount to
+# `/var/lib/postgresql`, or from a `docker run` of your own — then you have a real
+# cluster, and Postgres major versions have incompatible on-disk formats. 17 refuses
+# such a directory rather than corrupting it, verbatim:
+#
+#   FATAL:  database files are incompatible with server
+#   DETAIL:  The data directory was initialized by PostgreSQL version 18, which is
+#            not compatible with this version 17.11.
+#
+# (`17` may refuse slightly earlier, on a configuration parameter that only 18 writes —
+# `autovacuum_worker_slots` is new in 18 — but it refuses either way, and never
+# against a half-migrated directory.) So the fix is one of two:
+#
+#   1. Delete the volume and re-migrate. Correct for a development stack, and the
+#      right answer for anyone whose 18 database never started:
+#
+#         docker compose down -v
+#         docker compose up -d db
+#         docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
+#         docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
+#
+#      This loses every stored provider credential. If you have a real key in there,
+#      re-enter it after re-migrating rather than assuming the vault still has it.
+#
+#   2. Dump on 18, restore on 17, if you need the rows:
+#
+#         docker compose exec -T db pg_dump -U muse -d muse > muse-18.dump
+#         docker compose down -v && docker compose up -d db   # now on 17
+#         # then apply migrations/00001 and 00002, and
+#         docker compose exec -T db pg_restore -U muse -d muse --clean --if-exists < muse-18.dump
+#
+#      `pg_dump` defaults to a *logical* dump (plain SQL), which is the point: a
+#      physical copy of the data directory is what cannot cross the version boundary,
+#      and a logical dump is exactly the thing that can. Restore the dump into a 17
+#      database that already has the migrations applied.
+#
+# There is no third option. `docker compose down` without `-v` leaves the volume in
+# place — the volume is named, so it survives the container, and that is the whole
+# reason this note exists.
+#
 # MUSE_VAULT_KEY has no default anywhere in this file. Generate one with
 # `uv run python -m muse.vault` and export it, or the service refuses to start — which
 # is the point: a vault that boots with a default key is a vault whose keys are
@@ -25,7 +78,18 @@
 
 services:
   db:
-    image: postgres:18-alpine
+    # 17-alpine, the fleet's majority image and the platform standard — muse was the
+    # only service on 18, and a one-deploy-many-services platform that carries two
+    # major versions carries two upgrade paths and a dump from muse that will not
+    # restore into any other service's database. The `alpine` variant is deliberate:
+    # it is the smallest image and three of the six services already pin it, so this
+    # is the exact tag darkroom, identity and parlor/e2e use.
+    #
+    # It is a downgrade, so read the header above before you bring it up: a
+    # developer with a real 18 data directory needs `pg_dump`/`pg_restore` or
+    # `down -v` first, and a developer whose 18 stack never started (most of
+    # them — see the header) just needs the volume recreated.
+    image: postgres:17-alpine
     container_name: muse-db
     environment:
       POSTGRES_USER: muse
@@ -62,7 +126,15 @@ services:
       MUSE_DATABASE_URL: postgres://muse:muse@db:5432/muse
       # No default, on purpose. An empty value is a missing value, and muse treats a
       # missing key as a boot failure rather than a first-request failure.
-      MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}
+      #
+      # Quoted, and the quotes are load-bearing. The `:?` error message contains
+      # `run: uv`, and an unquoted YAML scalar reading `: ` mid-value is a nested
+      # mapping — so this line did not parse, and `docker compose up` failed with
+      # "mapping values are not allowed in this context" before it ever looked at a
+      # container. Every reader of this file had accepted it because nobody had run
+      # it. The quotes cost nothing and make the file valid; the missing-key refusal
+      # is unchanged and still the point.
+      MUSE_VAULT_KEY: "${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}"
       # Commented out rather than defaulted to the compose network: an issuer that does
       # not exist here would fail every request at the key-set fetch, and a *wrong*
       # issuer that does exist is a worse failure. Set it when identity is running.

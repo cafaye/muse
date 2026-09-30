@@ -5,6 +5,158 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-08 — muse is on the fleet's Postgres 17, and the stack was never booted
+
+Packet `muse-08`: the local stack moves from `postgres:18-alpine` to
+`postgres:17-alpine` — the fleet majority, verified, not assumed.
+
+> #### ⚠️ ACTION REQUIRED IF YOU HAVE A LOCAL `muse-db` VOLUME
+>
+> **First, the measured good news: with this compose file, a stack on 18 never
+> started at all — so most people have no 18 data to carry across.** The 18 image
+> moved its data directory: `PGDATA` is `/var/lib/postgresql/18/docker` in
+> `postgres:18` and `/var/lib/postgresql/data` in `postgres:17`. The
+> `muse-db:/var/lib/postgresql/data` mount this file carried is the *pre-18* path,
+> and the 18 image **refuses to start** when it finds a populated
+> `/var/lib/postgresql/data`. Verified: the container exits 1, and the named volume
+> holds **0 files**. So if your only attempt was `docker compose up -d db` on this
+> repository, deleting the volume and re-migrating is the whole of what you need:
+>
+> ```sh
+> docker compose down -v
+> docker compose up -d db
+> docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
+> docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
+> ```
+>
+> **If you did get a working 18 database** — by correcting the mount to
+> `/var/lib/postgresql` yourself, or from a `docker run` of your own — then you have
+> a real cluster, and Postgres major versions have incompatible on-disk formats. 17
+> **refuses** such a directory rather than corrupting it. Captured verbatim:
+>
+> ```
+> FATAL:  database files are incompatible with server
+> DETAIL:  The data directory was initialized by PostgreSQL version 18, which is
+>          not compatible with this version 17.11.
+> ```
+>
+> Carry the rows across with a **logical** dump, which is exactly the thing that can
+> cross the version boundary where a physical copy of the data directory cannot:
+>
+> ```sh
+> docker compose exec -T db pg_dump -U muse -d muse > muse-18.dump
+> docker compose down -v && docker compose up -d     # now on 17
+> # apply 00001 and 00002, then
+> docker compose exec -T db pg_restore -U muse -d muse --clean --if-exists < muse-18.dump
+> ```
+>
+> There is no third option: `docker compose down` without `-v` leaves the named
+> volume in place, and 17 still will not start against it. **Both recoveries lose
+> stored provider credentials** unless you dumped first — re-enter real keys
+> afterwards rather than assuming the vault still holds them.
+>
+> The same instructions are in the `docker-compose.yml` header, where a developer
+> meets them *before* the failure rather than after it.
+
+#### Changed
+
+- **`postgres:18-alpine` → `postgres:17-alpine`.** The exact tag five of the six
+  services already use (darkroom, identity, and parlor/e2e pin `17-alpine`; courier
+  and billing pin `17`), so a cross-service `pg_dump`/`pg_restore` is a routine
+  rather than a project. On a one-deploy-many-services platform the outlier is not
+  just an extra image: it is a second upgrade path, and a muse dump that restores
+  into no other service's database.
+- **The compose file is now read by the suite** (`tests/test_compose.py`, 9 tests,
+  hermetic — no socket, so rule 3 holds).
+
+#### Fixed
+
+- **`docker-compose.yml` did not parse, so this stack had never booted.**
+  `MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?… or run: uv run python -m muse.vault}` was an
+  unquoted YAML scalar, and the `: ` inside `run: uv` makes a plain scalar a nested
+  mapping. `docker compose up` failed with `mapping values are not allowed in this
+  context` before it looked at a container. The line is now quoted; the refusal on a
+  missing key — the point of the line — is unchanged, and still a boot failure.
+  **The version pin above could not have been booted, or verified, before this fix**,
+  which is the whole reason both defects survived: nothing in this repository had ever
+  executed the file.
+- **The volume was mounted where 18 does not keep its data.** `PGDATA` is
+  `/var/lib/postgresql/data` in `postgres:17` and `/var/lib/postgresql/18/docker` in
+  `postgres:18`; the mount below is unchanged and is correct for 17. Worth recording
+  because on 18 it was not merely a stale path: the 18 image refuses to start when it
+  finds a populated `/var/lib/postgresql/data`, so `docker compose up -d db` exited 1
+  and the named volume held **0 files**. The mount is now asserted, so a future pin
+  bump that changes `PGDATA` without changing this path is a red test rather than an
+  empty volume nobody notices.
+
+#### Added
+
+- **`tests/test_compose.py`** — asserts the file parses, that the database is the
+  platform standard's *exact* tag (not `latest`, not an interpolation), that the
+  volume mounts at 17's `PGDATA`, that the downgrade note still names both
+  recoveries, that the header's migration filenames exist, and that
+  `MUSE_VAULT_KEY` is a `${…:?…}` refusal rather than a literal.
+  Ten breakages were applied by hand to confirm each assertion can go red; the first
+  version of the credential regex passed a committed `sk-proj-…` key because it
+  stopped at the hyphen, which is why they were worth applying.
+- **`gate.yml`'s `core-parity` floor raised 898 → 907**, and `AGENTS.md` now says
+  plainly that adding tests means raising it in the same commit. Left at 898, the
+  9 new tests would have disarmed the ratchet: a run with one of the three core drift
+  guards deleted (906) would still have cleared the floor. A commit that only made the
+  suite bigger quietly weakened the guard that says the cross-repo tier ran.
+
+#### Findings — reported, not fixed, and deliberately so
+
+Both are **pre-existing and version-independent** — identical on 17 and on 18 —
+and neither is fixed here. See `REPORT-muse-08-pg17.md` for the reasoning and for
+what a fix would have to decide.
+
+- **`OutboxPublisher` has never published a row against a real database.**
+  `muse.outbox._claim` reads its result as `result.get("rows", ())`, and
+  `muse.vault.Vault.providers` does the same — but a *row* mapping has no `rows` key.
+  The `Database` protocol declares `fetchone(...) -> Mapping | None`, which cannot
+  express "give me a batch of rows" at all, so both call sites invented a shape that
+  only `tests/support/fake_database.py` produces. Against real postgres, `psycopg`
+  returns the first row, `.get("rows", ())` is `()`, and the loop claims nothing and
+  exits cleanly forever. `Vault.providers()` likewise always returns `()`.
+  **The cause is that the fake was written to agree with the code rather than with
+  the driver** — the one job a test double has that a real database does not. The
+  suite is green over this: 904 tests, 100% coverage, and an outbox that publishes
+  nothing. It surfaced only because `muse-08` booted the stack and ran muse's own
+  classes against it, which is the argument for doing so. **This needs its own
+  packet**, and probably a core ruling on the `Database` seam, since the "no way to
+  ask for a batch" gap will exist in any service that implements the outbox this way.
+- **No Postgres-18-only feature is in use.** Every statement is 9.5-era or older —
+  `on conflict do update`, `for update skip locked`, `jsonb`, `uuid`, `timestamptz`,
+  `bytea`, partial indexes, `CHECK` with `~` and `char_length`. Nothing in the
+  downgrade is blocked on a feature muse would have to give up.
+
+#### Verification
+
+- `docker compose up -d db` on the new pin; `select version()` reports
+  **`PostgreSQL 17.11 on aarch64-unknown-linux-musl … (Alpine 15.2.0)`**,
+  `server_version_num = 170011`.
+- Both migrations applied to an **empty** database from scratch, clean. The resulting
+  `outbox_events` matches core's documented column list exactly, and the CHECK
+  constraints were confirmed to *fire* (a malformed `event_type` and a malformed
+  `provider` are both rejected by the server, not merely declared).
+- muse's own `Vault`, `Meter` and `PsycopgDatabase` were driven against that live 17
+  server: seal/store/rotate/read/delete round-trip, the plaintext confirmed absent
+  from the stored ciphertext, the metering insert landing as `jsonb` with core's five
+  payload fields, and the `/readyz` `select 1 as ok` probe. (The publisher's claim
+  query is where it stopped — see the findings above.)
+- **Suite, self-contained tier: 904 passed, 3 skipped** (895 + 9 new). The 3 skips are
+  the pre-existing cross-repo guards and are gated on **`MUSE_CORE_SCHEMAS`**;
+  coverage 100%, branch coverage on.
+- **Suite, cross-repo tier with `MUSE_CORE_SCHEMAS=../core/schemas`: 907 passed, 0
+  skipped.** Both counts reported separately because they are different claims, and
+  `gate.yml`'s `core-parity` proof is the one that refuses the skipped run.
+- `../core/harness/bin/gate-check .` and `--prove` both pass, and
+  `bash tests/gate_self_test.sh` is 20/20 (3 controls, 13 breakages, 3 warnings,
+  1 hygiene, 0 skipped).
+- No sleeps, no raised retries, no loosened assertions, and no test was added that
+  skips.
+
 ### muse-06 — the bearer token is verified, and a valid signature is not an authorization
 
 Packet `muse-06`: `require_bearer` stops being a presence check. It verifies the

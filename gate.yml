@@ -61,21 +61,21 @@ gate:
     # 34.96s =============================` with one.
     - id: suite
       match: '^=+ ([0-9]+) passed'
-      # 890, deliberately below today's 895. The count only ever rises, so a
+      # 890, deliberately below today's 904. The count only ever rises, so a
       # floor at exactly today's number is a floor that has to be raised by
-      # hand before anything can be added; five tests of margin buys that
-      # headroom. It is still a detector: a suite that quietly lost six tests
-      # is `gate.floor`, which is a failure.
+      # hand before anything can be added; the margin below buys that
+      # headroom. It is still a detector: a suite that quietly lost a dozen
+      # tests is `gate.floor`, which is a failure.
       minimum: 890
     #
     # The load-bearing one. The negative lookahead is the whole point: it
     # matches a summary line only when nothing was skipped. On the
-    # `895 passed, 3 skipped` line the lookahead sees "skipped" further along
+    # `904 passed, 3 skipped` line the lookahead sees "skipped" further along
     # the same line and refuses, so `gate.proof-missing` is a FAILURE and
     # `gate-check --prove` goes red on a gate that exited zero.
     #
     # A regex rather than a second hand-written assertion in the workflow
-    # because the assertion already exists there and is the reason for this
+    # because the assertion already exists there and is why this
     # proof: .github/workflows/ci.yml has a step whose entire job is to fail
     # the build when pytest's summary mentions a skip, with the comment "a
     # per-test allowlist is a list that grows, and the day a third tier is
@@ -83,15 +83,25 @@ gate:
     # developer and a tool can both see it.
     - id: core-parity
       match: '^=+ (?!.*skipped)([0-9]+) passed'
-      # 898 exactly, and not a rounded number. 895 of the tests are
+      # 907 exactly, and not a rounded number. 904 of the tests are
       # self-contained; the three that are not are
       # tests/test_contracts.py::test_patterns_are_byte_identical_to_core,
       # the telemetry-vocabulary drift guard in test_error_vocabulary.py, and
-      # the manifest-drift guard in test_openapi.py. 898 - 895 is exactly
+      # the manifest-drift guard in test_openapi.py. 907 - 904 is exactly
       # those three, so this floor cannot be satisfied by a run in which the
       # cross-repo tier did not execute. It is also a ratchet in the other
       # direction: delete one of the three and the parity gate goes red.
-      minimum: 898
+      #
+      # RAISED 898 -> 907 by muse-08, and the reason is the ratchet clause
+      # above rather than the number. This floor is only "exact" relative to
+      # the suite's size: muse-08 added 9 hermetic compose tests, and a floor
+      # left at 898 would have meant a run with one of the three drift guards
+      # deleted still reported 906 and still cleared it. Adding a test can
+      # therefore never leave this floor stale *in the safe direction* — a
+      # reviewer adding tests must raise it here in the same commit, and the
+      # alternative (leave the floor, lose the ratchet) is the failure this
+      # note exists to prevent.
+      minimum: 907
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

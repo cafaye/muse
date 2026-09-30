@@ -52,8 +52,10 @@ src/muse/schemas/     core's telemetry schemas, vendored byte-identically
 migrations/           00001_outbox_events, 00002_vault_secrets
 config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
+docker-compose.yml    the local stack: the service, and postgres:17-alpine
 tests/                pytest; one module per concern, plus tests/support/
-                     (test_dependencies.py checks the suite's imports against
+                     (test_compose.py reads the compose file — see rule 23;
+                     test_dependencies.py checks the suite's imports against
                      the declared set, and bin/prime against --locked — see
                      Dependencies; test_error_vocabulary.py checks every
                      error class against core's vocabulary — see rule 19;
@@ -278,6 +280,28 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
    ways — a marker inside the claims, and separately the raw compact JWS, so a service
    that logged `request.headers` passes the first and fails the second. Never at debug
    level, never in an error message, never in a test failure message.
+23. **A version pin nobody has executed is a comment.** `docker-compose.yml` is a file
+   whose only job is to start a database, and for its whole life nothing started it:
+   no test read it, CI never invoked compose, and rule 3 means the suite opens no
+   socket. So it carried two defects that any reader's eye passed over. It pinned
+   `postgres:18-alpine` while five of six services sat on 17. And it did not parse at
+   all — `MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?… or run: uv run …}` was an unquoted YAML
+   scalar containing `: `, which is a nested mapping, so `docker compose up` died with
+   "mapping values are not allowed in this context" before it looked at a container.
+   `muse-08` booted the stack, which is the only reason either was found, and left
+   `tests/test_compose.py` behind so neither can come back: the file is parsed, the
+   database is asserted to be the platform standard's exact tag, the downgrade note is
+   asserted to still name `pg_dump`/`pg_restore` and `down -v`, and the vault key is
+   asserted to be a `${…:?…}` refusal rather than a literal. Nine breakages were
+   applied by hand to confirm each assertion can go red — including the first version
+   of the credential regex, which passed a committed `sk-proj-…` because it stopped
+   at the hyphen. Rule 14's discipline and the canary's apply here unchanged: **break
+   the guard on purpose and watch it go red, because a guard that passes is
+   indistinguishable from a guard that was never looking.**
+   The lesson generalises past compose: *every* file in this repository that only runs
+   outside the suite — `bin/prime` (asserted by `test_dependencies.py`), `gate.yml`
+   (asserted by `gate-check` and `gate_self_test.sh`) — is guarded for the same
+   reason, and `muse-08` is the argument for why that pattern exists.
 
 ## Dependencies
 
@@ -349,13 +373,20 @@ Three things in it are load-bearing here and are easy to undo by accident:
 - **`proof[].core-parity` must not match a line that says `skipped`.** That
   regex is the only thing standing between `bin/prime`'s exit code and the
   three core-parity tests that do not run without `MUSE_CORE_SCHEMAS`.
-  Delete it and the gate is green again over `895 passed, 3 skipped` — which
+  Delete it and the gate is green again over `903 passed, 3 skipped` — which
   is the identity defect this format exists to remove. `tests/gate_self_test.sh`
   breakage 13 asserts the red, and its companion asserts the green that
   deleting the proof would restore.
-- **`proof[].minimum` is a ratchet.** `890` is below the suite's 895 so a new
-  test does not need the floor raised first; `898` is the exact count when the
-  core tier runs, and dropping one of the three drift guards takes it under.
+- **`proof[].minimum` is a ratchet, and the `core-parity` floor is exact.**
+  `890` is below the suite's 903 so a new test does not need the floor raised
+  first; `906` is the exact count when the core tier runs, and dropping one of
+  the three drift guards takes it under. **So adding tests means raising
+  `core-parity`'s floor in the same commit.** `muse-08` learned this the
+  expensive way: it added 8 hermetic compose tests, and a floor left at 898
+  would have let a run with one drift guard deleted (905) still clear it —
+  the ratchet quietly disarmed by a commit that only ever made the suite
+  bigger. `tests/test_compose.py`'s pin cannot be loosened without the same
+  commit re-raising the floor.
 - **`external.selfContained: false`** because `bin/prime` starts with
   `uv sync --locked`, which needs PyPI on a cold checkout and a pinned
   toolchain the machine does not carry until mise installs it.
