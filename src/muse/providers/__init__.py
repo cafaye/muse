@@ -37,18 +37,16 @@ from muse.errors import (
     ProviderUnavailable,
     ResponseShapeError,
 )
-from muse.redaction import Secret, redact
 
-#: The credentials surface, re-exported. Defined in `muse.providers.credentials` and
-#: named here so a caller that only wants to hand a provider a dict of keys does not
-#: have to know which module the protocol lives in. Re-exported rather than redefined:
-#: a second copy of either class is a second thing for a test to cover and production
-#: never calls.
-from muse.providers.credentials import (
-    CredentialResolver,
-    StaticCredentials,
-    VaultCredentials,
-)
+#: The credentials surface, re-exported from `muse.providers.credentials` so a caller
+#: that only wants to hand a provider a dict of keys does not have to know which module
+#: the protocol lives in. Re-exported rather than redefined: a second copy of a class is
+#: a second thing for a test to cover that no request path ever calls — which is exactly
+#: how the static resolver ended up "tested" against a copy production never used.
+from muse.providers.credentials import CredentialResolver
+from muse.providers.credentials import StaticCredentials as StaticCredentials
+from muse.providers.credentials import VaultCredentials as VaultCredentials
+from muse.redaction import Secret, redact
 
 #: The roles a message may have. OpenAI's set, which is a superset of what the
 #: other vendors need; the adapter maps them if a vendor disagrees.

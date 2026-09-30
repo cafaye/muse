@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from muse.db import PsycopgDatabase
 from muse.errors import RouteConfigError, VaultKeyError
 from muse.main import (
     DEFAULT_ROUTES,
@@ -35,6 +36,7 @@ from muse.main import (
     create_app,
 )
 from muse.providers import LiteLLMProvider, ProviderRegistry
+from muse.redaction import Secret
 from muse.routes import routes_from_yaml
 
 from .conftest import write_routes
@@ -44,9 +46,31 @@ pytestmark = [pytest.mark.anyio, pytest.mark.unit]
 
 KEY = base64.b64encode(bytes(range(32))).decode()
 
+#: A DSN that is never dialled: `fake_pool` stands in for the factory, so this string is
+#: only ever a value passed *through*, which is exactly what the assertion is about.
+DSN = "postgres://muse:secret@db.invalid:5432/muse"
+
+#: A syntactically plausible key. Never sent anywhere — these tests stop at the vault.
+API_KEY = "sk-live-51H8xQ2eZvKYlo2C0fJk7Nb9pQrT4wYd"
+
 
 def env(**overrides: str) -> dict[str, str]:
     return {"MUSE_VAULT_KEY": KEY, **overrides}
+
+
+def fake_pool(monkeypatch, database: FakeDatabase, opened: list) -> None:
+    """Replace the pool factory with a stand-in, and record what it was asked for.
+
+    Patched onto `PsycopgDatabase` rather than passed into `build_container`, because
+    the seam this packet agreed on is the `Database` protocol — not another argument on
+    the composition root that exists only so the suite can reach it.
+    """
+
+    async def open_pool(dsn: str, *, min_size: int = 1, max_size: int = 8) -> FakeDatabase:
+        opened.append((dsn, min_size, max_size))
+        return database
+
+    monkeypatch.setattr(PsycopgDatabase, "open", open_pool)
 
 
 def routes_file(tmp_path: Path, document: dict | None = None) -> Path:
@@ -184,6 +208,77 @@ async def test_the_vault_key_is_read_before_the_database_is_touched(
     monkeypatch.delenv("MUSE_VAULT_KEY", raising=False)
     with pytest.raises(VaultKeyError):
         await build_container(Settings(routes_path=routes_file(tmp_path), database_url=None))
+
+
+# --- the container that does boot ------------------------------------------
+
+
+async def test_a_configured_database_url_reaches_the_pool(tmp_path: Path, monkeypatch) -> None:
+    """The one branch the suite cannot reach by accident, and the one that must not be
+    left unreached on purpose.
+
+    `PsycopgDatabase.open` is the single function in muse that dials, so it carries a
+    `no cover` pragma — and a pragma on the callee plus an unexercised caller branch is
+    how a pool ends up opening at the default size whatever `pool_max_size` says. The
+    stand-in stands in for the pool, not for the socket: the assertion is on the
+    arguments muse hands it.
+    """
+    monkeypatch.setenv("MUSE_VAULT_KEY", KEY)
+    database, opened = FakeDatabase(), []
+    fake_pool(monkeypatch, database, opened)
+
+    container = await build_container(
+        Settings(
+            routes_path=routes_file(tmp_path),
+            database_url=DSN,
+            pool_min_size=2,
+            pool_max_size=7,
+        )
+    )
+
+    assert opened == [(DSN, 2, 7)]
+    assert container.database is database
+
+
+async def test_a_shipped_adapter_reads_its_key_from_the_containers_vault(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The adapters and `Container.credentials` must be looking at one vault.
+
+    A boot sequence that builds a registry to validate the routes file and then serves
+    through a *different* resolver is the failure this test exists for: it boots
+    cleanly, reports `/readyz: ok`, and 503s on every request because the adapter reads
+    a store nothing writes to. `health()` is the observation point — with no credential
+    stored it answers from the vault alone, without calling a vendor.
+    """
+    monkeypatch.setenv("MUSE_VAULT_KEY", KEY)
+    database = FakeDatabase()
+    fake_pool(monkeypatch, database, [])
+
+    container = await build_container(Settings(routes_path=routes_file(tmp_path), database_url=DSN))
+    health = await container.registry.get("openai").health()
+
+    assert health.healthy is False
+    assert "openai" in health.detail
+    # The read came from the container's own store, which is only reachable through the
+    # container's own vault.
+    assert len(database.statements_matching("from vault_secrets")) == 1
+
+
+async def test_a_key_stored_after_boot_is_read_by_the_next_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other half of the same wiring, and the reason it is per-call: an operator
+    onboards a vendor by writing one row, and the next request uses it. Nothing here is
+    restarted, and nothing is cached."""
+    monkeypatch.setenv("MUSE_VAULT_KEY", KEY)
+    database = FakeDatabase()
+    fake_pool(monkeypatch, database, [])
+
+    container = await build_container(Settings(routes_path=routes_file(tmp_path), database_url=DSN))
+    await container.vault.put("openai", API_KEY)
+
+    assert await container.credentials.credential_for("openai") == Secret(API_KEY)
 
 
 # --- the no-database stand-in ----------------------------------------------
