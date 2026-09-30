@@ -409,8 +409,53 @@ def test_the_otlp_exporter_the_endpoint_path_imports_is_in_the_gate() -> None:
     assert distributors & closure, (
         f"{OTLP_EXPORTER} is imported by the endpoint path and shipped by "
         f"{', '.join(sorted(distributors)) or 'nothing'}, none of which `uv sync "
-        "--frozen` installs. A test that imports a package makes it a dev "
+        "--locked` installs. A test that imports a package makes it a dev "
         "dependency: add `muse[otel]` to the dev group."
+    )
+
+
+def test_the_exporter_stays_out_of_the_image() -> None:
+    """The other half of the trade-off, and the reason the fix has this shape at all.
+
+    muse-03b's repair puts the OTLP exporter in the dev group, so the suite can import
+    it while the image does not ship it. That is a claim about the *image*, and nothing
+    in the suite was checking it — so the natural "simplification" a future change would
+    make is to promote the exporter into `[project.dependencies]` and delete the extra,
+    which makes every test here pass and quietly adds grpcio and protobuf to every
+    deployment that never configured a collector.
+
+    Two facts together, because either alone is satisfiable by the wrong thing:
+    `[project.dependencies]` must not name anything the image does not need (the
+    exporter is the expensive one, so that is the specific claim), and the Dockerfile
+    must install with `--no-dev`, or the dev group reaches the image whatever
+    pyproject.toml says.
+
+    Verified by hand rather than asserted from the venv: `uv sync --locked --no-dev
+    --no-install-project` — what the Dockerfile runs — installs 69 distributions with
+    no opentelemetry-exporter-otlp, no grpcio and no protobuf, against the gate's 85.
+    """
+    base = _declarations()["[project.dependencies]"]
+
+    expensive = {"opentelemetry-exporter-otlp", "grpcio", "protobuf"}
+    assert not base & expensive, (
+        f"{', '.join(sorted(base & expensive))} moved into [project.dependencies], which "
+        "ships it in every image whether or not a collector is configured. The suite "
+        "needs it, so it belongs in the dev group; the image reads it from the `otel` "
+        "extra and nothing else (README.md#dependencies)."
+    )
+
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    installs = [
+        line.strip()
+        for line in dockerfile.splitlines()
+        if re.search(r"\buv\s+sync\b", line) and not line.lstrip().startswith("#")
+    ]
+
+    assert installs, "the Dockerfile no longer runs `uv sync`; this test is watching nothing"
+    assert all("--no-dev" in line for line in installs), (
+        "every `uv sync` in the Dockerfile needs --no-dev, or the dev group — which now "
+        "carries the OTLP exporter for the suite's benefit — is installed into the "
+        "image:\n" + "\n".join(installs)
     )
 
 
