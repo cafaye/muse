@@ -188,7 +188,9 @@ Each is a runtime dependency this packet added, and the reason it is not avoidab
 | `pyyaml`        | `config/routes.yaml`.                                                        |
 | `opentelemetry-api` | W3C trace context and the `Tracer`/`Span` types (PLAN §7 "adopt from first deploy"). |
 | `opentelemetry-sdk`  | The `TracerProvider` and span processors. Used rather than a hand-rolled span type, so traces are the shape every other OpenTelemetry tool expects. |
-| `opentelemetry-exporter-otlp` | **Optional extra** (`muse[otel]`), imported only when `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` is set. As a hard dependency it would pull grpcio and protobuf into every install to serve a path most deployments never reach. |
+| `opentelemetry-exporter-otlp` | **Optional extra** (`muse[otel]`), imported only when `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` is set. As a hard dependency it would pull grpcio and protobuf into every install to serve a path most deployments never reach. The dev group pulls the extra in, because the suite tests that path. |
+| `pydantic`        | The request and response models in `api.py` and `main.py`. Imported at module scope, so declared rather than inherited from fastapi's pin. |
+| `starlette`       | The ASGI types, the header types and `HTTPException` — muse is an ASGI app, and its pure-ASGI middleware imports these directly. Declared for the same reason as `pydantic`. |
 | `jsonschema`    | Dev only: validates `cafaye.yml` against core's schema when a checkout is available. |
 
 Floors are the newest releases satisfying the machine-wide uv
@@ -212,8 +214,12 @@ adding an endpoint to a compose deployment needs the extra built in — or the b
 error, which is the honest outcome.
 
 ```sh
-uv sync --extra otel    # to export traces
+uv sync --extra otel    # an install that skips the dev group
 ```
+
+A local checkout already has it: the dev group pulls `muse[otel]` in, because the
+test suite exercises the endpoint path and a test that imports a package makes it a
+test dependency. See `AGENTS.md` rule 19.
 
 ## Layout
 
@@ -263,6 +269,27 @@ MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
 They assert that the event patterns copied into `muse/contracts.py` are byte-identical
 to core's schema and that `cafaye.yml` validates against core's manifest schema. A
 copy is a drift risk, and this is the check that catches it.
+
+### A green gate is a claim about a clean machine
+
+`bin/prime` runs `uv sync --frozen` with no extras, so it is only green if the
+declared dependency set covers everything the suite imports. A package that is
+reachable only through an extra, or only because something else happened to pin it,
+makes the suite pass in the venv it was written in and fail on every fresh clone —
+which is how `muse-03`'s gate turned red at merge.
+
+So a change to the suite's imports has to be accompanied by a change to
+`pyproject.toml`, and the honest way to check that is to delete the venv:
+
+```sh
+rm -rf .venv && bin/prime
+```
+
+`tests/test_dependencies.py` enforces it on every gate run instead, from the
+declarations rather than from the venv: every module `src/` and `tests/` import must
+be provided by the closure of `[project.dependencies]` plus the dependency groups, and
+every third-party root must be a direct declaration. It reads `pyproject.toml`,
+`uv.lock` and the installed RECORD files — no socket, no network.
 
 ## License
 

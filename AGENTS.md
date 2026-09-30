@@ -42,6 +42,8 @@ migrations/           00001_outbox_events, 00002_vault_secrets
 config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
 tests/                pytest; one module per concern, plus tests/support/
+                     (test_dependencies.py checks the suite's imports against
+                     the declared set — see rule 19)
 bin/prime             the gate: uv sync && ruff && pytest
 ```
 
@@ -173,6 +175,22 @@ quarantine*, which is often a version or two behind the true latest. So:
 - Bumping past the quarantine window is the user's call, not the worker's.
 - Each addition needs a reason in the commit message and a row in the README's
   dependency table.
+- **A test may only import what the dev group installs.** `bin/prime` is
+  `uv sync --frozen` with no extras, so the set of packages the gate installs is
+  the closure of `[project.dependencies]` plus every dependency group — and
+  nothing else. An import from an extra is green in the venv that once ran
+  `uv sync --extra otel` and red on every fresh clone; that is exactly how
+  `muse-03`'s gate turned red at merge, because the suite tested
+  `build_provider(endpoint=...)` and the OTLP exporter lived in the `otel` extra.
+  A test that needs a package makes it a test dependency: the dev group asks for
+  the extra (`muse[otel]`) rather than repeating its floor, because two floors in
+  two places is a floor that drifts. Transitive availability is not a declaration
+  either — `pydantic` and `starlette` were imported at module scope while
+  arriving only through fastapi's pins.
+  `tests/test_dependencies.py` enforces both halves on every gate run, from
+  `pyproject.toml`, `uv.lock` and the installed RECORD files rather than from the
+  current venv, which is what lets it fail in a dirty environment. When it fires,
+  fix the declaration; do not skip the test that needed the package.
 
 ## Toolchain
 
@@ -184,6 +202,7 @@ pins 3.14. If a new interpreter release lands, bump `.python-version` and
 
 ```sh
 bin/prime                              # the gate
+rm -rf .venv && bin/prime              # the gate on a clean machine — see Dependencies
 uv run pytest                          # tests + coverage gate
 uv run pytest -m unit                  # only unit-marked
 uv run pytest -k vault -vv             # one concern

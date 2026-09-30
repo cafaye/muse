@@ -5,6 +5,53 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+Packet `muse-03b`: the gate was red on a clean checkout. A regression found at merge,
+fixed at the declarations rather than at the test.
+
+### Fixed
+
+- **`bin/prime` could not pass on a fresh clone.** `muse-03` put
+  `opentelemetry-exporter-otlp` in the optional `otel` extra, but
+  `test_a_configured_endpoint_gets_a_batch_processor` exercises
+  `build_provider(endpoint=...)`, which imports that exporter — and `bin/prime` runs
+  `uv sync --frozen` with no extras. The worktree that developed `muse-03` was green
+  because its venv already carried the exporter from an `uv sync --extra otel`; every
+  clean clone got
+  `ConfigError: MUSE_OTEL_EXPORTER_OTLP_ENDPOINT is set but the OTLP exporter is not
+  installed`. The worst kind of green: true where it was written, false everywhere
+  else. **A test that needs a package makes it a test dependency**, so the dev group
+  now asks for the extra (`muse[otel]`) rather than repeating the exporter's floor in
+  a second place. The extra stays an extra for the image, where pulling grpcio and
+  protobuf into every install is still the wrong default.
+- **`pydantic` and `starlette` are now declared.** `api.py` and `main.py` import both
+  at module scope, and both were reaching the venv only as `fastapi`'s transitive
+  dependencies — the same accident one fastapi repin away from a broken build.
+
+### Added
+
+- `tests/test_dependencies.py` — a recurrence guard for both halves, asserted from
+  the declarations rather than from the venv. Every module `src/` and `tests/` import
+  must be provided by the closure of `[project.dependencies]` plus the dependency
+  groups as `uv.lock` records it, resolved at **submodule** granularity, because
+  `opentelemetry` is declared while `opentelemetry.exporter.otlp` is not. Every
+  third-party root must additionally be a *direct* declaration, since transitive
+  availability is not a declaration. Ownership is read from the installed RECORD
+  files, so the check fails both with the extra installed (the owner is outside the
+  closure) and with it absent (the module cannot be found) — which is what makes it
+  trustworthy in a dirty venv. A third test names the OTLP exporter specifically, so
+  the regression this packet fixes fails with a message that points at itself.
+- `AGENTS.md` rule 19 and a README section: a green gate is a claim about a clean
+  machine, and `rm -rf .venv && bin/prime` is how you check it.
+
+### Deliberately not done
+
+- `test_a_configured_endpoint_gets_a_batch_processor` is unchanged. It tests real
+  behavior — an endpoint configured means a batch processor is wired — so the
+  dependency moved instead of the test.
+- No `pytest.mark.skipif` on the exporter. Skipping would trade a broken gate for a
+  gate that quietly tests less, which is the failure mode this packet exists to end.
+- Coverage stays at 100%; the added tests are in `tests/`, so they do not dilute it.
+
 Packet `muse-03`: OpenTelemetry, trace propagation, and bounded retry budgets. PLAN §7
 adopts W3C `traceparent` with traces in the platform collector, and bounded retry
 budgets with circuit breakers ("briefs forbid naive retries").
