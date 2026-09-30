@@ -82,11 +82,13 @@ class SigningKey:
     def sign(self, claims: Mapping[str, Any], *, header: Mapping[str, Any] | None = None) -> str:
         """A token signed by this key, `alg` and `kid` in the protected header.
 
-        `header` overrides rather than replaces, so a test that wants a different `kid`
-        or an extra header parameter does not have to re-state `alg`.
+        `header` overrides rather than replaces, which is what lets the amplification
+        test name five hundred different `kid`s from **one** key pair — a flood of
+        unknown key ids is the attack, and minting 500 RSA-2048 keys to simulate it
+        would cost a minute of CPU to prove a property about a counter.
         """
         return jwt.encode(
-            {**(header or {}), "alg": "RS256", "kid": self.kid},
+            {"alg": "RS256", "kid": self.kid, **(header or {})},
             dict(claims),
             self._key,
             algorithms=["RS256"],
@@ -182,11 +184,15 @@ def claims(**overrides: Any) -> dict[str, Any]:
     Written out rather than merged into so that a test overriding one claim is stating
     "this token is valid *except* for this", which is the only way a single-failure test
     proves the check it names is the check that fired.
+
+    A `None` override **removes** the claim rather than setting it to JSON `null`, which
+    is a different thing entirely: a claim that is absent fails an `essential` check, and
+    a claim whose value is null does not. Tests that mean "absent" pass `None`.
     """
     import time
 
     now = int(time.time())
-    return {
+    document = {
         "iss": ISSUER,
         "aud": AUDIENCE,
         "sub": "usr_01",
@@ -195,8 +201,13 @@ def claims(**overrides: Any) -> dict[str, Any]:
         "jti": "jti_01",
         "account_id": ACCOUNT,
         "scopes": SCOPE,
-        **overrides,
     }
+    for name, value in overrides.items():
+        if value is None:
+            document.pop(name, None)
+        else:
+            document[name] = value
+    return document
 
 
 def token(
@@ -232,8 +243,12 @@ def tampered(signed: str, **overrides: Any) -> str:
 
 
 def unsigned(payload: Mapping[str, Any] | None = None, **header: Any) -> str:
-    """A compact JWS with no signature at all: what `alg: none` looks like."""
-    return f"{_segment({'typ': 'JWT', **header})}.{_segment(payload or claims())}."
+    """A compact JWS with no signature at all: what `alg: none` looks like.
+
+    `alg` defaults to `"none"` because a header *without* an `alg` is a different (also
+    refused, but differently malformed) shape. Passing `alg=""` produces that one.
+    """
+    return f"{_segment({'typ': 'JWT', 'alg': 'none', **header})}.{_segment(payload or claims())}."
 
 
 def symmetric(payload: Mapping[str, Any] | None = None, **header: Any) -> str:

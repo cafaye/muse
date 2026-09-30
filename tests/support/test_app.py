@@ -41,21 +41,46 @@ TEST_KEY = load_vault_key({"MUSE_VAULT_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 IDENTITY = Identity()
 
 
-def auth_for(identity: Identity = IDENTITY, *, clock=time.time) -> TokenVerifier:
+class FakeClock:
+    """A clock a test moves by hand.
+
+    The JWKS cache's two windows — the TTL and the minimum interval between forced
+    refreshes — are *schedules*, not elapsed times. Asserting on them by sleeping would
+    make the suite slower than the thing it describes and flaky at both ends; injecting
+    the clock is what lets a test say "advance past the refresh interval" and assert on
+    what the policy then does. Same technique as `Router(clock=..., unit=...)`
+    (AGENTS.md rule 14).
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+#: The key-set URL the fixture serves from, built the way production builds it.
+JWKS_URL = f"{ISSUER}/.well-known/jwks.json"
+
+
+def auth_for(
+    identity: Identity = IDENTITY, *, clock=time.time, cache_clock: FakeClock | None = None
+) -> TokenVerifier:
     """A verifier wired to `identity`, for a container that is not the default one.
 
-    `clock` is a parameter because the token's `exp` is a wall-clock second and a test
-    that wants to be *about* expiry passes a clock that says otherwise — the whole
-    technique `Router(clock=..., unit=...)` uses (AGENTS.md rule 14).
+    `clock` is the *claim* clock (what "now" means for `exp`), and `cache_clock` is the
+    *cache* clock (what "now" means for the TTL and the refresh interval). They are
+    separate because they answer different questions and a test is almost always about
+    exactly one of them: an expiry test moves the first, a rotation test moves the
+    second, and conflating them is how a test ends up passing for the wrong reason.
     """
     return TokenVerifier(
         issuer=ISSUER,
         audience=AUDIENCE,
-        jwks=JwksClient(
-            f"{ISSUER}/.well-known/jwks.json",
-            identity.fetch,
-            clock=time.monotonic,
-        ),
+        jwks=JwksClient(JWKS_URL, identity.fetch, clock=cache_clock or FakeClock()),
         clock=clock,
     )
 

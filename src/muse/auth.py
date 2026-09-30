@@ -53,7 +53,6 @@ from urllib.parse import urlparse
 
 from joserfc import jwk, jws, jwt
 from joserfc.errors import (
-    DecodeError,
     ExpiredTokenError,
     InvalidClaimError,
     JoseError,
@@ -191,7 +190,11 @@ class TokenVerifier:
         """
         try:
             header = jws.extract_compact(token.encode()).protected
-        except (DecodeError, ValueError, UnicodeDecodeError, AttributeError) as error:
+        except (JoseError, ValueError, UnicodeDecodeError, AttributeError) as error:
+            # Every joserfc failure here is "this is not a compact JWS I can read" — a
+            # `DecodeError` on the segments, or a `MissingAlgorithmError` on a header
+            # with no `alg` at all. Both are the caller's token being unusable, and
+            # both must be a 401 rather than an exception that escapes as a 500.
             raise Unauthenticated("token is malformed") from error
 
         if header.get("alg") != ALGORITHM:
@@ -243,7 +246,10 @@ class TokenVerifier:
         """
         value = claims.get("account_id")
         if not isinstance(value, str) or not value:
-            raise MissingAccount("token carries no account; muse meters per tenant")
+            raise MissingAccount(
+                "token carries no account_id; muse meters per tenant, so a request whose "
+                "cost cannot be attributed is refused"
+            )
         return value
 
     def _scopes_of(self, claims: Mapping[str, Any]) -> frozenset[str]:

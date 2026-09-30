@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -83,11 +84,19 @@ class _State:
 
     cache: _Cache | None = None
     last_refresh_at: float | None = None
-    #: `kid`s seen and refused since the last successful fetch. Bounded by the number of
-    #: distinct key ids identity has published, not by the number of requests — an
-    #: attacker sending random ids grows this until the next fetch, and the interval
-    #: bounds how long "until" is.
-    unknown: set[str] = field(default_factory=set)
+    #: `kid`s we have looked for and not found, mapped to when we looked.
+    #:
+    #: This is the *record* of a check rather than a second control: the interval in
+    #: `_may_refresh` is what actually bounds fetching, and an entry here is only live for
+    #: that same interval. It earns its place twice — it names the specific reason a key
+    #: id is not usable ("we looked, at T"), and it is cleared by any successful fetch so
+    #: a rotation can rescue an id previously refused.
+    #:
+    #: Timestamped rather than a plain set, and that is the part that is easy to get
+    #: wrong: an entry that outlives the interval would keep refusing a key id that a
+    #: rotation has since published, and the caller would be told "unknown key" for as
+    #: long as the process lived.
+    unknown: dict[str, float] = field(default_factory=dict)
 
 
 class JwksClient:
@@ -107,13 +116,17 @@ class JwksClient:
         *,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         refresh_interval: float = DEFAULT_REFRESH_INTERVAL_SECONDS,
-        clock: Callable[[], float],
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._url = url
         self._fetch = fetch
         self._ttl = ttl_seconds
         self._interval = refresh_interval
-        self._clock = clock
+        # `monotonic` by default, and monotonic *not* `time.time`: both of these clocks
+        # measure intervals, and a wall clock that steps backwards mid-rotation would
+        # make a cached set look fresh. Injected in tests so the bound is asserted
+        # against a schedule the policy asked for rather than against elapsed time.
+        self._clock = clock or time.monotonic
         self._state = _State()
         self._lock = asyncio.Lock()
 
@@ -143,31 +156,32 @@ class JwksClient:
 
     async def _keys_for(self, kid: str) -> jwk.KeySet | None:
         cached = self._state.cache
+        fresh = not self._stale()
 
-        # Cold: nothing has ever been fetched. Fetch and answer from it.
-        if cached is None:
-            await self._load()
-            return self._answer(kid)
-
-        # Fresh and known: the hot path, and the one that must cost nothing.
-        if not self._stale() and self._publishes(kid):
-            return cached.keys
-
-        # Fresh but unknown, and already refused since the last fetch: the negative
-        # cache. Without this branch a client holding a stale token re-runs the interval
-        # check on every request, and the bound below degrades from "one fetch per
-        # rotation" into "one fetch per interval, forever".
-        if not self._stale() and kid in self._state.unknown:
+        if fresh and cached is not None:
+            # The hot path, and the one that must cost nothing.
+            if self._publishes(kid):
+                return cached.keys
+            # Unknown to us, and we looked for it recently enough that looking again
+            # would be an unfunded fetch. This is the amplification control.
+            if self._may_look_again(kid):
+                await self._load()
+                return self._answer(kid)
+            # We hold a usable key set that simply does not name this key, so the answer
+            # is a refusal and not another fetch.
             return None
 
-        # Either the cache is stale, or `kid` is unknown and we are allowed to look
-        # again. Both are one fetch, and `_load` records the attempt either way, so the
-        # interval below is enforced by the clock rather than by this branch structure.
+        # Stale, or cold: we have nothing to answer with until a fetch succeeds.
         if self._may_refresh():
             await self._load()
             return self._answer(kid)
 
-        return cached.keys if self._publishes(kid) else None
+        # Cold *and* inside the interval, which means the last attempt failed. This is
+        # the case that a naive implementation gets wrong: "no cache" looks like a
+        # reason to always fetch, so during an outage — when fetching is most expensive
+        # — every request aims another one at identity. Fail closed instead, which is
+        # both cheaper and more honest: we cannot check the token, so we say so.
+        raise SigningKeysUnavailable(f"the signing keys at {self._url} could not be retrieved")
 
     def _answer(self, kid: str) -> jwk.KeySet | None:
         """The cached set if it publishes `kid`, else record the miss and say no."""
@@ -176,7 +190,7 @@ class JwksClient:
             raise SigningKeysUnavailable("the signing keys are not available")
         if self._publishes(kid):
             return cached.keys
-        self._state.unknown.add(kid)
+        self._state.unknown[kid] = self._clock()
         return None
 
     async def _load(self) -> None:
@@ -185,7 +199,16 @@ class JwksClient:
         A failure is a `SigningKeysUnavailable` rather than a silently-empty cache: a
         client that kept the last good set would be serving requests against a key set
         identity may have withdrawn, which is the opposite of what this module is for.
+
+        **The interval is claimed before the fetch, not after it.** That ordering is the
+        whole amplification control on the failure path, and it is not obvious: recording
+        the attempt on success only means that while identity is *down* — which is
+        exactly when fetching is most expensive — every request is allowed another one,
+        so the bound silently disappears during an outage. Claiming the slot first also
+        dedupes concurrent requests, because the claim is synchronous and the await
+        happens after it.
         """
+        self._state.last_refresh_at = self._clock()
         try:
             document = await self._fetch(self._url)
             keys = jwk.KeySet.import_key_set(document)
@@ -205,12 +228,11 @@ class JwksClient:
 
         now = self._clock()
         self._state.cache = _Cache(keys=keys, fetched_at=now)
-        self._state.last_refresh_at = now
         # Replaced on success, never merged: a merge is a set that only ever grows, and
         # a withdrawn key that never leaves.
         self._state.unknown.clear()
 
-    # --- the two clocks ----------------------------------------------------
+    # --- the two windows, and the two questions they answer --------------------
 
     def _stale(self) -> bool:
         """Whether the cached set has outlived its TTL.
@@ -222,6 +244,19 @@ class JwksClient:
         if cached is None:
             return True
         return self._clock() - cached.fetched_at >= self._ttl
+
+    def _may_look_again(self, kid: str) -> bool:
+        """Whether one more fetch is allowed, to look for this specific `kid`.
+
+        Two conditions, and the second is the one that makes the first mean something:
+        we must not have looked for *this key id* inside the interval, and we must not
+        have fetched anything inside the interval. Either alone would let a flood of
+        distinct ids defeat the bound.
+        """
+        checked_at = self._state.unknown.get(kid)
+        if checked_at is not None and self._clock() - checked_at < self._interval:
+            return False
+        return self._may_refresh()
 
     def _may_refresh(self) -> bool:
         """Whether enough time has passed to spend a fetch on an unknown `kid`.

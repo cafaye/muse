@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from fastapi import FastAPI, Request
 from opentelemetry import context as context_api
 from opentelemetry.trace import Span
@@ -327,17 +328,18 @@ def _build_auth(settings: Settings) -> TokenVerifier:
 JWKS_TIMEOUT_SECONDS = 5.0
 
 
-async def http_fetch_keys(url: str) -> dict:
+async def http_fetch_keys(url: str, transport: httpx.AsyncBaseTransport | None = None) -> dict:
     """Fetch the key set over HTTP.
 
     Raises on a non-2xx rather than returning the body, so `JwksClient` cannot be handed
     an error page it would try to parse as a key set. The response body is never logged
     or returned: identity's answer is third-party text, and the only thing this needs to
     carry upward is *that* it failed.
-    """
-    import httpx
 
-    async with httpx.AsyncClient(timeout=JWKS_TIMEOUT_SECONDS) as client:
+    `transport` is httpx's own injection point, used by the test to drive this without a
+    socket (AGENTS.md rule 3). Production passes nothing and gets the real network.
+    """
+    async with httpx.AsyncClient(timeout=JWKS_TIMEOUT_SECONDS, transport=transport) as client:
         response = await client.get(url)
         response.raise_for_status()
         return response.json()
