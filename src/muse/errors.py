@@ -218,6 +218,69 @@ class VaultDecryptError(MuseError):
     """
 
 
+class AuthError(MuseError):
+    """A credential was presented and muse refused it.
+
+    The base for every authentication and authorization failure, so the API layer can
+    catch the family and read the status off the exception rather than matching on
+    type. Splitting it from `ProviderAuthError` matters: those two are different
+    directions of the same word, and conflating them is how "identity is down" ends up
+    reported as "the caller's key is wrong".
+    """
+
+
+class Unauthenticated(AuthError):
+    """The credential is absent, malformed, unverified, or expired. 401.
+
+    Every one of those is the same answer to the caller — get a fresh token — and
+    distinguishing them in a `detail` is a convenience, not a security property. The
+    `detail` names *which* check failed because that is the first question support asks,
+    and names no claim value: a token's contents are the caller's, and a `problem+json`
+    body is the most-read copy of anything this process writes.
+    """
+
+
+class InsufficientScope(AuthError):
+    """The token verified and carries none of the capability the operation needs. 403.
+
+    Deliberately not `Unauthenticated`: the credential is good, and a caller who is told
+    "unauthorized" retries with the same token forever. core's own rule separates the
+    two, and so does every SDK generated from `openapi/v1.yaml`.
+    """
+
+
+class SigningKeysUnavailable(AuthError):
+    """identity's key set could not be fetched. 503.
+
+    Not 401, and this is the whole point of the class. A 401 tells the caller their
+    credential is bad, and the problem is that we could not *check* it — so a 401 sends
+    a caller with a perfectly good token to re-authenticate against a healthy identity
+    and then retry forever. It is a 503 because muse is up and identity is not, which is
+    the one case where retrying the same request is the right response.
+
+    The operational contract that follows: **muse does not serve unauthenticated traffic
+    when identity is down.** A request is refused rather than admitted on an unverified
+    credential, because the alternative is a service whose only protection against a
+    forged token is whether the token's issuer happened to be reachable.
+    """
+
+
+class MissingAccount(AuthError):
+    """A verified token carries no usable `account_id`. 401.
+
+    core requires `account_id` on authenticated service traffic, and muse bills and
+    meters per tenant — so a token with no tenant is a request whose cost cannot be
+    attributed to anyone. Refusing is the safe interim while the fleet-wide question is
+    open: the alternative is defaulting to `sub`, which turns a user id into a tenancy
+    key and makes a bug in one service a cross-tenant read.
+
+    Recorded as its own class rather than folded into `Unauthenticated` because it is
+    the one 401 that is not the caller's mistake in the ordinary sense — the token is
+    valid, it just cannot be used *here*, and an operator reading `error.type` needs to
+    tell that from a forged signature.
+    """
+
+
 class RouteNotFound(MuseError):
     """No route is configured for the requested model."""
 

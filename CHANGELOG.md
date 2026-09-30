@@ -5,6 +5,83 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-06 — the bearer token is verified, and a valid signature is not an authorization
+
+Packet `muse-06`: `require_bearer` stops being a presence check. It verifies the
+signature against `identity`'s published JWKS, checks the issuer, audience, expiry and
+every required claim, enforces the capability the operation needs, and refuses a token
+with no `account_id`.
+
+#### Changed
+
+- **The bearer token is verified.** RS256 only, against
+  `{issuer}/.well-known/jwks.json`, cached by `kid` with a bounded TTL so `identity` is
+  never on the hot path.
+  **Breaking for every existing caller**: any non-empty string used to work, and a 401
+  now means a real reason — a forged signature, an expired token, a wrong issuer or
+  audience, a missing claim, or no `account_id`. Nothing about the request or response
+  *shape* changed, which is why this is a minor version bump on `openapi/v1.yaml`: the
+  path is the same and the body is the same, but the meaning of a `200` did.
+- **A validly signed token carrying no scope is now a 403.** This is the change that
+  matters. "The signature is valid" and "the caller may do this" are different
+  questions, and an implementation that checks only the first authorises anybody
+  holding a stale token.
+- **`account_id` is required.** A token with none is refused rather than defaulted to
+  `sub`, because muse bills and meters per tenant and the lenient answer makes an
+  unattributable spend. **Stricter than `guard`**, which treats a missing
+  `account_id` as `undefined` for rate-limit keying; the two are answering different
+  questions and the divergence is recorded in `cafaye.yml` for a fleet-wide ruling.
+- **An unreachable key set is a 503, never a 401.**
+  **muse does not serve unauthenticated traffic when identity is down.** A 401 would
+  tell the caller their credential is bad when the problem is that we could not
+  *check* it. The request is refused rather than admitted on an unverified credential.
+- **Four new error classes**, all `AuthError`s: `Unauthenticated`, `InsufficientScope`,
+  `MissingAccount` and `SigningKeysUnavailable`. The first three report as
+  `policy_denied`; `SigningKeysUnavailable` reports as `dependency_unavailable`,
+  because an outage on the same dashboard as a fraud signal trains everyone to ignore
+  that page.
+- **`identity` is now a required dependency** in `cafaye.yml`. Not because muse needs
+  more of it — because it can no longer serve anything without it, and a soft
+  dependency is how `caf dev` starts a service that answers 503 to everything.
+- **`joserfc` and `httpx` are now runtime dependencies.** `httpx` was already in the
+  runtime closure through `litellm`, so the image gains nothing.
+
+#### Added
+
+- **The JWKS refresh is bounded.** A minimum interval between forced refreshes, a
+  timestamped negative cache of unknown `kid`s, and a cold cache that fails closed
+  rather than fetching again. Without the bound, "refresh on an unknown `kid`" is an
+  amplification primitive: anyone who can send a request can send one with a random
+  `kid` and make muse fetch the key set per request, unauthenticated, aimed at our own
+  identity service. `tests/test_auth.py` sends five hundred unknown `kid`s and asserts
+  the fetch count does not track the request count.
+- **Rotation works in both directions**, and is asserted: a token signed by a key
+  published *after* this process cached the old set is accepted within the refresh
+  interval, and a key withdrawn from the published set stops being accepted once the
+  TTL expires. The cache is replaced, never merged — a merged cache is a set in which a
+  withdrawn signing key never leaves.
+- **`403` as a documented response**, and the `503` gained a second cause.
+- `MUSE_IDENTITY_ISSUER`, `MUSE_IDENTITY_AUDIENCE`, `MUSE_JWKS_URL`,
+  `MUSE_JWKS_TTL_SECONDS`, `MUSE_JWKS_REFRESH_SECONDS`. These **default** rather than
+  being required, the opposite of `MUSE_VAULT_KEY` and deliberately: a wrong issuer or
+  audience cannot make a bad token good, so the worst a wrong default can do is refuse
+  every token.
+
+#### Open, and implemented safely under
+
+None of these is settled; all three are recorded in `cafaye.yml` for whoever decides.
+
+- **The capability claim's name.** core requires `scopes`; `guard` reads a
+  space-separated `scope`; `identity` mints both, byte-identical. muse accepts either
+  and **refuses a token carrying both where they disagree** — not merged, not
+  preferred, not unioned. A token whose two authorisation claims contradict each other
+  is a token muse does not understand, and guessing which one the issuer meant is how an
+  escalation about a claim name becomes a cross-tenant read.
+- **The required scope's exact string**, `completions:write`. It follows core's
+  documented `resource:action` shape and names muse's own surface, and it is one
+  constant. This packet adds no scope namespace to core's document.
+- **A token with no `account_id`** — refused here, lenient in `guard`. See above.
+
 ### muse-05 — error.type is core's vocabulary, and a span cannot claim one thing while recording another
 
 Packet `muse-05`: `error.type` moves from muse's class names to core's fleet

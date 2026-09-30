@@ -13,6 +13,15 @@
 # `uv run python -m muse.vault` and export it, or the service refuses to start — which
 # is the point: a vault that boots with a default key is a vault whose keys are
 # readable by anyone who can read this repository.
+#
+# There is no `identity` service here, so nothing in this stack can mint a token muse
+# will accept and `/v1/route` answers 503 for everything. That is the honest local
+# state rather than a gap: muse verifies tokens against a JWKS it fetches over the
+# network, and pointing it at the production issuer would be worse than useless. To
+# exercise the endpoint locally, run `identity` alongside this stack and set
+# MUSE_IDENTITY_ISSUER to its origin — the same value `guard` uses in the compose
+# network. The probes (/healthz, /readyz) do not consult an issuer and answer either
+# way.
 
 services:
   db:
@@ -54,6 +63,10 @@ services:
       # No default, on purpose. An empty value is a missing value, and muse treats a
       # missing key as a boot failure rather than a first-request failure.
       MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}
+      # Commented out rather than defaulted to the compose network: an issuer that does
+      # not exist here would fail every request at the key-set fetch, and a *wrong*
+      # issuer that does exist is a worse failure. Set it when identity is running.
+      # MUSE_IDENTITY_ISSUER: http://identity:8080
     depends_on:
       db:
         condition: service_healthy

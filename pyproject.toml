@@ -19,6 +19,14 @@ dependencies = [
     "psycopg-pool>=3.3.0",
     "opentelemetry-api>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
+    # Packet muse-06: JWT verification against identity's JWKS. `algorithms=[...]` is
+    # a parameter of joserfc's decode, so RS256 is pinned in the call rather than
+    # checked afterwards — see muse/auth.py.
+    "joserfc>=1.7.5",
+    # The JWKS fetch. Already in the runtime closure through litellm -> openai, so
+    # declaring it adds nothing to the image; it was dev-only before muse-06 and
+    # tests/test_dependencies.py would (correctly) refuse an undeclared import.
+    "httpx>=0.28.1",
     # Imported by src/muse at module scope, so declared rather than inherited from
     # fastapi's pins. See tests/test_dependencies.py.
     "pydantic>=2.13.5",         # the request/response models in api.py and main.py
@@ -41,7 +49,6 @@ dev = [
     # unaffected: the Dockerfile installs with --no-dev, which
     # tests/test_dependencies.py::test_the_exporter_stays_out_of_the_image asserts.
     "muse[otel]",
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "anyio>=4.15.1",

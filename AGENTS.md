@@ -21,11 +21,20 @@ out of scope — and so is `Idempotency-Key`, which PLAN §7 assigned to `muse-0
 which is **not built**; `muse.errors.ProviderIndeterminate` documents the billing
 consequence of its absence.
 
+Packet `muse-06` made the bearer token real. `require_bearer` used to count the
+header; it now verifies the signature against identity's published JWKS with the
+algorithm **pinned in the call**, checks the issuer, audience, expiry and every
+required claim, requires the capability the operation needs, and refuses a token with
+no `account_id`. **A valid signature is not an authorization** — a correctly signed
+token carrying no scope is a 403.
+
 ## Layout
 
 ```
 src/muse/main.py      the composition root: settings, Container, create_app()
-src/muse/api.py       POST /v1/route, the error envelope, auth stub, trace ids
+src/muse/api.py       POST /v1/route, the error envelope, the bearer check, trace ids
+src/muse/auth.py      the verifier: pinned algorithm, claims, capability, tenancy
+src/muse/jwks.py      identity's key set: cached, and refreshed under a bound
 src/muse/router.py    request -> ordered candidates -> completion
 src/muse/routes.py    config/routes.yaml and its loader
 src/muse/providers/   the Provider protocol, registry, litellm adapter, doubles
@@ -47,7 +56,9 @@ tests/                pytest; one module per concern, plus tests/support/
                      (test_dependencies.py checks the suite's imports against
                      the declared set, and bin/prime against --locked — see
                      Dependencies; test_error_vocabulary.py checks every
-                     error class against core's vocabulary — see rule 19)
+                     error class against core's vocabulary — see rule 19;
+                     test_auth.py is the bearer contract and test_jwks.py the
+                     key-set cache — see rule 20)
 bin/prime             the gate: uv sync --locked && ruff && pytest
 ```
 
@@ -195,6 +206,75 @@ bin/prime             the gate: uv sync --locked && ruff && pytest
     `record_error` catches the refusal, records `_OTHER` and logs the class
     name — a symbol, never the message — while the gate is what actually stops
     one shipping.
+
+20. **A valid signature is not an authorization.** `muse.auth.require_bearer` checks
+   the header, then the signature, then the claims, then the capability, then the
+   tenant — in that order, because each step is cheaper than the next and refusing
+   early is what keeps a malformed token from costing a key fetch. Five properties are
+   load-bearing, and each has a test named after the failure it prevents:
+   - **The algorithm is pinned in the call, not checked afterwards.**
+     `joserfc`'s `jwt.decode(..., algorithms=[ALGORITHM])` makes `alg: none`, HS256
+     and ES256 *unrepresentable*. An implementation that reads `alg` from the token
+     and then decides has already parsed attacker-controlled input to choose a
+     verifier. The pin lives in one constant (`muse.auth.ALGORITHM`); RS256 only,
+     because the algorithm is a property of the key set identity publishes and
+     accepting one no published key uses buys nothing.
+   - **A correctly signed token with no scope is a 403.** A verification-only
+     implementation passes every other auth test and still authorises anybody
+     holding a stale token. The scope gate is not optional plumbing.
+   - **An absent scope claim is the empty set, never everything.** A gate that
+     treats "no scopes" as "all scopes" is a gate with no gate.
+   - **A key set that cannot be fetched is a 503, never a 401.** A 401 tells the
+     caller their credential is bad when the problem is that we could not *check*
+     it, which sends a caller with a good token to re-authenticate against a
+     healthy identity and retry forever. `SigningKeysUnavailable` is the only auth
+     failure that is not the caller's fault, and it is the only one `errortype`
+     maps off `policy_denied` — an outage on the same dashboard as a fraud signal
+     trains everyone to ignore that page.
+   - **A token with no `account_id` is refused**, not defaulted to `sub`. muse bills
+     per tenant, so an unattributable spend is a request nobody can charge for, and
+     `sub` as a tenancy key makes a bug in one service a cross-tenant read. This is
+     **stricter than `guard`**, which treats a missing `account_id` as `undefined`
+     because its use is a rate-limit key; the two are answering different questions
+     and `cafaye.yml` records the divergence for a fleet-wide ruling.
+   - **The claim checks are ours, not the library's, because a verifier's errors
+     carry its messages.** `joserfc`'s `InvalidClaimError.args[0]` is not the claim
+     name — it is the sentence `"invalid_claim: Claim 'sub' must be a StringOrURI
+     value"` — and `guard` gives the rule this follows: a library's expected values
+     are the platform's internals. So `muse.auth` does its own presence, type and
+     value checks, one per rule, and the response says what was wrong in muse's
+     vocabulary. The library keeps the two jobs it is better at — verifying the
+     signature and pinning the algorithm. Those are crypto; a date comparison is not.
+     `test_a_refusal_never_quotes_the_verifiers_library` walks every failure path for
+     this, because it is the property that quietly regresses when somebody delegates
+     the checks to save twenty lines.
+21. **The key-set refresh is bounded, and the bound is claimed before the fetch.**
+   "Refresh on an unknown `kid`" without a floor is an amplification primitive:
+   anyone who can send a request can send one with a random `kid` and make muse fetch
+   the key set per request, unauthenticated, aimed at our own identity service. So
+   `muse.jwks` has a minimum interval between refreshes, a timestamped negative cache
+   of unknown `kid`s, and a cold cache that **fails closed** rather than fetching
+   again. Three things follow that are easy to get wrong, and all three were wrong in
+   the first draft of this packet — `tests/test_auth.py` and `tests/test_jwks.py` each
+   caught one:
+   - the interval is recorded on **every attempt, including a failed one**, and
+     *before* the `await`, or the bound vanishes during an outage — which is exactly
+     when another fetch is most expensive;
+   - "no cache" is **not** a reason to always fetch, for the same reason;
+   - a negative-cache entry **expires with the interval**, or a key id a rotation has
+     since published stays refused for the life of the process.
+   The cache is **replaced** on refresh, never merged: a merged cache is a set in
+   which a withdrawn signing key never leaves. Rotation therefore works in both
+   directions, and `tests/test_auth.py` asserts each one against an injected clock
+   rather than a sleep (rule 14).
+22. **Nothing about a token reaches a log, a span, or an error message.** The same
+   boundary as rule 16, and the credential is the worst case in it: a token in a
+   retained log is a credential in a searchable store. So `muse.auth` names the
+   *check* that failed and never a claim's value, `ALLOWED_SPAN_ATTRIBUTES` gained
+   **no** attribute in this packet, and `tests/test_auth.py` asserts the absence two
+   ways — a marker inside the claims, and separately the raw compact JWS, so a service
+   that logged `request.headers` passes the first and fails the second. Never at debug
+   level, never in an error message, never in a test failure message.
 
 ## Dependencies
 

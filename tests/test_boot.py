@@ -337,7 +337,10 @@ def _empty_table():
 def test_the_app_is_titled_and_versioned() -> None:
     app = create_app()
     assert app.title == "muse"
-    assert app.version == "0.2.0"
+    # Bumped by muse-06, and deliberately: the surface is the same path with the same
+    # body, but the *meaning* of a 200 changed — it now means a token verified. A client
+    # that assumed "any non-empty bearer string is fine" needs to notice.
+    assert app.version == "0.3.0"
 
 
 def test_the_openapi_document_the_app_generates_declares_the_endpoint() -> None:

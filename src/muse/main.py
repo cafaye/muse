@@ -22,12 +22,14 @@ first request.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from fastapi import FastAPI, Request
 from opentelemetry import context as context_api
 from opentelemetry.trace import Span
@@ -36,12 +38,18 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from muse.api import TRACE_HEADER, build_router, new_trace_id, register_error_handlers
+from muse.auth import TokenVerifier, jwks_url_for
 from muse.breaker import (
     DEFAULT_BREAKER_RESET_SECONDS,
     DEFAULT_BREAKER_THRESHOLD,
     BreakerRegistry,
 )
 from muse.db import Database, PsycopgDatabase
+from muse.jwks import (
+    DEFAULT_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_TTL_SECONDS,
+    JwksClient,
+)
 from muse.metering import Meter
 from muse.providers import LiteLLMProvider, ProviderRegistry
 from muse.providers.credentials import CredentialResolver, VaultCredentials
@@ -59,11 +67,20 @@ from muse.telemetry import (
 from muse.vault import Vault, load_vault_key
 
 APP_TITLE = "muse"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 APP_DESCRIPTION = "LLM routing, credentials vault, and token metering for cafaye."
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_ROUTES = REPO_ROOT / "config" / "routes.yaml"
+
+#: identity, as core's conventions document it: the only issuer, and the key set at
+#: `{issuer}/.well-known/jwks.json`. `MUSE_IDENTITY_ISSUER` overrides it.
+DEFAULT_IDENTITY_ISSUER = "https://identity.cafaye.com"
+
+#: The `aud` a token must carry to be for this service — muse's own client id. Guard
+#: calls it "guard's own client id" for the same reason: a resource server's audience
+#: is its own name, and anything wider would accept a token minted for a sibling.
+DEFAULT_IDENTITY_AUDIENCE = "muse"
 
 #: The vendors this build ships adapters for. Named in one place because the routes
 #: file is validated against the registry at boot, and a file naming a fourth vendor
@@ -113,6 +130,26 @@ class Settings:
     #: `muse.breaker` for why the default is five and not one.
     breaker_threshold: int = DEFAULT_BREAKER_THRESHOLD
     breaker_reset_seconds: float = DEFAULT_BREAKER_RESET_SECONDS
+    #: identity, and what it means to verify one of its tokens. core's documented
+    #: defaults (`docs/openapi-conventions.md:128`): identity is the only issuer, and
+    #: the key set lives at `{issuer}/.well-known/jwks.json`.
+    #:
+    #: These *default* rather than being required, which is the opposite of
+    #: `MUSE_VAULT_KEY` (rule 10) and deliberately so. A wrong issuer or audience
+    #: cannot make a bad token good: verification still needs a signature from the keys
+    #: at that URL, and a token addressed to another service fails the `aud` check. The
+    #: worst a wrong default can do is refuse every token — fail closed, loudly — where a
+    #: vault key's wrong default decrypts everybody's credentials. Rule 18's rule holds:
+    #: a setting whose fallback is safe falls back.
+    identity_issuer: str = DEFAULT_IDENTITY_ISSUER
+    identity_audience: str = DEFAULT_IDENTITY_AUDIENCE
+    #: An explicit key-set URL, for an operator pointing at a mirror. `None` means the
+    #: issuer's own well-known path, which is what identity serves and what core says.
+    jwks_url: str | None = None
+    #: How long a fetched key set is reused, and the floor between two forced refreshes
+    #: on an unknown `kid`. The second is the amplification control (see `muse.jwks`).
+    jwks_ttl_seconds: float = DEFAULT_TTL_SECONDS
+    jwks_refresh_interval: float = DEFAULT_REFRESH_INTERVAL_SECONDS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -129,6 +166,13 @@ class Settings:
             ),
             breaker_reset_seconds=_positive_float(
                 source, "MUSE_BREAKER_RESET_SECONDS", DEFAULT_BREAKER_RESET_SECONDS
+            ),
+            identity_issuer=source.get("MUSE_IDENTITY_ISSUER") or DEFAULT_IDENTITY_ISSUER,
+            identity_audience=source.get("MUSE_IDENTITY_AUDIENCE") or DEFAULT_IDENTITY_AUDIENCE,
+            jwks_url=source.get("MUSE_JWKS_URL") or None,
+            jwks_ttl_seconds=_positive_float(source, "MUSE_JWKS_TTL_SECONDS", DEFAULT_TTL_SECONDS),
+            jwks_refresh_interval=_positive_float(
+                source, "MUSE_JWKS_REFRESH_SECONDS", DEFAULT_REFRESH_INTERVAL_SECONDS
             ),
         )
 
@@ -180,6 +224,12 @@ class Container:
     vault: Vault
     meter: Meter
     credentials: CredentialResolver
+    #: The token verifier, and with it the key-set cache. Required rather than optional:
+    #: a container that could be built without one is a container whose `/v1/route`
+    #: either skips verification or invents a permissive default, and both are the bug
+    #: this packet exists to remove. Every test that builds a container supplies one, so
+    #: there is no path to a served app that does not verify.
+    auth: TokenVerifier
     scrub_secrets: tuple[Secret, ...] = ()
     #: The tracer, shared with `router` so the provider spans nest under the request
     #: span. Defaults to a no-op rather than being required, because a container
@@ -205,6 +255,7 @@ async def build_container(settings: Settings) -> Container:
     """
     key = load_vault_key()
     routes = routes_from_yaml(settings.routes_path.read_text(encoding="utf-8"))
+    auth = _build_auth(settings)
     database: Database = (
         await PsycopgDatabase.open(
             settings.database_url,
@@ -245,8 +296,53 @@ async def build_container(settings: Settings) -> Container:
         vault=vault,
         meter=Meter(database),
         credentials=credentials,
+        auth=auth,
         telemetry=telemetry,
     )
+
+
+def _build_auth(settings: Settings) -> TokenVerifier:
+    """The production verifier: identity's JWKS, cached, fetched over HTTP.
+
+    One client for the process, which is one cache — two verifiers would each fetch the
+    key set and could disagree about whether a rotation has happened, which is exactly
+    the failure a single source of truth for "which keys are live" exists to prevent.
+    """
+    return TokenVerifier(
+        issuer=settings.identity_issuer,
+        audience=settings.identity_audience,
+        jwks=JwksClient(
+            settings.jwks_url or jwks_url_for(settings.identity_issuer),
+            http_fetch_keys,
+            ttl_seconds=settings.jwks_ttl_seconds,
+            refresh_interval=settings.jwks_refresh_interval,
+            clock=time.monotonic,
+        ),
+        clock=time.time,
+    )
+
+
+#: How long one fetch of the key set may take. Five seconds, and the same default `guard`
+#: uses: long enough that a slow identity is not a failed one, short enough that a hung
+#: endpoint does not hold a request open past the point where the caller has given up.
+JWKS_TIMEOUT_SECONDS = 5.0
+
+
+async def http_fetch_keys(url: str, transport: httpx.AsyncBaseTransport | None = None) -> dict:
+    """Fetch the key set over HTTP.
+
+    Raises on a non-2xx rather than returning the body, so `JwksClient` cannot be handed
+    an error page it would try to parse as a key set. The response body is never logged
+    or returned: identity's answer is third-party text, and the only thing this needs to
+    carry upward is *that* it failed.
+
+    `transport` is httpx's own injection point, used by the test to drive this without a
+    socket (AGENTS.md rule 3). Production passes nothing and gets the real network.
+    """
+    async with httpx.AsyncClient(timeout=JWKS_TIMEOUT_SECONDS, transport=transport) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.json()
 
 
 class _UnavailableDatabase:

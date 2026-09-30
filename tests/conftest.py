@@ -18,14 +18,26 @@ import yaml
 
 from muse.main import create_app
 
+from .support.jwks import token
+from .support.test_app import IDENTITY
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROUTES_YAML = REPO_ROOT / "config" / "routes.yaml"
 
 BASE_URL = "http://muse.test"
 
-#: The auth header the endpoint's stub checks for. A real JWT lands with the guard
-#: contract; until then this is a presence check and nothing more.
-AUTH_HEADERS = {"Authorization": "Bearer test-token"}
+#: A real, signed, fully-valid bearer token — every check in core's list satisfied, with
+#: the capability `POST /v1/route` requires and an `account_id`.
+#:
+#: Not a stub and not a fixture that bypasses verification. Every test that posts with
+#: this header therefore drives the whole chain (signature, claims, capability,
+#: tenancy), so the auth tests are additions to the suite rather than a parallel one,
+#: and there is no test in this repository that reaches a handler without a credential
+#: that would pass production verification.
+#:
+#: Minted once at import against `IDENTITY`'s ephemeral key, so no private key is ever
+#: committed (see `tests/support/jwks.py`).
+AUTH_HEADERS = {"Authorization": f"Bearer {token(IDENTITY)}"}
 
 
 def write_routes(document: Mapping[str, Any]) -> str:

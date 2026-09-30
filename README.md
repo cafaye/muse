@@ -14,10 +14,98 @@ rest, and emits a `muse.tokens.consumed` event for every completion it serves so
 
 ## Status: v1 core
 
-Routing, the vault, metering and the HTTP surface are done and tested. Not in this
-version: streaming, tool calls, embeddings, images, batches, and a real admin UI. Auth
-is a stub — the bearer header's presence is checked and the token is not verified; real
-JWT verification arrives with the guard contract.
+Routing, the vault, metering, the HTTP surface and **real JWT verification** are done and
+tested. Not in this version: streaming, tool calls, embeddings, images, batches, and a
+real admin UI.
+
+## Auth
+
+`POST /v1/route` verifies the bearer token against the key set `identity` publishes.
+**A valid signature is not an authorization** — the token must also carry the
+capability the operation needs and the tenant the request runs as.
+
+| Check | Failure |
+| --- | --- |
+| RS256 signature, from identity's cached JWKS | 401 |
+| `alg: none`, HS256, ES256, or any token naming a key identity does not publish | 401 |
+| `iss`, `aud`, `exp`, `nbf` | 401 |
+| `sub`, `iat`, `jti`, `account_id` present | 401 |
+| `completions:write` in the capability set | **403** |
+| `identity`'s key set reachable | **503** |
+
+Two of those deserve their own line.
+
+**A correctly signed token with no scope is a 403.** That is the whole point: "the
+signature is valid" and "the caller may do this" are different questions, and an
+implementation that checks only the first authorises anybody holding a stale token.
+
+**An unreachable key set is a 503, never a 401.** A 401 tells the caller their
+credential is bad, and the problem is that we could not *check* it — so a 401 sends a
+caller with a perfectly good token to re-authenticate against a healthy identity and
+then retry forever.
+
+> **muse does not serve unauthenticated traffic when identity is down.** The request is
+> refused rather than admitted on an unverified credential. The alternative is a service
+> whose only protection against a forged token is whether the token's issuer happened to
+> be reachable at that moment.
+
+### Two open platform questions
+
+Neither is settled, and both are recorded in `cafaye.yml` for whoever decides.
+
+**The claim's name.** `core/docs/openapi-conventions.md` requires `scopes`; `guard` reads
+a space-separated `scope`. `identity` mints **both**, byte-identical, precisely so the
+decision can land without breaking an issued token. muse accepts either name, and
+**refuses a token carrying both where they disagree** — not merged, not preferred, not
+unioned. A token whose two authorisation claims contradict each other is a token muse
+does not understand, and guessing which one the issuer meant is how an escalation about
+a claim name becomes a cross-tenant read.
+
+**The required scope.** `completions:write` follows core's documented
+`resource:action` shape and names muse's own surface, but the exact string is
+provisional and this packet adds no scope namespace to core's document.
+
+A token with **no `account_id`** is refused, which is stricter than `guard`: muse bills
+and meters per tenant, so a request whose cost cannot be attributed is a request nobody
+can charge for. Defaulting to `sub` would make a user id a tenancy key.
+
+### Configuration
+
+| Variable | Default | What it is |
+| --- | --- | --- |
+| `MUSE_IDENTITY_ISSUER` | `https://identity.cafaye.com` | The only issuer whose tokens are accepted. |
+| `MUSE_IDENTITY_AUDIENCE` | `muse` | The `aud` a token must carry to be for this service. |
+| `MUSE_JWKS_URL` | `{issuer}/.well-known/jwks.json` | An explicit key-set URL, for a mirror. |
+| `MUSE_JWKS_TTL_SECONDS` | `300` | How long a fetched key set is reused. |
+| `MUSE_JWKS_REFRESH_SECONDS` | `30` | Floor between two forced refreshes. |
+
+These **default** rather than being required, which is the opposite of `MUSE_VAULT_KEY`
+and deliberate: a wrong issuer or audience cannot make a bad token good, so the worst a
+wrong default can do is refuse every token. Fail closed, loudly.
+
+### The key set is cached, and the refresh is bounded
+
+Keys are cached by `kid` with a bounded TTL, so `identity` is never on the hot path. An
+unknown `kid` triggers **one** refresh — bounded by a minimum interval, because
+"refresh on an unknown `kid`" without a bound is an amplification primitive: anyone who
+can send a request can send one with a random `kid` and make muse fetch the key set per
+request, by an unauthenticated caller, aimed at our own identity service.
+`tests/test_auth.py` sends five hundred unknown `kid`s and asserts the fetch count does
+not track the request count.
+
+Rotation works in both directions: a token signed by a key published *after* this
+process cached the old set is accepted within the refresh interval, and a key withdrawn
+from the published set stops being accepted once the TTL expires — the cache is
+replaced, never merged, because a merged cache is a set where a withdrawn key never
+leaves.
+
+### Nothing about the token is logged
+
+The token is a credential, and a token in a retained log is a credential in a searchable
+store. No claim is recorded on a span, no error message carries one, and
+`tests/test_auth.py` asserts it with a marker placed inside the token — separately
+against the raw compact JWS, so a service that logged `request.headers` fails the
+second check.
 
 ## Requirements
 
@@ -27,6 +115,16 @@ anything other than the probes to answer.
 
 ```sh
 mise install          # reads mise.toml -> python 3.14, uv 0.12.20
+```
+
+`identity` is required to serve anything but the probes: muse verifies tokens against a
+JWKS it fetches over the network, so `/v1/route` answers 503 without an issuer. The
+probes consult nothing and answer either way.
+
+```sh
+# If identity is not running on the compose network, the probes still work and the
+# endpoint 503s. This is the honest local state, not a gap.
+docker compose up --build
 ```
 
 ## Quick start
@@ -92,25 +190,27 @@ containers that could have answered.
 
 ```sh
 curl -s localhost:8000/v1/route \
-  -H 'Authorization: Bearer <any non-empty token>' \
+  -H "Authorization: Bearer $MUSE_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model":"fast","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The token is not verified. The header's presence is what is checked.
+`$MUSE_TOKEN` is a real JWT from `identity`: RS256, carrying `completions:write` and an
+`account_id`. Any non-empty string is a 401 now — see [Auth](#auth).
 
 Every non-2xx is `application/problem+json`:
 
-| Code                | Status | When                                            |
-| ------------------- | ------ | ----------------------------------------------- |
-| `unauthorized`      | 401    | No bearer credential supplied.                  |
-| `not_found`         | 404    | No route for the requested model.               |
-| `validation_failed` | 422    | The body is not a valid route request.          |
-| `unavailable`       | 503    | Every candidate provider failed.                |
-| `internal`          | 500    | muse failed. `trace_id` is the handle.          |
+| Code                | Status | When                                                              |
+| ------------------- | ------ | ----------------------------------------------------------------- |
+| `unauthorized`      | 401    | The credential is absent, malformed, unverified, expired, or has no `account_id`. |
+| `forbidden`         | 403    | The token verified and lacks `completions:write`.                  |
+| `not_found`         | 404    | No route for the requested model.                                  |
+| `validation_failed` | 422    | The body is not a valid route request.                             |
+| `unavailable`       | 503    | Every candidate provider failed, **or** identity's keys are unreachable. |
+| `internal`          | 500    | muse failed. `trace_id` is the handle.                             |
 
-A 503 means muse is up and the models are not — the one case where retrying the same
-request is worthwhile.
+A 503 means muse is up and something it depends on is not — the models, or `identity` —
+which is the one case where retrying the same request is worthwhile.
 
 ## Routing
 
@@ -191,6 +291,8 @@ Each is a runtime dependency this packet added, and the reason it is not avoidab
 | `opentelemetry-exporter-otlp` | **Optional extra** (`muse[otel]`), imported only when `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` is set. As a hard dependency it would pull grpcio and protobuf into every install to serve a path most deployments never reach. The dev group pulls the extra in, because the suite tests that path. |
 | `pydantic`        | The request and response models in `api.py` and `main.py`. Imported at module scope, so declared rather than inherited from fastapi's pin. |
 | `starlette`       | The ASGI types, the header types and `HTTPException` — muse is an ASGI app, and its pure-ASGI middleware imports these directly. Declared for the same reason as `pydantic`. |
+| `joserfc`       | JWT verification against identity's JWKS (packet muse-06). BSD-3-Clause, and its **only** dependency is `cryptography`, which muse already declared — so the whole crypto layer adds one pure-Python package and no tree. Chosen over `PyJWT[crypto]` and `python-jose` for the reason that matters here: `algorithms=[...]` is a parameter of its `decode`, so RS256 is pinned in the call and `alg: none` / HS256 / ES256 are *unrepresentable* rather than unlisted. `python-jose` was rejected as effectively unmaintained. |
+| `httpx`         | The JWKS fetch. Was dev-only before muse-06; it was already in the runtime closure through `litellm`, so the image gains nothing, and `tests/test_dependencies.py` would (correctly) refuse an undeclared import. Also the suite's ASGI client. |
 | `jsonschema`    | Dev only: validates `cafaye.yml` against core's schema when a checkout is available. |
 
 Floors are the newest releases satisfying the machine-wide uv
@@ -208,6 +310,16 @@ then discarded. Nothing leaves the process, which is what keeps the suite hermet
 | --- | --- | --- |
 | `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP endpoint. Unset means export nowhere. Setting it without `muse[otel]` installed is a boot error naming both fixes, not a silent no-op. |
 | `OTEL_SERVICE_NAME` | `muse` | `service.name` on the exported resource. |
+
+### Auth
+
+| Variable | Default | What it is |
+| --- | --- | --- |
+| `MUSE_IDENTITY_ISSUER` | `https://identity.cafaye.com` | The only issuer whose tokens are accepted. |
+| `MUSE_IDENTITY_AUDIENCE` | `muse` | The `aud` a token must carry to be for this service. |
+| `MUSE_JWKS_URL` | `{issuer}/.well-known/jwks.json` | An explicit key-set URL, for a mirror. |
+| `MUSE_JWKS_TTL_SECONDS` | `300` | How long a fetched key set is reused. |
+| `MUSE_JWKS_REFRESH_SECONDS` | `30` | Floor between two forced refreshes — the amplification control. |
 
 The container image installs the locked dependency set without the `otel` extra and
 without the dev group, so adding an endpoint to a compose deployment needs the extra
@@ -229,7 +341,9 @@ section of `AGENTS.md`.
 ```
 src/muse/
   main.py            the composition root: settings, the container, create_app()
-  api.py             POST /v1/route, the error envelope, auth stub, trace ids
+  api.py             POST /v1/route, the error envelope, the bearer check, trace ids
+  auth.py            the verifier: pinned algorithm, claims, capability, tenancy
+  jwks.py            identity's key set: cached, and refreshed under a bound
   router.py          request -> ordered candidates -> completion, with fallback
   routes.py          config/routes.yaml and its loader
   providers/         the Provider protocol, the registry, the litellm adapter

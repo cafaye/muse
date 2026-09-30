@@ -44,7 +44,7 @@ from muse.vault import Vault
 from .conftest import AUTH_HEADERS, asgi_client
 from .support.fake_database import FakeDatabase
 from .support.litellm_stub import make_stub
-from .support.test_app import TEST_KEY
+from .support.test_app import TEST_KEY, auth_for
 from .support.tracing import by_name, names, payloads, recording_telemetry, rendered
 
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
@@ -84,6 +84,7 @@ def _app(registry: ProviderRegistry, table: RouteTable, telemetry: Telemetry, **
         vault=Vault(database, TEST_KEY),
         meter=Meter(database),
         credentials=StaticCredentials({}),
+        auth=auth_for(),
         telemetry=telemetry,
     )
     return create_app(container=container)
@@ -562,6 +563,7 @@ async def test_the_breaker_state_is_recorded_on_the_provider_span() -> None:
         vault=Vault(database, TEST_KEY),
         meter=Meter(database),
         credentials=StaticCredentials({}),
+        auth=auth_for(),
         telemetry=telemetry,
     )
     app = create_app(container=container)
@@ -674,6 +676,7 @@ async def test_a_held_credential_never_reaches_a_span() -> None:
         meter=Meter(database),
         credentials=StaticCredentials({}),
         scrub_secrets=(Secret("sk-live-XYZ"),),
+        auth=auth_for(),
         telemetry=telemetry,
     )
     app = create_app(container=container)
