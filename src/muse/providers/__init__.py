@@ -37,7 +37,7 @@ from muse.errors import (
     ProviderUnavailable,
     ResponseShapeError,
 )
-from muse.redaction import Secret
+from muse.redaction import Secret, redact
 
 #: The roles a message may have. OpenAI's set, which is a superset of what the
 #: other vendors need; the adapter maps them if a vendor disagrees.
@@ -460,8 +460,12 @@ class LiteLLMProvider:
         The credential is scrubbed out of the message on the way through: a provider
         that echoes the key it rejected would otherwise put a live credential in
         every log line and every error body downstream of here.
+
+        `sanitise` does the scrubbing *on the original exception*, not just on the
+        copy returned here. That is the part that is easy to get wrong — see its
+        docstring.
         """
-        detail = _scrub(str(error), self._api_key)
+        detail = _sanitise(error, self._api_key)
         name = type(error).__name__
         module = self.litellm
         if name == "ContextWindowExceededError":
@@ -524,7 +528,10 @@ class LiteLLMProvider:
                 max_tokens=1,
             )
         except Exception as error:  # a probe reports a failure, it does not raise
-            return Health(healthy=False, detail=_scrub(str(error), self._api_key))
+            # No in-place scrub here, unlike the error path: this detail is returned
+            # as a string and nothing chains the original exception, so no second
+            # copy of the message is left holding the key.
+            return Health(healthy=False, detail=redact(str(error), self._api_key))
         return Health(healthy=True, detail="ok")
 
 
@@ -559,12 +566,30 @@ def _looks_like_missing_credential(detail: str) -> bool:
     return any(hint in lowered for hint in _MISSING_CREDENTIAL_HINTS)
 
 
-def _scrub(detail: str, secret: Secret) -> str:
-    """Remove a credential from provider text. The adapter holds the key, so the
-    adapter is the only place that can do this."""
-    from muse.redaction import redact
+def _sanitise(error: Exception, secret: Secret) -> str:
+    """`error`'s message with the credential scrubbed out, ready to report.
 
-    return redact(detail, secret)
+    The scrub is applied to the original exception *in place*, not only to the string
+    this function returns. That distinction is the whole reason this function exists
+    rather than a bare `redact(str(error), secret)`.
+
+    `complete` raises the mapped error `from error`, which keeps the vendor's
+    exception as the `__cause__` — and every traceback renderer in the ecosystem
+    (`traceback.format_exception`, `logging.exception`, an APM agent, Sentry) prints
+    that cause together with its own message. Scrubbing only the reported message
+    therefore leaves the plaintext key in the chained cause, so a `logger.exception`
+    downstream writes the live credential to disk while the reported error body
+    looks clean. Rewriting the cause's message closes that hole.
+
+    The cause keeps its class and its traceback frames, which is the part of a
+    provider stack trace worth having; only the credential is removed. The message
+    is left exactly as-is when it carries no credential, so an untouched upstream
+    message is not silently re-worded on its way to the logs.
+    """
+    detail = redact(str(error), secret)
+    if detail != str(error):
+        error.args = (detail,)
+    return detail
 
 
 def _per_1k_micros(per_token: Any) -> int:

@@ -20,6 +20,8 @@ router's own tests need a provider and a later packet's contract tests will too.
 
 from __future__ import annotations
 
+import traceback
+
 import pytest
 
 from muse.errors import (
@@ -900,6 +902,62 @@ async def test_the_adapter_maps_an_unrecognised_error_to_unavailable() -> None:
     provider = make_provider(raises="SomethingNewUpstream", error_message="surprise")
     with pytest.raises(ProviderUnavailable, match="SomethingNewUpstream"):
         await provider.complete(ask())
+
+
+async def test_the_adapter_scrubs_the_credential_out_of_the_whole_traceback() -> None:
+    """The leak `str(exc)` cannot see, and the one that actually reaches a log.
+
+    `raise ... from error` keeps the vendor's exception as the `__cause__`, and
+    every traceback renderer — `traceback.format_exception`, `logging.exception`,
+    an APM agent, Sentry — prints that cause with its own message. So scrubbing
+    only the reported message leaves the plaintext key in the chained cause, and
+    the assertion above passes while the key still ships in the log line.
+
+    This asserts on the *rendered* traceback rather than on any one attribute,
+    because the rendered text is the thing that gets written down.
+    """
+    provider = make_provider(
+        api_key="sk-live-SECRET123",
+        raises="AuthenticationError",
+        error_message="Incorrect API key provided: sk-live-SECRET123",
+    )
+    with pytest.raises(ProviderAuthError) as excinfo:
+        await provider.complete(ask())
+    rendered = "".join(
+        traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
+    )
+    assert "sk-live-SECRET123" not in rendered
+    assert "redacted" in rendered
+
+
+async def test_the_adapter_keeps_the_vendor_exception_in_the_chain() -> None:
+    """The counterweight to the scrub: sanitising must not be done by dropping the
+    cause.
+
+    The cause is the only record of *where* inside litellm the failure happened,
+    which is the part of a provider stack trace that is worth reading. The fix
+    removes the credential from the chain, not the chain itself — a
+    `from None` here would pass every redaction test and make every provider
+    failure undiagnosable.
+    """
+    provider = make_provider(raises="InternalServerError", error_message="500 boom")
+    with pytest.raises(ProviderUnavailable) as excinfo:
+        await provider.complete(ask())
+    cause = excinfo.value.__cause__
+    assert cause is not None
+    assert type(cause).__name__ == "InternalServerError"
+
+
+async def test_the_adapter_leaves_a_clean_cause_message_untouched() -> None:
+    """Scrubbing rewrites the cause's message. It must rewrite only when it had to,
+    so an error carrying no credential is not silently re-worded on its way to the
+    logs — the diagnostic value of an untouched upstream message is the point of
+    keeping the cause at all.
+    """
+    provider = make_provider(raises="Timeout", error_message="gateway timeout after 30s")
+    with pytest.raises(ProviderTimeout) as excinfo:
+        await provider.complete(ask())
+    assert excinfo.value.__cause__.args == ("gateway timeout after 30s",)
 
 
 async def test_the_adapter_scrubs_the_credential_out_of_the_error_detail() -> None:

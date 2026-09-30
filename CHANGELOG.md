@@ -44,6 +44,19 @@ conventional-compat (0.x, so anything may change while pre-1.0).
     `ContextWindowExceededError` checked before `BadRequestError`, which it
     subclasses upstream.
 
+### Fixed
+
+- Credential redaction in the LiteLLM adapter's error path now covers the whole
+  rendered traceback, not only the reported message. `complete` raises the mapped
+  error `from` the vendor exception, so the plaintext key survived in the chained
+  `__cause__`; every traceback renderer (`traceback.format_exception`,
+  `logging.exception`, an APM agent) prints that cause with its own message, which
+  put a live credential in the log line even though the reported error body read
+  clean. `_sanitise` now scrubs the cause's message in place, keeping the vendor
+  exception class and its frames — the cause is deliberately *not* dropped, since
+  a `from None` would pass every redaction test and make provider failures
+  undiagnosable. Messages carrying no credential are left exactly as-is.
+
 ## [0.1.0] — 2026-09-30
 
 Initial scaffold (packet `muse-01`). No LLM logic yet — see `AGENTS.md`.
