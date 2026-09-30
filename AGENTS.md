@@ -60,6 +60,9 @@ tests/                pytest; one module per concern, plus tests/support/
                      test_auth.py is the bearer contract and test_jwks.py the
                      key-set cache — see rule 20)
 bin/prime             the gate: uv sync --locked && ruff && pytest
+gate.yml              the gate, declared: the command, the mise task, what it
+                      needs from the machine, and the lines it must print
+tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
 ```
 
 ## Rules
@@ -334,16 +337,49 @@ quarantine*, which is often a version or two behind the true latest. So:
   Assert the floor before asserting an absence, and when adding a guard, break it
   on purpose and watch it go red.
 
-## Toolchain
+## The gate is declared, not discovered
 
-`mise.toml` pins `python = "3.14"` and `uv = "0.12.20"`; `.python-version`
-pins 3.14. If a new interpreter release lands, bump `.python-version` and
-`mise.toml` together and re-run the gate.
+`gate.yml` at the root states what gates this repository, against core's
+`schemas/gate.schema.json`. Read it before changing `bin/prime`, `mise.toml`
+or `.github/workflows/ci.yml`: the checker reads all three, and it is what
+turns "run the gate" from a thing a human has to get right into a file.
+
+Three things in it are load-bearing here and are easy to undo by accident:
+
+- **`proof[].core-parity` must not match a line that says `skipped`.** That
+  regex is the only thing standing between `bin/prime`'s exit code and the
+  three core-parity tests that do not run without `MUSE_CORE_SCHEMAS`.
+  Delete it and the gate is green again over `895 passed, 3 skipped` — which
+  is the identity defect this format exists to remove. `tests/gate_self_test.sh`
+  breakage 13 asserts the red, and its companion asserts the green that
+  deleting the proof would restore.
+- **`proof[].minimum` is a ratchet.** `890` is below the suite's 895 so a new
+  test does not need the floor raised first; `898` is the exact count when the
+  core tier runs, and dropping one of the three drift guards takes it under.
+- **`external.selfContained: false`** because `bin/prime` starts with
+  `uv sync --locked`, which needs PyPI on a cold checkout and a pinned
+  toolchain the machine does not carry until mise installs it.
+
+Check it with core's checker, which this repository does not vendor:
+
+```sh
+../core/harness/bin/gate-check .              # the declaration against the tree
+../core/harness/bin/gate-check --prove .      # and the gate itself
+MUSE_CORE_SCHEMAS=../core/schemas ../core/harness/bin/gate-check --prove .
+bash tests/gate_self_test.sh                  # the declaration can fail
+```
+
+Two warnings are expected and correct, both `gate.requirement-unproven`: the
+checker refuses to run `mise install` or `git clone` to see whether a
+requirement is met, because an answer that depended on what happened to be on
+PATH would be red on a laptop and green on CI. It is reported and never acted
+on, which is the tri-state contract.
 
 ## Commands
 
 ```sh
 bin/prime                              # the gate
+mise run prime                         # the same gate; mise.toml declares it
 rm -rf .venv && bin/prime              # the gate on a clean machine — see Dependencies
 uv run pytest                          # tests + coverage gate
 uv run pytest -m unit                  # only unit-marked
@@ -357,3 +393,9 @@ MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
 ```
 
 Long commands get a `timeout`. Never push — the manager merges to `master`.
+
+## Toolchain
+
+`mise.toml` pins `python = "3.14"` and `uv = "0.12.20"`; `.python-version`
+pins 3.14. If a new interpreter release lands, bump `.python-version` and
+`mise.toml` together and re-run the gate.
