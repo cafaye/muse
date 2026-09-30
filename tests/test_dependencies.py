@@ -26,6 +26,14 @@ missing the exporter module cannot be found at all, and with the extra installed
 undeclared its owning distribution is outside the closure. The check fails in both
 states, which is what makes it worth having.
 
+A third assertion guards the *lock* rather than the imports, and it exists because of a
+second defect of the same family — one that deleting `.venv` does **not** expose.
+`uv sync --frozen` installs the lockfile *as written*; only `--locked` asserts that the
+lockfile still matches `pyproject.toml`. So an uncommitted re-lock is invisible: the
+gate resolves the old graph, passes, and the `uv run` later in the same script then
+quietly rewrites `uv.lock` on its way to pytest. Assertion 3 is what makes a lock that
+predates a `pyproject.toml` edit fail loudly instead.
+
 No socket, no subprocess: the graph comes from `pyproject.toml` and `uv.lock`, and
 ownership from the venv's own metadata (AGENTS.md rule 3).
 """
@@ -46,6 +54,7 @@ pytestmark = [pytest.mark.unit]
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 LOCK = ROOT / "uv.lock"
+PRIME = ROOT / "bin" / "prime"
 TREES = (ROOT / "src", ROOT / "tests")
 
 #: The module the endpoint path imports. Named on its own so the regression this
@@ -198,6 +207,70 @@ def _root_claims(declared: set[str]) -> dict[str, set[str]]:
     return claims
 
 
+def _declarations() -> dict[str, set[str]]:
+    """The distribution names `pyproject.toml` asks for, keyed by *where* it asks.
+
+    The keys are ``"[project.dependencies]"``, ``"[project.optional-dependencies].otel"``
+    and ``"[dependency-groups].dev"``. Where a declaration lives is the whole question
+    for the lock assertion: a package declared only in an extra is not something
+    `uv sync --frozen` installs, so a lock that has quietly grown one is a lock that
+    disagrees with what the gate will actually resolve.
+    """
+    document = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    project = document["project"]
+    declared: dict[str, set[str]] = {"[project.dependencies]": set()}
+    for requirement in project["dependencies"]:
+        name, _ = _requirement(requirement)
+        declared["[project.dependencies]"].add(name)
+    for extra, requirements in project.get("optional-dependencies", {}).items():
+        declared[f"[project.optional-dependencies].{extra}"] = {
+            _requirement(requirement)[0] for requirement in requirements
+        }
+    for group, requirements in document.get("dependency-groups", {}).items():
+        declared[f"[dependency-groups].{group}"] = {
+            _requirement(requirement)[0] for requirement in requirements
+        }
+    return declared
+
+
+def _locked() -> dict[str, set[str]]:
+    """Where `uv.lock` says each declared distribution came from.
+
+    Read from muse's own entry rather than by walking every package: the lock records
+    `requires-dist` and `requires-dev` verbatim from `pyproject.toml`, so comparing
+    those two lists is a comparison of the two files with no re-resolution and no
+    network. An extra's requirement appears in `requires-dist` with an
+    `extra == 'otel'` marker, which is exactly how an extra-only declaration is told
+    apart from a base one without parsing the marker.
+    """
+    muse = next(
+        package
+        for package in tomllib.loads(LOCK.read_text(encoding="utf-8"))["package"]
+        if _normalized(package["name"]) == _normalized(
+            tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["name"]
+        )
+    )
+    origins: dict[str, set[str]] = {}
+    for entry in muse["metadata"]["requires-dist"]:
+        marker = entry.get("marker", "")
+        # An extra-gated requirement is recorded under `extra == 'otel'`, which names
+        # the extra. Keyed by that name so it lines up with `[project.optional-
+        # dependencies].otel` on the declaration side without parsing the marker.
+        extra = re.search(r"extra == '([^']+)'", marker)
+        bucket = (
+            f"[project.optional-dependencies].{extra.group(1)}"
+            if extra
+            else "[project.dependencies]"
+        )
+        origins.setdefault(bucket, set()).add(_normalized(entry["name"]))
+    for group, entries in muse["metadata"].get("requires-dev", {}).items():
+        for entry in entries:
+            origins.setdefault(f"[dependency-groups].{group}", set()).add(
+                _normalized(entry["name"])
+            )
+    return origins
+
+
 def _provided(owners: dict[str, set[str]], closure: set[str]) -> set[str]:
     """Every module name the closure can supply: what its distributions ship, plus the
     namespace prefixes above them.
@@ -293,4 +366,63 @@ def test_the_otlp_exporter_the_endpoint_path_imports_is_in_the_gate() -> None:
         f"{', '.join(sorted(distributors)) or 'nothing'}, none of which `uv sync "
         "--frozen` installs. A test that imports a package makes it a dev "
         "dependency: add `muse[otel]` to the dev group."
+    )
+
+
+def test_the_committed_lock_agrees_with_pyproject() -> None:
+    """`uv.lock` must already carry every declaration in `pyproject.toml`.
+
+    The defect this catches does not need a deleted `.venv` and so is invisible to the
+    clean-checkout run: `uv sync --frozen` installs the lockfile *as written* and never
+    notices it disagrees with `pyproject.toml`. Only `--locked` asserts that. So with a
+    lock that predates an edit, `bin/prime` resolved the old graph, passed, and the
+    `uv run` a few lines later silently re-resolved and rewrote `uv.lock` on the way to
+    pytest — a green gate over a lockfile that was never the one committed.
+
+    Comparing the lock's own `requires-dist` / `requires-dev` against the declarations
+    is the same fact uv checks, read from two files already on disk: no subprocess, no
+    network, and it holds in a dirty working tree where `--locked` would need a
+    resolver.
+    """
+    locked = _locked()
+    disagreement = {
+        f"{bucket}: declared {sorted(names)}, locked {sorted(locked.get(bucket, set()))}"
+        for bucket, names in _declarations().items()
+        if names != locked.get(bucket, set())
+    }
+
+    assert disagreement == set(), (
+        "uv.lock does not match pyproject.toml. `uv sync --frozen` installs the lock\n"
+        "as written, so this gate would resolve the old graph and pass. Run `uv lock`\n"
+        "and commit uv.lock:\n" + "\n".join(sorted(disagreement))
+    )
+
+
+def test_bin_prime_asserts_the_lock_rather_than_only_freezing_it() -> None:
+    """`bin/prime` must use `--locked`, or the test above is the only thing standing
+    between a stale lock and a green gate.
+
+    `--frozen` and `--locked` sound interchangeable and are not. `--frozen` means "do
+    not update `uv.lock`", which is exactly what lets a lock that disagrees with
+    `pyproject.toml` install silently. `--locked` means "assert `uv.lock` would not
+    change", which is the property the gate's own comment claims it has and does not.
+
+    The whole script is checked rather than one line, because the exposure is the
+    *combination*: `uv run` re-resolves by default, so even a correct `uv sync --locked`
+    at the top is undone by an unguarded `uv run` further down.
+    """
+    script = PRIME.read_text(encoding="utf-8")
+
+    unguarded = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(script.splitlines(), start=1)
+        if re.search(r"\buv\s+(sync|run)\b", line)
+        and "--locked" not in line
+        and not line.lstrip().startswith("#")
+    ]
+
+    assert unguarded == [], (
+        "every `uv sync`/`uv run` in the gate must pass --locked. Without it the gate\n"
+        "installs whatever uv.lock says even when pyproject.toml disagrees, and `uv\n"
+        "run` rewrites the lock on the way to pytest:\n" + "\n".join(unguarded)
     )
