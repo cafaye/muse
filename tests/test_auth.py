@@ -175,7 +175,7 @@ async def test_a_token_from_another_issuer_is_refused() -> None:
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, iss="https://evil.test")))
     assert response.status_code == 401
-    assert "iss" in problem_of(response)["detail"]
+    assert "issuer" in problem_of(response)["detail"]
 
 
 async def test_a_token_addressed_to_another_service_is_refused() -> None:
@@ -184,7 +184,21 @@ async def test_a_token_addressed_to_another_service_is_refused() -> None:
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, aud="guard")))
     assert response.status_code == 401
-    assert "aud" in problem_of(response)["detail"]
+    assert "audience" in problem_of(response)["detail"]
+
+
+async def test_a_token_naming_several_audiences_is_accepted_when_one_is_ours() -> None:
+    """RFC 7519 §4.1.3: `aud` may be an array when there is more than one intended
+    recipient, and a token minted for `muse` and `guard` is a token for muse."""
+    identity = Identity()
+    response = await call(app_for(identity), bearer(token(identity, aud=[AUDIENCE, "guard"])))
+    assert response.status_code == 200
+
+
+async def test_a_token_naming_several_audiences_none_of_them_ours_is_refused() -> None:
+    identity = Identity()
+    response = await call(app_for(identity), bearer(token(identity, aud=["guard", "caf"])))
+    assert response.status_code == 401
 
 
 async def test_an_expired_token_is_refused() -> None:
@@ -201,6 +215,16 @@ async def test_a_token_that_is_not_yet_valid_is_refused() -> None:
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, nbf=int(time.time()) + 600)))
     assert response.status_code == 401
+
+
+async def test_a_token_that_is_already_valid_by_nbf_is_accepted() -> None:
+    """The other side of the same check. A token carrying an `nbf` in the past is
+    ordinary — `identity` mints one on every token it issues with a small backdate —
+    so refusing it would break the normal path.
+    """
+    identity = Identity()
+    response = await call(app_for(identity), bearer(token(identity, nbf=int(time.time()) - 30)))
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize("missing", REQUIRED_CLAIMS)
@@ -311,6 +335,74 @@ async def test_a_token_that_is_not_a_compact_jws_is_a_401_and_not_a_500(garbage:
     assert response.status_code == 401
     assert problem_of(response)["detail"] == "token is malformed"
     assert identity.fetches == [], "a malformed token reached the network"
+
+
+@pytest.mark.parametrize(
+    ("claim", "value"),
+    [
+        ("sub", 1),
+        ("sub", ""),
+        ("jti", 99),  # the revocation handle, as a number
+        ("jti", ""),
+        ("exp", "soon"),
+        ("exp", True),  # a bool IS an int in Python
+        ("iat", "now"),
+        ("iss", 5),
+        ("aud", 5),
+        ("aud", [AUDIENCE, 5]),  # an array that is not all strings
+        ("nbf", "later"),
+    ],
+)
+async def test_a_claim_of_the_wrong_type_is_refused(claim: str, value) -> None:
+    """Types, not just presence. A required claim that is present and the wrong shape
+    fails the same way as one that is absent, and a `Principal` handed to a handler
+    never carries an `int` where its fields are annotated `str`.
+
+    `exp: True` is the one worth naming: `bool` subclasses `int`, so a naive NumericDate
+    check reads `true` as 1970-01-01T00:00:01Z. That token is expired, so it is refused
+    anyway — but by accident, and right by accident is not a control.
+    """
+    identity = Identity()
+    response = await call(app_for(identity), bearer(token(identity, **{claim: value})))
+    assert response.status_code == 401
+    assert claim in problem_of(response)["detail"]
+
+
+async def test_a_refusal_never_quotes_the_verifiers_library() -> None:
+    """**No third-party text in a `problem+json` body.**
+
+    This is `guard`'s `refusalOf` rule, and it is why the claim checks are written here
+    rather than delegated to `joserfc`'s `JWTClaimsRegistry`: that library's
+    `InvalidClaimError.args[0]` is not the claim name, it is the sentence
+    `"invalid_claim: Claim 'sub' must be a StringOrURI value"`. Putting that in a
+    response hands a caller a description of this service's validation, and if a future
+    library version quotes an *expected value* it hands over the expected audience.
+
+    Every refusal below is checked for it, across every check that can fail, so the
+    property is not resting on one error path being well behaved today.
+    """
+    identity = Identity()
+    cases = {
+        "bad signature": tampered(token(identity), sub="attacker"),
+        "malformed": "not-a-jwt",
+        "wrong issuer": token(identity, iss="https://evil.test"),
+        "wrong audience": token(identity, aud="guard"),
+        "expired": token(identity, exp=int(time.time()) - 10),
+        "future nbf": token(identity, nbf=int(time.time()) + 600),
+        "bad sub type": token(identity, sub=1),
+        "bad exp type": token(identity, exp="soon"),
+        "unknown key": token(SigningKey("stranger")),
+        "unsigned": unsigned(kid=identity.keys[0].kid),
+    }
+    for name, candidate in cases.items():
+        response = await call(app_for(identity), bearer(candidate))
+        assert response.status_code == 401, f"{name} was not refused"
+        detail = problem_of(response)["detail"]
+        # The library's own spellings, plus its error-code prefixes. "NumericDate" is
+        # deliberately *not* on this list: it is RFC 7519's name for what `exp` is, so
+        # using it is ours and saying it helps whoever reads the 401.
+        for leaked in ("joserfc", "invalid_claim", "StringOrURI", "expired_token", "bad_signature"):
+            assert leaked not in detail, f"{name} leaked library text into the response: {detail!r}"
 
 
 async def test_a_token_naming_no_key_is_refused() -> None:

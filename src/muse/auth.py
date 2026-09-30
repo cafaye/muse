@@ -45,6 +45,7 @@ unique marker placed inside the token.
 
 from __future__ import annotations
 
+import hmac
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -52,14 +53,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from joserfc import jwk, jws, jwt
-from joserfc.errors import (
-    ExpiredTokenError,
-    InvalidClaimError,
-    JoseError,
-    MissingClaimError,
-    UnsupportedAlgorithmError,
-)
-from joserfc.jwt import JWTClaimsRegistry
+from joserfc.errors import JoseError, UnsupportedAlgorithmError
 
 from muse.errors import (
     InsufficientScope,
@@ -145,16 +139,8 @@ class TokenVerifier:
         self._issuer = issuer
         self._audience = audience
         self._jwks = jwks
-        self._registry = JWTClaimsRegistry(
-            now=lambda: int(clock()),
-            leeway=leeway,
-            iss={"essential": True, "value": issuer},
-            aud={"essential": True, "value": audience},
-            sub={"essential": True},
-            exp={"essential": True},
-            iat={"essential": True},
-            jti={"essential": True},
-        )
+        self._clock = clock
+        self._leeway = leeway
 
     async def verify(self, token: str) -> Principal:
         """The principal this token names, or raise.
@@ -217,18 +203,80 @@ class TokenVerifier:
             raise Unauthenticated(f"token is not valid ({type(error).__name__})") from error
 
     def _check_claims(self, claims: Mapping[str, Any]) -> None:
-        """`iss`, `aud`, `exp`/`nbf`, and the presence of every required claim."""
-        try:
-            self._registry.validate(dict(claims))
-        except MissingClaimError as error:
-            # `error.args[0]` is the library's own comma-joined list of *names*. Names,
-            # never values, and the names are a closed vocabulary this module wrote.
-            raise Unauthenticated(f"token is missing required claims: {error.args[0]}") from error
-        except ExpiredTokenError as error:
-            raise Unauthenticated("token has expired") from error
-        except InvalidClaimError as error:
-            claim = error.args[0] if error.args else "?"
-            raise Unauthenticated(f"token claim {claim!r} is not valid") from error
+        """Presence, type and value for every claim core lists as required.
+
+        **Written here rather than delegated to `joserfc`'s `JWTClaimsRegistry`, and
+        the reason is the one `guard` gives in `refusalOf`.** A verifier library's
+        errors carry its messages, and those messages describe the platform's internals
+        — `guard` notes that an expected audience "is this gateway's client id". A
+        library-composed message in a `problem+json` body is the same leak wearing a
+        nicer hat, and `joserfc`'s `InvalidClaimError.args[0]` is not even the claim
+        name; it is the sentence `"invalid_claim: Claim 'sub' must be a StringOrURI
+        value"`. So the mapping is ours, one check per rule, and the response says what
+        was wrong in muse's vocabulary.
+
+        The library keeps the two jobs it is actually better at: verifying the
+        signature, and pinning the algorithm. Those are crypto (see the module
+        docstring); a date comparison is not.
+        """
+        # `account_id` is deliberately absent from this loop. `_account_of` owns its
+        # presence, type and emptiness together, so the refusal can say *why* a token
+        # with no tenant is refused instead of "some claim is missing" — which is the
+        # difference between a caller who can fix it and a caller who cannot.
+        for name in REQUIRED_CLAIMS:
+            if name != "account_id" and name not in claims:
+                raise Unauthenticated(f"token is missing required claims: {name}")
+
+        self._check_issuer(claims)
+        self._check_audience(claims)
+        self._check_times(claims)
+        for name in ("sub", "jti"):
+            # `jti` is type-checked for a reason beyond tidiness: it is the handle an
+            # operator revokes by, and a number in that field is not a token id any
+            # revocation list can carry.
+            value = claims[name]
+            if not isinstance(value, str) or not value:
+                raise Unauthenticated(f"token claim {name!r} is not a non-empty string")
+
+    def _check_issuer(self, claims: Mapping[str, Any]) -> None:
+        issuer = claims["iss"]
+        if not isinstance(issuer, str) or not issuer:
+            raise Unauthenticated("token claim 'iss' is not a string")
+        if not hmac.compare_digest(issuer, self._issuer):
+            raise Unauthenticated("token issuer is not accepted")
+
+    def _check_audience(self, claims: Mapping[str, Any]) -> None:
+        """RFC 7519 §4.1.3: `aud` is a string, or an array of them when there is more
+        than one intended recipient. Anything else is a claim this service cannot
+        interpret, so it is refused rather than coerced."""
+        audience = claims["aud"]
+        if isinstance(audience, str):
+            candidates = [audience]
+        elif isinstance(audience, list) and all(isinstance(one, str) for one in audience):
+            candidates = audience
+        else:
+            raise Unauthenticated("token claim 'aud' is not a string or an array of them")
+        if not any(hmac.compare_digest(one, self._audience) for one in candidates):
+            raise Unauthenticated("token audience is not accepted")
+
+    def _check_times(self, claims: Mapping[str, Any]) -> None:
+        """`exp`, `nbf` and `iat`, all as NumericDate seconds.
+
+        `iat` is checked for presence and type but not compared: a token minted with a
+        clock a minute fast is still a token we should serve, and refusing it would make
+        clock skew an outage. Its failure mode — a token issued in the future — is
+        covered by `nbf`, which is the claim that states it deliberately.
+        """
+        expiry = _numeric_date(claims["exp"], "exp")
+        _numeric_date(claims["iat"], "iat")  # type only — see the docstring
+
+        now = int(self._clock())
+        if now >= expiry + self._leeway:
+            raise Unauthenticated("token has expired")
+        if "nbf" in claims:
+            not_before = _numeric_date(claims["nbf"], "nbf")
+            if now + self._leeway < not_before:
+                raise Unauthenticated("token is not valid yet")
 
     def _account_of(self, claims: Mapping[str, Any]) -> str:
         """The tenancy claim, or refuse.
@@ -286,6 +334,18 @@ class TokenVerifier:
 def _split_scopes(value: str) -> frozenset[str]:
     """Whitespace-separated scopes. Empty strings and runs of spaces are not scopes."""
     return frozenset(part for part in value.split() if part)
+
+
+def _numeric_date(value: Any, name: str) -> int:
+    """A NumericDate, or refuse.
+
+    `bool` is excluded explicitly: it is an `int` in Python, so a token with
+    `"exp": true` would otherwise verify as expiring in 1970+1 second — refused as
+    expired, which is right by accident, and right by accident is not a control.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Unauthenticated(f"token claim {name!r} is not a NumericDate")
+    return value
 
 
 def require_scope(principal: Principal, scope: str) -> None:

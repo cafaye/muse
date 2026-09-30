@@ -210,7 +210,7 @@ bin/prime             the gate: uv sync --locked && ruff && pytest
 20. **A valid signature is not an authorization.** `muse.auth.require_bearer` checks
    the header, then the signature, then the claims, then the capability, then the
    tenant — in that order, because each step is cheaper than the next and refusing
-   early is what keeps a malformed token from costing a key fetch. Four properties are
+   early is what keeps a malformed token from costing a key fetch. Five properties are
    load-bearing, and each has a test named after the failure it prevents:
    - **The algorithm is pinned in the call, not checked afterwards.**
      `joserfc`'s `jwt.decode(..., algorithms=[ALGORITHM])` makes `alg: none`, HS256
@@ -237,6 +237,17 @@ bin/prime             the gate: uv sync --locked && ruff && pytest
      **stricter than `guard`**, which treats a missing `account_id` as `undefined`
      because its use is a rate-limit key; the two are answering different questions
      and `cafaye.yml` records the divergence for a fleet-wide ruling.
+   - **The claim checks are ours, not the library's, because a verifier's errors
+     carry its messages.** `joserfc`'s `InvalidClaimError.args[0]` is not the claim
+     name — it is the sentence `"invalid_claim: Claim 'sub' must be a StringOrURI
+     value"` — and `guard` gives the rule this follows: a library's expected values
+     are the platform's internals. So `muse.auth` does its own presence, type and
+     value checks, one per rule, and the response says what was wrong in muse's
+     vocabulary. The library keeps the two jobs it is better at — verifying the
+     signature and pinning the algorithm. Those are crypto; a date comparison is not.
+     `test_a_refusal_never_quotes_the_verifiers_library` walks every failure path for
+     this, because it is the property that quietly regresses when somebody delegates
+     the checks to save twenty lines.
 21. **The key-set refresh is bounded, and the bound is claimed before the fetch.**
    "Refresh on an unknown `kid`" without a floor is an amplification primitive:
    anyone who can send a request can send one with a random `kid` and make muse fetch
