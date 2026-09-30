@@ -1,51 +1,67 @@
-# cafaye.yml — muse manifest (DRAFT)
+# cafaye.yml — the muse manifest.
 #
-# STATUS: draft. `core` owns the cafaye.yml schema (PLAN §4, Phase 0) and core
-# does not exist yet. This file is a worker-authored PROPOSAL so the manager has
-# something concrete to react to; it is not a validated contract. Do not build
-# tooling against it until the schema lands. Fields are expected to change.
+# Validated against cafaye/core's schemas/cafaye.manifest.schema.json, which owns
+# this format. The event types and the `exposes` keys are cross-checked against
+# core's docs/event-naming.md catalog: a published type that is not in the catalog
+# fails core's suite, so the two files are the same fact stated twice and they land
+# in the same commit.
 #
-# Drafted for: service identity, local run target, contract surface, probe
-# endpoints, and the ports the platform reserves.
+# What each part is for is in core's docs/manifest-conventions.md. The short version:
+# `caf dev`, `caf gen`, `pantry` and `guard` all read this one file rather than six
+# bespoke config files, which is how cross-repo drift starts.
 
-apiVersion: cafaye/v0
-kind: Service
+name: muse
+description: LLM routing, credentials vault, and token metering.
+language: python
+core: ^0.2.0
 
-metadata:
-  name: muse
-  org: cafaye
-  phase: 4
-  owner: cafaye
-  summary: LLM routing, credentials vault, and token metering.
-
-spec:
-  language: python
-  runtime:
-    python: "3.14"
-    packageManager: uv
-    entrypoint: "uvicorn --factory muse.main:create_app"
-    port: 8000
-    healthcheck:
-      liveness: /healthz
-      readiness: /readyz
-
-  local:
-    dev: docker compose up --build
-    gate: bin/prime
-
-  # The published API surface. Empty in v0 apart from the probes: the OpenAPI
-  # spec for muse's real endpoints is a Phase 4 contract-test deliverable, once
-  # `core` freezes the specs this repo validates against (PLAN §3.3).
-  apis: []
+exposes:
+  # The committed HTTP contract. FastAPI also generates a document from the code at
+  # /openapi.json, and this is the one that is reviewed and the one the SDKs are
+  # generated from — `tests/test_openapi.py` asserts the two agree in both
+  # directions, so neither can drift from the other.
+  api: openapi/v1.yaml
 
   events:
-    # Emitted, none. When metering lands it will publish usage events for
-    # `billing` to consume; that is a later packet, not this one.
-    emits: []
-    consumes: []
+    # Emitted on every served completion, so `billing` can aggregate usage for an
+    # invoice. Three segments, publisher-prefixed, snake_case after the service name
+    # — core's grammar, with no exceptions.
+    #
+    # The action `consumed` is NOT in core's v0 action vocabulary, which the brief
+    # for this packet named explicitly. Implemented as specified and flagged for the
+    # manager: either the vocabulary gains `consumed` or this becomes
+    # `muse.usage.recorded`, which is in the list and already used by billing for a
+    # different thing. Both are one-line changes; the vocabulary is core's to decide.
+    #
+    # `data` carries exactly five fields — model, provider, tokens_in, tokens_out,
+    # cost_micros — because core closes payload schemas with
+    # `additionalProperties: false`, and a field added now is one a future schema
+    # carries forever. The payload schema itself belongs in core (see
+    # docs/event-naming.md#payload-schemas); it is not written here, because a
+    # publisher that owns its own payload schema is a contract nobody else can rely on.
+    - muse.tokens.consumed
 
-  # Planned dependencies. Listed to make the Phase 4 shape visible; none are
-  # running in v0, and `/readyz` reports `db: skipped` until the vault lands.
-  dependencies: []
+# muse subscribes to nothing in v0. It is a leaf service: a routed request comes from
+# guard or from a caller, and usage leaves on the bus. A consumer list would be
+# omitted rather than left empty, per core's manifest conventions.
+consumes: []
 
-  secrets: []
+# Other cafaye services, not packages. Both are listed as soft dependencies because
+# muse serves requests without either: guard is the public edge, and the vault and
+# the outbox are this service's own postgres.
+dependencies:
+  - name: identity
+    version: ^0.1.0
+    required: false
+  - name: guard
+    version: ^0.1.0
+    required: false
+
+repository:
+  url: git@github.com:cafaye/muse.git
+  defaultBranch: master
+  visibility: public
+
+owner:
+  team: muse
+  contact: muse@cafaye.com
