@@ -28,27 +28,53 @@ Five rules shape the implementation:
   carries each candidate's detail so the API layer renders it without re-deriving
   what happened, and so the suite asserts on the chain rather than a substring.
 
-The backoff uses tenacity's real `wait_exponential` with an injected `sleep`, so
-the suite exercises the real backoff arithmetic without waiting on it. Tests
-assert on the durations the policy asked for, which is what makes "the backoff
-grows exponentially" a fact rather than a hope.
+Packet `muse-03` adds the resilience layer around that, and the three additions are
+ordered by how much damage getting them wrong would do:
+
+- **A circuit breaker per provider** (`muse.breaker`), consulted *before* the
+  provider is touched, so a held-back provider is never dialled. It sits outside the
+  retry loop rather than inside it: a breaker that counted attempts would open
+  `threshold` times faster than the threshold says.
+- **A bounded budget** — attempts *and* wall clock, because a count alone does not
+  bound time. The deadline is checked before each wait, so muse never begins a sleep
+  that would carry the request past it.
+- **Jittered backoff.** Without it every muse process that failed at the same
+  instant retries at the same instant, and a recovering provider is hit by a wave
+  rather than a trickle.
+
+Everything time-shaped is injected — the sleep, the clock, the jitter source — so
+the suite asserts on the *schedule the policy asked for* rather than on elapsed wall
+time. That is what makes "the backoff grows, the ceiling holds, the budget stops the
+loop" facts about this code rather than hopes about a machine (AGENTS.md rule 13).
+
+Spans are created here too, through `muse.telemetry.Telemetry`. The attributes
+recorded are model, provider, token counts, cost, latency, breaker state and the
+error *class* — never a prompt, a completion, or a credential, because
+`muse.telemetry` refuses anything not on its allowlist and the canary test in
+`tests/test_trace_propagation.py` asserts that against the exported payload.
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
-from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import AsyncRetrying, retry_if_exception
 
+from muse.breaker import BreakerRegistry
 from muse.errors import (
     AllCandidatesFailed,
     CandidateFailure,
+    CircuitOpen,
     PriceUnavailable,
     ProviderError,
+    ProviderIndeterminate,
     RouteNotFound,
     is_retryable,
+    trips_breaker,
 )
 from muse.providers import (
     Completion,
@@ -57,7 +83,8 @@ from muse.providers import (
     ProviderRegistry,
 )
 from muse.redaction import Secret, redact
-from muse.routes import Candidate, Route, RouteTable
+from muse.routes import BackoffPolicy, Candidate, RetryPolicy, Route, RouteTable
+from muse.telemetry import Telemetry, record
 
 #: A `(role, content)` pair as a caller states it. The router turns these into
 #: `Message` values, so the endpoint and the router agree on one request shape
@@ -68,6 +95,14 @@ MessagePair = tuple[str, str]
 #: tenacity's async path awaits the result.
 SleepFn = Callable[[float], Awaitable[None]]
 
+#: Monotonic seconds. Injected so the budget is assertable without waiting; see the
+#: module docstring.
+Clock = Callable[[], float]
+
+#: A draw in `[0, 1)` used to jitter each backoff. Injected for the same reason, and
+#: so a test can pin the schedule exactly rather than asserting on a range.
+Unit = Callable[[], float]
+
 
 async def _asyncio_sleep(seconds: float) -> None:
     """The production sleep.
@@ -77,6 +112,16 @@ async def _asyncio_sleep(seconds: float) -> None:
     the bug it hides — a policy that never actually waits — is invisible in both.
     """
     await asyncio.sleep(seconds)
+
+
+def backoff_delay(policy: BackoffPolicy, index: int, unit: float) -> float:
+    """The wait after the failure that was attempt number `index + 1`.
+
+    A named function rather than a lambda inside the loop, so the schedule can be
+    asserted on its own — the alternative is a policy that can only be tested by
+    running a whole route and reading a list of sleeps out of a side channel.
+    """
+    return policy.delay(index, unit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +177,10 @@ class Router:
     per-request state is a local in `route()` — a counter on `self` would be shared
     between concurrent requests, which is the class of bug the app-factory isolation
     tests exist to catch.
+
+    The breaker registry is the one piece of shared mutable state here, and that is
+    the point: a provider being held back is a fact about the provider, not about the
+    request that noticed.
     """
 
     def __init__(
@@ -140,15 +189,28 @@ class Router:
         routes: RouteTable,
         *,
         sleep: SleepFn = _asyncio_sleep,
+        clock: Clock = time.monotonic,
+        unit: Unit = random.random,
+        telemetry: Telemetry | None = None,
+        breakers: BreakerRegistry | None = None,
     ) -> None:
         self._registry = registry
         self._routes = routes
         self._sleep = sleep
+        self._clock = clock
+        self._unit = unit
+        self._telemetry = telemetry if telemetry is not None else Telemetry.noop()
+        self._breakers = breakers if breakers is not None else BreakerRegistry()
 
     @property
     def routes(self) -> RouteTable:
         """The routing table, for a readiness body or a future admin surface."""
         return self._routes
+
+    @property
+    def breakers(self) -> BreakerRegistry:
+        """The per-provider breakers, for a readiness body or an admin surface."""
+        return self._breakers
 
     async def route(
         self,
@@ -173,6 +235,10 @@ class Router:
         """
         route = self._routes.find(model)
         if route is None:
+            # Raised before the span, and the model name is not recorded anywhere: it
+            # is caller-supplied text, and `muse.telemetry` does not put
+            # caller-supplied text on a span. An unknown model earns a status and an
+            # error class, which is all it deserves.
             raise RouteNotFound(model)
         # The messages are validated here, before the candidate loop, so a bad role
         # is a typed ValueError the endpoint turns into a 422 rather than a
@@ -181,33 +247,48 @@ class Router:
 
         failures: list[CandidateFailure] = []
         attempts = 0
-        # `route.candidates` is already resolved: a `Route` holds each candidate's
-        # vendor model, defaulted to the route's own at construction.
-        for candidate in route.candidates:
-            outcome = await self._attempt(
-                candidate=candidate,
-                route=route,
-                messages=validated,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                secrets=secrets,
-            )
-            attempts += outcome.calls
-            if outcome.completion is not None:
-                return RoutedCompletion(
-                    completion=outcome.completion,
-                    route=route.model,
-                    model=outcome.completion.model,
-                    candidates_tried=len(failures) + 1,
-                    attempts=attempts,
+        with self._telemetry.span("muse.route", muse_route=route.model) as span:
+            # `route.candidates` is already resolved: a `Route` holds each candidate's
+            # vendor model, defaulted to the route's own at construction.
+            for index, candidate in enumerate(route.candidates):
+                outcome = await self._attempt(
+                    candidate=candidate,
+                    route=route,
+                    messages=validated,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    secrets=secrets,
+                    index=index,
                 )
-            # An outcome always carries exactly one of the two, so `failure` is not
-            # None here. Asserted rather than guarded: `_attempt` builds both
-            # branches itself, and a `None` would mean a new return path was added
-            # without this loop being told — which would silently drop a failure from
-            # the chain and make a fallback look like a single-candidate route.
-            assert outcome.failure is not None, "an attempt produced neither a result nor a failure"
-            failures.append(outcome.failure)
+                attempts += outcome.calls
+                if outcome.completion is not None:
+                    result = RoutedCompletion(
+                        completion=outcome.completion,
+                        route=route.model,
+                        model=outcome.completion.model,
+                        candidates_tried=len(failures) + 1,
+                        attempts=attempts,
+                    )
+                    record(
+                        span,
+                        muse_model=result.model,
+                        muse_provider=result.completion.provider,
+                        muse_candidates_tried=result.candidates_tried,
+                        muse_attempts=result.attempts,
+                        muse_cost_micros=result.cost_micros,
+                        muse_tokens_in=result.completion.tokens_in,
+                        muse_tokens_out=result.completion.tokens_out,
+                    )
+                    return result
+                # An outcome always carries exactly one of the two, so `failure` is not
+                # None here. Asserted rather than guarded: `_attempt` builds both
+                # branches itself, and a `None` would mean a new return path was added
+                # without this loop being told — which would silently drop a failure from
+                # the chain and make a fallback look like a single-candidate route.
+                assert outcome.failure is not None, (
+                    "an attempt produced neither a result nor a failure"
+                )
+                failures.append(outcome.failure)
         raise AllCandidatesFailed(route.model, tuple(failures))
 
     async def _attempt(
@@ -219,6 +300,7 @@ class Router:
         max_tokens: int | None,
         temperature: float | None,
         secrets: Sequence[Secret | str],
+        index: int,
     ) -> _Attempt:
         """Run one candidate to exhaustion.
 
@@ -228,6 +310,44 @@ class Router:
         """
         provider = self._registry.get(candidate.provider)
         model = candidate.model or route.model
+        breaker = self._breakers.for_provider(candidate.provider)
+
+        # The breaker is consulted *before* the price lookup and before the provider is
+        # touched at all, so an open breaker is a refusal that never becomes a request.
+        # Recorded in the chain with `attempts: 0` because nothing was attempted — a
+        # chain that said "1 attempt" here would be a lie an operator would chase.
+        if not breaker.allow():
+            with self._telemetry.span(
+                "muse.provider.call",
+                muse_provider=candidate.provider,
+                muse_model=model,
+                muse_candidate_index=index,
+                muse_breaker_state=str(breaker.state),
+            ) as span:
+                # The mapping form because `error.type` is a semantic convention and
+                # keeps its dot, which is not a legal Python keyword argument. The 503
+                # is what makes this span distinguishable in a trace viewer from a call
+                # that was actually made and failed.
+                record(
+                    span,
+                    {
+                        "http.response.status_code": 503,
+                        "error.type": CircuitOpen.__name__,
+                    },
+                )
+            return _Attempt(
+                failure=CandidateFailure(
+                    provider=candidate.provider,
+                    model=model,
+                    error=CircuitOpen,
+                    detail=(
+                        f"{candidate.provider} is being held back after "
+                        f"{breaker.threshold} consecutive failures"
+                    ),
+                    attempts=0,
+                )
+            )
+
         try:
             price = provider.cost_per_1k_tokens(model)
         except PriceUnavailable as error:
@@ -249,12 +369,44 @@ class Router:
             max_tokens=max_tokens,
             temperature=temperature,
         )
+        policy = route.retry
         calls = 0
+        started = self._clock()
 
         async def call() -> Completion:
             nonlocal calls
             calls += 1
-            completion = await provider.complete(request)
+            with self._telemetry.span(
+                "muse.provider.call",
+                muse_provider=candidate.provider,
+                muse_model=model,
+                muse_candidate_index=index,
+                muse_retry_attempt=calls,
+                muse_breaker_state=str(breaker.state),
+            ) as span:
+                began = self._clock()
+                try:
+                    completion = await provider.complete(request)
+                except ProviderError as error:
+                    # The class name, never the message. A vendor's message is
+                    # third-party text and a content-policy rejection quotes the
+                    # offending content back, so recording it would put a prompt in a
+                    # tracing backend — which is retained, searchable and readable by
+                    # anyone with collector access. Re-raised rather than swallowed:
+                    # the retry loop below owns the decision, this span only reports.
+                    record(
+                        span,
+                        {"error.type": type(error).__name__},
+                        muse_latency_ms=int((self._clock() - began) * 1000),
+                    )
+                    raise
+                record(
+                    span,
+                    muse_tokens_in=completion.tokens_in,
+                    muse_tokens_out=completion.tokens_out,
+                    muse_cost_micros=completion.cost_micros,
+                    muse_latency_ms=int((self._clock() - began) * 1000),
+                )
             return Completion(
                 provider=completion.provider,
                 model=completion.model,
@@ -267,20 +419,68 @@ class Router:
                 finish_reason=completion.finish_reason,
             )
 
+        # One jitter draw per attempt, memoised. tenacity computes the wait *before*
+        # consulting the stop condition, so both the budget check and the sleep ask
+        # for the delay; if each drew its own the request could overshoot its own
+        # deadline by the width of the jitter window — a bound that lies. It would
+        # also consume the random stream twice per retry for no reason.
+        drawn: dict[int, float] = {}
+
+        def delay_for(attempt_number: int) -> float:
+            if attempt_number not in drawn:
+                drawn[attempt_number] = backoff_delay(
+                    policy.backoff, attempt_number - 1, self._unit()
+                )
+            return drawn[attempt_number]
+
+        def stop(retry_state) -> bool:
+            """Attempts exhausted, or the budget cannot absorb another wait.
+
+            A plain callable rather than tenacity's `stop_after_attempt` /
+            `stop_after_delay` because both read the clock internally, and this
+            module's whole testing approach is that the clock is the test's.
+
+            The second condition is what makes this a *deadline* rather than a
+            suggestion. Checking only "is the budget already spent" would let a 0.1s
+            budget start a 0.25s wait, and the request would then finish 2.5x later
+            than the ceiling it published — worse than having no budget, because it is
+            a bound that lies. So a wait is only started when it lands *within* the
+            budget; landing exactly on it is allowed, which is why this is `>`.
+
+            Both checks are needed. `elapsed >= budget` alone lets a boundary attempt
+            run with no time to spare; the sum alone would keep re-entering the loop
+            against a clock that has already passed the budget.
+            """
+            if retry_state.attempt_number >= policy.max_attempts:
+                return True
+            elapsed = self._clock() - started
+            if elapsed >= policy.budget_seconds:
+                return True
+            return elapsed + delay_for(retry_state.attempt_number) > policy.budget_seconds
+
+        def wait(retry_state) -> float:
+            return delay_for(retry_state.attempt_number)
+
         retrying = AsyncRetrying(
-            stop=stop_after_attempt(route.retry.max_attempts),
-            wait=wait_exponential(
-                multiplier=route.retry.backoff.initial, max=route.retry.backoff.maximum
-            ),
-            retry=retry_if_exception(is_retryable),
+            stop=stop,
+            wait=wait,
+            retry=retry_if_exception(self._retryable(policy)),
             sleep=self._sleep,
             reraise=True,
         )
         try:
             async for attempt in retrying:
                 with attempt:
-                    return _Attempt(completion=await call(), calls=calls)
+                    result = _Attempt(completion=await call(), calls=calls)
+                    breaker.record_success()
+                    return result
         except ProviderError as error:
+            if trips_breaker(error):
+                # One candidate failing is one strike, however many attempts it took:
+                # counting attempts would open the breaker `threshold` times faster
+                # for a route that happens to be configured with retries than for one
+                # that is not.
+                breaker.record_failure()
             return _Attempt(
                 failure=CandidateFailure(
                     provider=candidate.provider,
@@ -292,13 +492,29 @@ class Router:
                     attempts=calls,
                 )
             )
-        # Unreachable while `stop_after_attempt` has a positive count, which the
-        # policy validator guarantees. Stated rather than left implicit, because a
-        # silent fallthrough here would return a success-shaped outcome with no
-        # completion in it and the caller would dereference `None`.
+        # Unreachable while `stop` has a positive attempt count, which the policy
+        # validator guarantees. Stated rather than left implicit, because a silent
+        # fallthrough here would return a success-shaped outcome with no completion
+        # in it and the caller would dereference `None`.
         raise AssertionError(
             f"the retry loop for {candidate.provider}/{model} ended without a result"
         )
+
+    def _retryable(self, policy: RetryPolicy) -> Callable[[BaseException], bool]:
+        """The retry predicate for one route's policy.
+
+        A closure rather than the bare `is_retryable` so `retry_indeterminate` is
+        honoured per route. It is not a "retry more" switch: the same tuple decides
+        everything else either way, so opting in unlocks the ambiguous read timeout
+        and nothing more.
+        """
+
+        def retryable(error: BaseException) -> bool:
+            if type(error) is ProviderIndeterminate:
+                return policy.retry_indeterminate
+            return is_retryable(error)
+
+        return retryable
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(routes={list(self._routes.models())})"

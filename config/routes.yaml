@@ -32,6 +32,26 @@
 #                     Defaults to 1 — no retry — because a retry that has not been
 #                     measured against a real incident is latency added to every
 #                     failure.
+#     budget_seconds   the wall-clock ceiling on ONE candidate's whole retry loop,
+#                     backoff included. The attempt count alone does not bound time:
+#                     six attempts against a 4s ceiling is 20s of waiting before the
+#                     last attempt is even sent. Checked before each wait, so muse
+#                     never starts a sleep that would carry the request past it.
+#     backoff_jitter   the fraction of each delay that is randomised, in [0, 1].
+#                     Without it every muse that failed at the same instant retries
+#                     at the same instant, and a provider recovering from an outage
+#                     is hit by a wave instead of a trickle. The window is
+#                     [ceiling*(1-jitter), ceiling], so the backoff can never go
+#                     backwards and jitter can never exceed the ceiling.
+#     retry_indeterminate
+#                     whether a *read* timeout is retried. A read timeout means the
+#                     request was sent and the answer did not arrive, so the vendor
+#                     may have completed and billed it. Off by default: retrying it
+#                     can charge a customer twice for one request, and muse has no
+#                     idempotency key to ask the vendor which happened (PLAN §7
+#                     assigns one to muse; it is not built). Set it per route, and
+#                     only for a route whose price makes duplicate spend cheaper
+#                     than a 503.
 #
 # Order matters and is not alphabetical. A route lists its cheapest adequate model
 # first and its most capable one last, so the fallback costs more but serves more.
@@ -45,7 +65,12 @@ defaults:
   max_attempts: 1
   backoff_initial_seconds: 0.25
   backoff_max_seconds: 2.0
+  backoff_jitter: 0.5
   timeout_seconds: 30.0
+  # Twenty seconds of retrying per candidate, and at most two candidates, so a route
+  # cannot hold a caller's request open through more than 40s of waiting plus the
+  # attempts themselves.
+  budget_seconds: 20.0
 
 routes:
   # The everyday route. A small model on a cheap vendor, with a same-tier fallback
@@ -60,9 +85,13 @@ routes:
         model: claude-haiku-4-5
     timeout_seconds: 20.0
 
-  # The capable route. Retries twice: a timeout on a long completion is common
-  # enough that one attempt would surface an error the second attempt would have
-  # answered, and 0.25s of backoff is cheap against a request that costs cents.
+  # The capable route. Retries twice: a *connect* failure or a 5xx on a long
+  # completion is common enough that one attempt would surface an error the second
+  # attempt would have answered, and 0.25s of backoff is cheap against a request that
+  # costs cents. A read timeout is deliberately NOT retried here even though it was
+  # retried before muse-03 — see `retry_indeterminate` above. The fallback still
+  # answers, so the cost of this decision is a 503 on a genuinely ambiguous timeout
+  # rather than a possible duplicate charge on a Sonnet-priced request.
   - model: smart
     description: The most capable model available, for reasoning and long output.
     candidates:
@@ -71,4 +100,5 @@ routes:
       - provider: openai
         model: gpt-4o
     max_attempts: 3
+    budget_seconds: 30.0
     timeout_seconds: 60.0

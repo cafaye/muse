@@ -30,6 +30,7 @@ from muse.errors import (
     PriceUnavailable,
     ProviderAuthError,
     ProviderError,
+    ProviderIndeterminate,
     ProviderInvalidRequest,
     ProviderRateLimited,
     ProviderTimeout,
@@ -799,9 +800,31 @@ async def test_the_adapter_maps_a_rate_limit_to_a_retryable_error() -> None:
         await provider.complete(ask())
 
 
-async def test_the_adapter_maps_a_timeout_to_a_retryable_error() -> None:
+async def test_the_adapter_maps_a_bare_timeout_to_a_non_retryable_error() -> None:
+    """A timeout with no HTTP status behind it is *ambiguous*, not transient.
+
+    The request was in flight when the deadline passed, so the vendor may have
+    completed and billed it. Retrying would risk charging the customer twice for one
+    request, and with no idempotency key there is no way to ask the vendor which
+    happened — so this is `ProviderIndeterminate`, which the router does not retry
+    unless a route explicitly opts in.
+
+    This is a deliberate change from packet muse-02, which mapped every timeout to a
+    retryable `ProviderTimeout`. The split is the point of `muse-03`.
+    """
     provider = make_provider(raises="Timeout", error_message="request timed out")
-    with pytest.raises(ProviderTimeout, match="timed out"):
+    with pytest.raises(ProviderIndeterminate, match="may have been processed"):
+        await provider.complete(ask())
+
+
+async def test_the_adapter_maps_a_408_to_a_retryable_error() -> None:
+    """A 408 is the server saying the request never arrived complete.
+
+    That is a definite "not processed" — the same bytes will get the same treatment
+    next time — so unlike a bare timeout it is safe to repeat.
+    """
+    provider = make_provider(raises="Timeout", error_message="", status_code=408)
+    with pytest.raises(ProviderTimeout, match="408"):
         await provider.complete(ask())
 
 
@@ -958,7 +981,7 @@ async def test_the_adapter_leaves_a_clean_cause_message_untouched() -> None:
     keeping the cause at all.
     """
     provider = make_provider(raises="Timeout", error_message="gateway timeout after 30s")
-    with pytest.raises(ProviderTimeout) as excinfo:
+    with pytest.raises(ProviderIndeterminate) as excinfo:
         await provider.complete(ask())
     assert excinfo.value.__cause__.args == ("gateway timeout after 30s",)
 

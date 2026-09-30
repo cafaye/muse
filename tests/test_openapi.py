@@ -31,7 +31,10 @@ from muse.api import RouteRequestBody, RouteResponseBody
 from muse.contracts import TOKENS_CONSUMED, validate_event_type
 from muse.main import create_app
 
-pytestmark = [pytest.mark.unit]
+#: `anyio` as well as `unit`: one test here drives the real app end to end to prove
+#: the running service emits the correlation headers the document promises, and
+#: nothing about a document comparison can catch a header the middleware forgets.
+pytestmark = [pytest.mark.unit, pytest.mark.anyio]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OPENAPI = REPO_ROOT / "openapi" / "v1.yaml"
@@ -146,6 +149,89 @@ def test_every_path_the_app_serves_is_documented() -> None:
             assert path in spec()["paths"], f"{path} is served but not documented"
 
 
+async def test_the_running_app_emits_every_correlation_header_the_document_promises() -> None:
+    """The third direction, and the one a header can get wrong without anyone noticing.
+
+    The two tests above check the document against the *code*; nothing there would
+    catch a header the document promises and the middleware forgets to send. So this
+    drives the real app and reads the real response — the property rule 14 is actually
+    about, which is that the committed contract is what the service does.
+    """
+
+    from muse.breaker import BreakerRegistry
+    from muse.main import Container, Settings
+    from muse.metering import Meter
+    from muse.providers import Price, ProviderRegistry
+    from muse.providers.credentials import StaticCredentials
+    from muse.providers.fake import FakeProvider
+    from muse.router import Router
+    from muse.routes import routes_from_yaml
+    from muse.vault import Vault
+
+    from .conftest import AUTH_HEADERS, asgi_client
+    from .support.fake_database import FakeDatabase
+    from .support.test_app import TEST_KEY
+    from .support.tracing import recording_telemetry
+
+    documented = spec()["paths"]["/v1/route"]["post"]["responses"]
+
+    telemetry, _ = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(FakeProvider(name="openai", price=Price(1000, 2000)))
+    table = routes_from_yaml(
+        "version: 1\nroutes:\n  - model: fast\n    candidates:\n      - provider: openai\n"
+    )
+    database = FakeDatabase()
+    app = create_app(
+        container=Container(
+            settings=Settings(env="test"),
+            database=database,
+            registry=registry,
+            routes=table,
+            router=Router(registry, table, telemetry=telemetry, breakers=BreakerRegistry()),
+            vault=Vault(database, TEST_KEY),
+            meter=Meter(database),
+            credentials=StaticCredentials({}),
+            telemetry=telemetry,
+        )
+    )
+
+    async with asgi_client(app) as client:
+        ok = await client.post(
+            "/v1/route",
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                **AUTH_HEADERS,
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            },
+        )
+        # A 503 is the response a caller most wants a trace for, so it is asserted
+        # too rather than assumed to travel the same path.
+        unauthorized = await client.post(
+            "/v1/route",
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+        )
+        not_found = await client.get(
+            "/does-not-exist",
+            headers={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+        )
+
+    assert ok.status_code == 200
+    assert unauthorized.status_code == 401
+    assert not_found.status_code == 404
+    # httpx lowercases response header names, and HTTP header names are
+    # case-insensitive, so the comparison is too.
+    for response in (ok, unauthorized, not_found):
+        assert set(response.headers) >= {"x-trace-id", "traceparent"}
+        assert re.fullmatch(
+            spec()["components"]["headers"]["Traceparent"]["schema"]["pattern"],
+            response.headers["traceparent"],
+        )
+    assert not_found.headers["traceparent"], "the 404 path is not covered by the contract"
+    assert documented, "the contract is empty, so the assertion above proves nothing"
+
+
 def test_the_response_schema_names_exactly_the_response_models_fields() -> None:
     """A field in a response model that the document omits is a field no SDK has. This
     is the check that makes the committed document worth committing."""
@@ -216,6 +302,59 @@ def test_the_trace_id_header_is_declared_on_every_response() -> None:
     header means support has nothing to grep for."""
     for status, operation in spec()["paths"]["/v1/route"]["post"]["responses"].items():
         assert "X-Trace-Id" in operation["headers"], f"{status} does not echo X-Trace-Id"
+
+
+def test_the_traceparent_header_is_declared_on_every_response() -> None:
+    """Packet muse-03, and the same reasoning as `X-Trace-Id`.
+
+    A caller that sent a `traceparent` needs one back to continue the trace, and it
+    needs it on the *error* responses most of all — a 503 is exactly when someone
+    wants to pull up the trace.
+    """
+    for status, operation in spec()["paths"]["/v1/route"]["post"]["responses"].items():
+        assert "traceparent" in operation["headers"], f"{status} does not echo traceparent"
+
+
+def test_the_traceparent_header_is_declared_as_an_optional_request_parameter() -> None:
+    """Optional, because a caller that has never heard of W3C trace context must get
+    a working service.
+
+    A client generated from a document that marked it required would refuse to send
+    anything, and the obvious fix in a generated SDK is to invent a plausible-looking
+    traceparent — which is worse than not sending one.
+    """
+    parameters = spec()["paths"]["/v1/route"]["post"]["parameters"]
+    traceparent = next(p for p in parameters if p["name"] == "traceparent")
+
+    assert traceparent["in"] == "header"
+    assert traceparent["required"] is False
+
+
+def test_the_documented_traceparent_pattern_is_the_one_muse_accepts() -> None:
+    """The document and the parser must agree, in the strict direction that matters.
+
+    The published pattern is *narrower* than what `parse_traceparent` accepts — it
+    excludes the future versions the W3C spec says to continue rather than discard.
+    A client sending a `02-…` header would be rejected by its own generated
+    validator and then correctly served by muse, which is the asymmetry the
+    description says out loud. What must not happen is the other direction: a
+    documented value that muse itself would refuse.
+    """
+    from muse.telemetry import parse_traceparent
+
+    pattern = spec()["components"]["headers"]["Traceparent"]["schema"]["pattern"]
+    examples = [
+        spec()["components"]["headers"]["Traceparent"]["example"],
+        next(
+            p
+            for p in spec()["paths"]["/v1/route"]["post"]["parameters"]
+            if p["name"] == "traceparent"
+        )["example"],
+    ]
+
+    assert re.fullmatch(pattern, examples[0])
+    for example in examples:
+        assert parse_traceparent(example) is not None, f"{example} is documented but refused"
 
 
 def test_the_request_body_is_required() -> None:

@@ -14,6 +14,7 @@ openapi: 3.1.0
 #   * info.version present, and it moves when the document does
 #   * every non-2xx is application/problem+json (RFC 9457) with a reserved `code`
 #   * X-Trace-Id echoed in the header and the body
+#   * W3C `traceparent` accepted and echoed (packet muse-03; PLAN §7)
 #   * bearer auth stated in the security scheme
 #
 # The probe endpoints are deliberately absent. They are infrastructure, not contract:
@@ -131,12 +132,27 @@ paths:
                       content: A table written in the same transaction as the state.
                     - role: user
                       content: Why does that matter?
+      parameters:
+        - name: traceparent
+          in: header
+          required: false
+          description: |
+            W3C trace context to continue. When present and well formed, muse joins
+            that trace and propagates the context to the provider. When absent or
+            malformed, muse starts a new trace — a broken correlation header is never
+            an error, because it must not be able to fail a customer's request.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
       responses:
         '200':
           description: A completion. One `muse.tokens.consumed` event was emitted.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/json:
               schema:
@@ -168,6 +184,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -185,6 +203,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -203,6 +223,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -218,6 +240,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -242,6 +266,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -265,6 +291,8 @@ paths:
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
           content:
             application/problem+json:
               schema:
@@ -308,6 +336,24 @@ components:
         type: string
         pattern: '^[A-Za-z0-9_-]{8,64}$'
       example: 0af7651916cd43dd8448eb211c80319c
+
+    Traceparent:
+      description: |
+        The W3C trace context (https://www.w3.org/TR/trace-context/) for this
+        request, naming muse's own span.
+
+        Send one to join an existing trace: muse continues that trace id, and its
+        provider calls propagate the context onward to the vendor. A malformed or
+        absent header starts a new trace — never a 400, and never an exception,
+        because a correlation header must not be able to fail a request.
+        `X-Trace-Id` is unchanged and remains the packet-02 correlation id.
+
+        Omitted entirely when no tracing is configured.
+      required: false
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 
   schemas:
     Role:

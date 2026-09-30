@@ -42,7 +42,10 @@ _DEFAULT_KEYS = frozenset(
         "max_attempts",
         "backoff_initial_seconds",
         "backoff_max_seconds",
+        "backoff_jitter",
         "timeout_seconds",
+        "budget_seconds",
+        "retry_indeterminate",
     }
 )
 _ROUTE_KEYS = _DEFAULT_KEYS | frozenset({"model", "description", "candidates"})
@@ -64,17 +67,11 @@ RESERVED_CANDIDATE_KEYS = frozenset({"weight"})
 #: that cannot be read is a constant nobody reuses.
 DEFAULT_BACKOFF_INITIAL = 0.25
 DEFAULT_BACKOFF_MAXIMUM = 2.0
+DEFAULT_BACKOFF_JITTER = 0.5
 DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_TIMEOUT_SECONDS = 30.0
-
-
-#: The defaults, as named constants rather than as reads of the dataclass fields.
-#: A `slots=True` dataclass has no class-level attribute to read, and a constant that
-#: cannot be read is a constant nobody reuses.
-DEFAULT_BACKOFF_INITIAL = 0.25
-DEFAULT_BACKOFF_MAXIMUM = 2.0
-DEFAULT_MAX_ATTEMPTS = 1
-DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_BUDGET_SECONDS = 20.0
+DEFAULT_RETRY_INDETERMINATE = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,10 +81,20 @@ class BackoffPolicy:
     `initial` is the first wait; each subsequent wait doubles, capped at `maximum`.
     The cap is not optional: unbounded exponential backoff against a provider that
     is down for minutes is a request that hangs until the client's own timeout.
+
+    `jitter` is the fraction of each delay that is randomised, and it is not
+    decoration. Without it, every muse process that failed at the same instant
+    retries at the same instant, forever — so a provider recovering from an outage
+    is hit by a synchronised wave instead of a trickle, which is the thundering herd
+    the ceiling alone does not prevent. The window is
+    `[ceiling * (1 - jitter), ceiling]`: the floor rises with the exponential, so the
+    backoff can never go backwards into a hot loop, and the top of the window is
+    exactly the ceiling, so jitter can never push a delay past the cap.
     """
 
     initial: float = DEFAULT_BACKOFF_INITIAL
     maximum: float = DEFAULT_BACKOFF_MAXIMUM
+    jitter: float = DEFAULT_BACKOFF_JITTER
 
     def __post_init__(self) -> None:
         if self.initial < 0:
@@ -96,6 +103,18 @@ class BackoffPolicy:
             raise ValueError(
                 f"backoff maximum {self.maximum} is below the initial delay {self.initial}"
             )
+        if not 0.0 <= self.jitter <= 1.0:
+            raise ValueError(f"jitter must be between 0 and 1, got {self.jitter}")
+
+    def delay(self, index: int, unit: float) -> float:
+        """The wait after the failure that was attempt number `index + 1`.
+
+        `unit` is a draw in `[0, 1)` from an injected source, which is what makes the
+        schedule assertable without waiting on it while the production path stays
+        genuinely random rather than jitter-free.
+        """
+        ceiling = min(self.maximum, self.initial * 2**index)
+        return ceiling * (1.0 - self.jitter + self.jitter * unit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,14 +123,32 @@ class RetryPolicy:
 
     `max_attempts` counts the first try, so 1 means no retry. Only transient
     failures are retried — see `muse.errors.RETRYABLE_PROVIDER_ERRORS`.
+
+    `budget_seconds` is the wall-clock ceiling on this candidate's whole retry loop,
+    backoff included, and it is checked *before* each wait. The attempt count alone
+    does not bound time: six attempts against a 4-second ceiling is twenty seconds of
+    waiting before the last attempt is even sent, and "however long each attempt
+    takes" is unbounded unless a deadline says otherwise. Per candidate rather than
+    per route, because a shared budget is worst in exactly the case it is meant to
+    help — the primary burns the whole thing, and the fallback, the candidate most
+    likely to work, is then refused untried.
+
+    `retry_indeterminate` decides whether a read timeout is retried, and defaults to
+    no. See `muse.errors.ProviderIndeterminate`: the vendor may already have billed
+    that request, and without an idempotency key there is no way to ask which
+    happened. The knob is per route because that is the unit that knows the price.
     """
 
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     backoff: BackoffPolicy = field(default_factory=BackoffPolicy)
+    budget_seconds: float = DEFAULT_BUDGET_SECONDS
+    retry_indeterminate: bool = DEFAULT_RETRY_INDETERMINATE
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {self.max_attempts}")
+        if self.budget_seconds <= 0:
+            raise ValueError(f"budget_seconds must be positive, got {self.budget_seconds}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,9 +337,36 @@ def _read_defaults(block: Any) -> tuple[RetryPolicy, TimeoutPolicy]:
         RetryPolicy(
             max_attempts=_attempts(block, DEFAULT_MAX_ATTEMPTS),
             backoff=_backoff_from(block, None),
+            budget_seconds=_budget(block, DEFAULT_BUDGET_SECONDS),
+            retry_indeterminate=_flag(block, "retry_indeterminate", DEFAULT_RETRY_INDETERMINATE),
         ),
         _timeout(block),
     )
+
+
+def _budget(block: dict[str, Any], fallback: float) -> float:
+    """The retry budget, validated here so the message names the file's key.
+
+    Same cross-field treatment as the backoff: only this layer knows which *key* was
+    wrong, and the operator needs to be told which line to edit.
+    """
+    return _number(block, "budget_seconds", fallback)
+
+
+def _flag(block: dict[str, Any], key: str, fallback: bool) -> bool:
+    """A boolean setting, refused rather than coerced.
+
+    `yaml.safe_load` already resolves `yes` and `on` to `True`, so this only has to
+    catch the remaining mistake: `retry_indeterminate: "false"` as a quoted string,
+    which is truthy and would silently switch on the one setting that can bill a
+    customer twice.
+    """
+    value = block.get(key)
+    if value is None:
+        return fallback
+    if not isinstance(value, bool):
+        raise RouteConfigError(f"`{key}` must be true or false, got {value!r}")
+    return value
 
 
 def _backoff_from(block: dict[str, Any], inherited: BackoffPolicy | None) -> BackoffPolicy:
@@ -323,12 +387,21 @@ def _backoff_from(block: dict[str, Any], inherited: BackoffPolicy | None) -> Bac
         "backoff_max_seconds",
         inherited.maximum if inherited else DEFAULT_BACKOFF_MAXIMUM,
     )
+    jitter = inherited.jitter if inherited else DEFAULT_BACKOFF_JITTER
+    if "backoff_jitter" in block:
+        raw = block["backoff_jitter"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise RouteConfigError(f"`backoff_jitter` must be a number, got {raw!r}")
+        jitter = float(raw)
     if maximum < initial:
         raise RouteConfigError(
             f"`backoff_max_seconds` ({maximum}) is below `backoff_initial_seconds` "
             f"({initial}); the first retry would wait longer than the ceiling allows"
         )
-    return BackoffPolicy(initial=initial, maximum=maximum)
+    try:
+        return BackoffPolicy(initial=initial, maximum=maximum, jitter=jitter)
+    except ValueError as error:
+        raise RouteConfigError(f"`backoff_jitter` is invalid: {error}") from error
 
 
 def _timeout(block: dict[str, Any], fallback: float = DEFAULT_TIMEOUT_SECONDS) -> TimeoutPolicy:
@@ -390,6 +463,11 @@ def _read_route(entry: Any, defaults: RetryPolicy, default_timeout: TimeoutPolic
         retry=RetryPolicy(
             max_attempts=_attempts(entry, defaults.max_attempts),
             backoff=_backoff_from(entry, defaults.backoff),
+            budget_seconds=_budget(entry, defaults.budget_seconds),
+            # An unset key on a route inherits the file default rather than the
+            # dataclass default, so `defaults: {retry_indeterminate: true}` means
+            # what it says to every route that does not speak for itself.
+            retry_indeterminate=_flag(entry, "retry_indeterminate", defaults.retry_indeterminate),
         ),
         timeout=_timeout(entry, default_timeout.seconds),
     )
