@@ -1,6 +1,6 @@
 """What the suite imports must be what `bin/prime` installs.
 
-The gate is `uv sync --frozen` with no extras, so the suite runs against exactly the
+The gate is `uv sync --locked` with no extras, so the suite runs against exactly the
 distributions in the transitive closure of `[project.dependencies]` plus every
 `[dependency-groups]` entry. An import outside that set is a test that passes in
 whoever's venv happens to carry the package and fails on every fresh clone. That is
@@ -112,7 +112,7 @@ def _declared() -> set[str]:
 
 
 def _gate_closure() -> set[str]:
-    """Every distribution `uv sync --frozen` puts in the venv: the declared set plus
+    """Every distribution `uv sync --locked` puts in the venv: the declared set plus
     whatever `uv.lock` records as a dependency of it.
 
     An edge carrying an `extra` is not followed. A third-party extra is opt-in,
@@ -346,7 +346,7 @@ def test_every_import_is_provided_by_the_set_the_gate_installs() -> None:
 
     unprovided = {
         f"{module} (shipped by {', '.join(sorted(owners.get(module, ()))) or 'nothing found'}"
-        f" — outside `uv sync --frozen`; imported by {', '.join(sorted(files))})"
+        f" — outside `uv sync --locked`; imported by {', '.join(sorted(files))})"
         for module, files in _imports().items()
         if module not in provided
     }

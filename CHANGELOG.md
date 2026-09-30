@@ -6,7 +6,8 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 ## [Unreleased]
 
 Packet `muse-03b`: the gate was red on a clean checkout. A regression found at merge,
-fixed at the declarations rather than at the test.
+fixed at the declarations rather than at the test. While proving the fix, a second
+defect of the same class turned up in the gate itself.
 
 ### Fixed
 
@@ -14,7 +15,7 @@ fixed at the declarations rather than at the test.
   `opentelemetry-exporter-otlp` in the optional `otel` extra, but
   `test_a_configured_endpoint_gets_a_batch_processor` exercises
   `build_provider(endpoint=...)`, which imports that exporter — and `bin/prime` runs
-  `uv sync --frozen` with no extras. The worktree that developed `muse-03` was green
+  `uv sync` with no extras. The worktree that developed `muse-03` was green
   because its venv already carried the exporter from an `uv sync --extra otel`; every
   clean clone got
   `ConfigError: MUSE_OTEL_EXPORTER_OTLP_ENDPOINT is set but the OTLP exporter is not
@@ -23,6 +24,19 @@ fixed at the declarations rather than at the test.
   now asks for the extra (`muse[otel]`) rather than repeating the exporter's floor in
   a second place. The extra stays an extra for the image, where pulling grpcio and
   protobuf into every install is still the wrong default.
+- **`bin/prime` asserted nothing about the lockfile.** Its own comment claimed
+  `uv sync --frozen` "refuses to re-resolve a stale lock", and the flag on line 12 was
+  `--frozen`. It does not: `--frozen` means *do not update the lock*, which is exactly
+  what lets a lock that disagrees with `pyproject.toml` install silently; the assertion
+  is `--locked`. Demonstrated against a stale lock: `uv sync --frozen` exited 0 with 77
+  packages and no exporter, `uv run pytest` exited 0 with 760 passed, and `uv run`
+  quietly **rewrote `uv.lock` on the way there**. The gate passed over a lockfile nobody
+  had committed — the same "green in one worktree, false elsewhere" shape as the
+  exporter defect, and the one a clean-checkout proof cannot catch, because a clean
+  checkout has a correct lock. Every `uv sync`/`uv run` in `bin/prime` now carries
+  `--locked`, including the `uv run` lines: `uv run` re-resolves by default, so a
+  guarded sync followed by a bare `uv run` reopened the hole. The Dockerfile's syncs
+  carried the same false comment and are now `--locked` too.
 - **`pydantic` and `starlette` are now declared.** `api.py` and `main.py` import both
   at module scope, and both were reaching the venv only as `fastapi`'s transitive
   dependencies — the same accident one fastapi repin away from a broken build.
@@ -40,6 +54,23 @@ fixed at the declarations rather than at the test.
   closure) and with it absent (the module cannot be found) — which is what makes it
   trustworthy in a dirty venv. A third test names the OTLP exporter specifically, so
   the regression this packet fixes fails with a message that points at itself.
+- Four more assertions in that module, each of which closes a way the guard could have
+  been decorative:
+  - **the lock agrees with `pyproject.toml`** — the fact `--locked` checks, read from
+    two files on disk so it also holds in a dirty tree.
+  - **`bin/prime` passes `--locked` everywhere** — read from the script, so the gate
+    cannot quietly lose the assertion. The whole script is checked, not line 12,
+    because the exposure was the *combination* with an unguarded `uv run`.
+  - **the walk found something** — every assertion above is a set-difference over a
+    helper's result, so an empty result makes all of them pass. Breaking `_imports`,
+    `_declared`, `_gate_closure` or `_owners` one at a time left the two general
+    guards green every time; only the by-name OTLP test noticed. The floor is now
+    asserted before any absence is, which is the canary test's own discipline from
+    `test_trace_propagation.py` ("the canary is absent" is also true of an export that
+    produced no spans).
+  - **the exporter stays out of the image** — `[project.dependencies]` must not name
+    the expensive distributions and every Dockerfile `uv sync` must carry `--no-dev`,
+    so the fix cannot be "simplified" into shipping grpcio and protobuf everywhere.
 - `AGENTS.md` rule 19 and a README section: a green gate is a claim about a clean
   machine, and `rm -rf .venv && bin/prime` is how you check it.
 
@@ -51,6 +82,17 @@ fixed at the declarations rather than at the test.
 - No `pytest.mark.skipif` on the exporter. Skipping would trade a broken gate for a
   gate that quietly tests less, which is the failure mode this packet exists to end.
 - Coverage stays at 100%; the added tests are in `tests/`, so they do not dilute it.
+
+### Proof
+
+The salvage was unverified, so it was verified before being trusted: reverting
+`pyproject.toml` and `uv.lock` to `f411eb5` and deleting `.venv` reproduces the
+merge-red gate (4 failed, 756 passed), with all three original dependency tests firing
+on it. With the fix applied, `rm -rf .venv && bin/prime` gives **763 passed, 2 skipped,
+coverage 100.00%, exit 0**. The salvage's shape was also checked against the objection
+that it makes the dev environment carry a production dependency: it does not. The
+Dockerfile's command sequence installs 69 distributions with no
+`opentelemetry-exporter-otlp`, no grpcio and no protobuf, against the gate's 85.
 
 Packet `muse-03`: OpenTelemetry, trace propagation, and bounded retry budgets. PLAN §7
 adopts W3C `traceparent` with traces in the platform collector, and bounded retry

@@ -43,8 +43,9 @@ config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
 tests/                pytest; one module per concern, plus tests/support/
                      (test_dependencies.py checks the suite's imports against
-                     the declared set — see rule 19)
-bin/prime             the gate: uv sync && ruff && pytest
+                     the declared set, and bin/prime against --locked — see
+                     Dependencies)
+bin/prime             the gate: uv sync --locked && ruff && pytest
 ```
 
 ## Rules
@@ -176,7 +177,7 @@ quarantine*, which is often a version or two behind the true latest. So:
 - Each addition needs a reason in the commit message and a row in the README's
   dependency table.
 - **A test may only import what the dev group installs.** `bin/prime` is
-  `uv sync --frozen` with no extras, so the set of packages the gate installs is
+  `uv sync --locked` with no extras, so the set of packages the gate installs is
   the closure of `[project.dependencies]` plus every dependency group — and
   nothing else. An import from an extra is green in the venv that once ran
   `uv sync --extra otel` and red on every fresh clone; that is exactly how
@@ -187,10 +188,36 @@ quarantine*, which is often a version or two behind the true latest. So:
   two places is a floor that drifts. Transitive availability is not a declaration
   either — `pydantic` and `starlette` were imported at module scope while
   arriving only through fastapi's pins.
-  `tests/test_dependencies.py` enforces both halves on every gate run, from
+  The flip side is that the dev group is *not* the image's dependency set: the
+  Dockerfile installs with `--no-dev`, so what the suite needs and what a
+  deployment ships are different sets on purpose, and neither test covers the
+  other.
+  `tests/test_dependencies.py` enforces all of it on every gate run, from
   `pyproject.toml`, `uv.lock` and the installed RECORD files rather than from the
   current venv, which is what lets it fail in a dirty environment. When it fires,
   fix the declaration; do not skip the test that needed the package.
+- **`--locked`, not `--frozen`, everywhere in the gate and the Dockerfile.**
+  They sound interchangeable and are not. `--frozen` means *do not update the
+  lock*, which is exactly what lets a lockfile that disagrees with
+  `pyproject.toml` install silently; `--locked` means *assert the lock would not
+  change*. `muse-03b` found `bin/prime` running `--frozen` under a comment
+  claiming the opposite, and the consequence was worse than a red gate: with a
+  stale lock, `uv sync` exited 0, `uv run pytest` exited 0, and `uv run` quietly
+  **rewrote `uv.lock` on the way there** — a green gate over a lockfile nobody
+  had committed. Because `uv run` re-resolves by default, `--locked` belongs on
+  every `uv run` too: one bare `uv run` undoes a guarded `uv sync`.
+  This is the failure mode that `rm -rf .venv && bin/prime` *cannot* catch,
+  because a clean checkout has a correct lock. `tests/test_dependencies.py` asserts
+  the script itself, so the gate cannot quietly lose the assertion.
+- **A guard that can pass by finding nothing is not a guard.** Every assertion in
+  `tests/test_dependencies.py` is a set-difference over a helper's result, so a
+  helper returning an empty set makes all of them pass — and breaking the import
+  walk, the declared set, the closure or the RECORD walk in turn did exactly that,
+  leaving two of the guards green. This is the canary test's own discipline from
+  `tests/test_trace_propagation.py`: "the canary is absent" is also true of an
+  export that produced no spans, which is why it asserts `names(exporter)` first.
+  Assert the floor before asserting an absence, and when adding a guard, break it
+  on purpose and watch it go red.
 
 ## Toolchain
 

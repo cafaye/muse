@@ -209,17 +209,20 @@ then discarded. Nothing leaves the process, which is what keeps the suite hermet
 | `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP endpoint. Unset means export nowhere. Setting it without `muse[otel]` installed is a boot error naming both fixes, not a silent no-op. |
 | `OTEL_SERVICE_NAME` | `muse` | `service.name` on the exported resource. |
 
-The container image installs the locked dependency set without the `otel` extra, so
-adding an endpoint to a compose deployment needs the extra built in — or the boot
-error, which is the honest outcome.
+The container image installs the locked dependency set without the `otel` extra and
+without the dev group, so adding an endpoint to a compose deployment needs the extra
+built in — or the boot error, which is the honest outcome.
 
 ```sh
-uv sync --extra otel    # an install that skips the dev group
+uv sync --extra otel    # to export traces
 ```
 
 A local checkout already has it: the dev group pulls `muse[otel]` in, because the
 test suite exercises the endpoint path and a test that imports a package makes it a
-test dependency. See `AGENTS.md` rule 19.
+test dependency. That costs the image nothing — `tests/test_dependencies.py` asserts
+`[project.dependencies]` never names the exporter and that every Dockerfile `uv sync`
+carries `--no-dev`, so the group cannot leak into a deployment. See `AGENTS.md`
+rule 19.
 
 ## Layout
 
@@ -272,14 +275,15 @@ copy is a drift risk, and this is the check that catches it.
 
 ### A green gate is a claim about a clean machine
 
-`bin/prime` runs `uv sync --frozen` with no extras, so it is only green if the
+`bin/prime` runs `uv sync --locked` with no extras, so it is only green if the
 declared dependency set covers everything the suite imports. A package that is
 reachable only through an extra, or only because something else happened to pin it,
 makes the suite pass in the venv it was written in and fail on every fresh clone —
 which is how `muse-03`'s gate turned red at merge.
 
 So a change to the suite's imports has to be accompanied by a change to
-`pyproject.toml`, and the honest way to check that is to delete the venv:
+`pyproject.toml` **and** a `uv lock`, and the honest way to check it is to delete the
+venv:
 
 ```sh
 rm -rf .venv && bin/prime
@@ -290,6 +294,19 @@ declarations rather than from the venv: every module `src/` and `tests/` import 
 be provided by the closure of `[project.dependencies]` plus the dependency groups, and
 every third-party root must be a direct declaration. It reads `pyproject.toml`,
 `uv.lock` and the installed RECORD files — no socket, no network.
+
+### `--locked`, not `--frozen`
+
+The two flags sound interchangeable and are not. `--frozen` means *do not update
+`uv.lock`*, so a lock that disagrees with `pyproject.toml` installs silently.
+`--locked` means *assert `uv.lock` would not change*, which is what a gate wants.
+
+The gap is not academic. With a lock that predates a `pyproject.toml` edit, `uv sync
+--frozen` exited 0 with a partial dependency set, `uv run pytest` exited 0, and
+`uv run` quietly **rewrote `uv.lock` on the way there** — a green gate over a lockfile
+nobody had committed. So `--locked` goes on every `uv sync` *and* every `uv run` in
+`bin/prime` and the Dockerfile; `uv run` re-resolves by default, and one bare `uv run`
+undoes a guarded sync.
 
 ## License
 
