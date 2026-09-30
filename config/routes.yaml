@@ -1,0 +1,74 @@
+# config/routes.yaml — which model a request names, and which providers may serve it.
+#
+# A client asks for a *model*; this file decides which vendor answers. A request
+# for `fast` is served by openai/gpt-4o-mini, and if that provider is rate-limited
+# or down, by anthropic/claude-haiku-4-5. The client never learns which one ran,
+# and cannot ask for a vendor directly — that is the whole point.
+#
+# Shape, per `muse.routes`:
+#
+#   version   the schema version of this file. Bumped when the shape changes.
+#   routes    the routing table. Each entry is one model name.
+#     model          what the client asks for. Unique across the file.
+#     description    for `caf contract` and for a human reading a diff.
+#     candidates     ordered, primary first. The first success wins; a failure
+#                    advances to the next. At least one, and a route with one
+#                    candidate is not a fallback route — it is a single vendor
+#                    with extra syntax, so say so in the description.
+#       provider      a name in the provider registry. Validated against the
+#                     registry at boot, so a typo here is a boot failure and not a
+#                     503 on the first request.
+#       model         the vendor's model id. Optional: omitted, it inherits the
+#                     route's `model`, which is the common case where the two
+#                     names agree.
+#       weight        reserved for load balancing in a later packet. Present in
+#                     the schema and ignored by the router, so adding it later is
+#                     not a config-format change.
+#     timeout_seconds  per-attempt wall clock for one provider call. Optional;
+#                     the default applies when absent.
+#     max_attempts     how many times the router retries ONE candidate before
+#                     advancing. Only transient failures are retried; a rejected
+#                     credential or a malformed request advances immediately.
+#                     Defaults to 1 — no retry — because a retry that has not been
+#                     measured against a real incident is latency added to every
+#                     failure.
+#
+# Order matters and is not alphabetical. A route lists its cheapest adequate model
+# first and its most capable one last, so the fallback costs more but serves more.
+# Reordering a route is a behaviour change to spend, not a refactor.
+
+version: 1
+
+defaults:
+  # Applied to every route that does not state its own. Two candidates in every
+  # route is deliberate: a fallback chain of one is a single vendor.
+  max_attempts: 1
+  backoff_initial_seconds: 0.25
+  backoff_max_seconds: 2.0
+  timeout_seconds: 30.0
+
+routes:
+  # The everyday route. A small model on a cheap vendor, with a same-tier fallback
+  # rather than a bigger one: when the cheap model is unavailable, the caller wanted
+  # a cheap answer, not a different expensive one.
+  - model: fast
+    description: Small, cheap, for classification, extraction and routing.
+    candidates:
+      - provider: openai
+        model: gpt-4o-mini
+      - provider: anthropic
+        model: claude-haiku-4-5
+    timeout_seconds: 20.0
+
+  # The capable route. Retries twice: a timeout on a long completion is common
+  # enough that one attempt would surface an error the second attempt would have
+  # answered, and 0.25s of backoff is cheap against a request that costs cents.
+  - model: smart
+    description: The most capable model available, for reasoning and long output.
+    candidates:
+      - provider: anthropic
+        model: claude-sonnet-4-5
+      - provider: openai
+        model: gpt-4o
+    max_attempts: 3
+    timeout_seconds: 60.0

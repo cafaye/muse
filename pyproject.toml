@@ -10,6 +10,13 @@ dependencies = [
     # `exclude-newer = "7 days"` supply-chain quarantine (see AGENTS.md).
     "fastapi>=0.141.1",
     "uvicorn>=0.53.0",
+    # Packet muse-02. Each floor is justified in README.md#dependencies.
+    "litellm>=1.102.0",         # the router/metering engine muse embeds as a library
+    "cryptography>=50.0.1",     # AES-256-GCM for the credentials vault
+    "tenacity>=9.1.4",          # per-candidate retry backoff
+    "psycopg[binary]>=3.3.6",   # postgres: vault_secrets + outbox_events
+    "pyyaml>=6.0.3",            # config/routes.yaml
+    "psycopg-pool>=3.3.0",
 ]
 
 [dependency-groups]
@@ -19,6 +26,9 @@ dev = [
     "pytest-cov>=7.1.0",
     "anyio>=4.15.1",
     "ruff>=0.14.4",
+    # Contract tests only (PLAN §3.3): validates emitted envelopes against
+    # core's schemas when a core checkout is pointed at by MUSE_CORE_SCHEMAS.
+    "jsonschema>=4.26.0",
 ]
 
 [build-system]
