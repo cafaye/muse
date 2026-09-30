@@ -1,10 +1,45 @@
 # muse — local development stack.
 #
-# This is the service alone. No database, no queue: v0 has no dependencies to
-# stand up, and adding empty services here would imply architecture that does
-# not exist yet (AGENTS.md).
+# The service, plus the postgres it now needs. v0 had no dependencies to stand up;
+# the vault and the outbox are this service's own database, so compose carries it.
+#
+# Migrations are a deploy step, not a startup step, so they are applied by hand:
+#
+#   docker compose up -d db
+#   docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
+#   docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
+#
+# MUSE_VAULT_KEY has no default anywhere in this file. Generate one with
+# `uv run python -m muse.vault` and export it, or the service refuses to start — which
+# is the point: a vault that boots with a default key is a vault whose keys are
+# readable by anyone who can read this repository.
 
 services:
+  db:
+    image: postgres:18-alpine
+    container_name: muse-db
+    environment:
+      POSTGRES_USER: muse
+      POSTGRES_PASSWORD: muse
+      POSTGRES_DB: muse
+    ports:
+      # Published so `psql` on the host can apply migrations and store a credential.
+      - "5433:5432"
+    volumes:
+      - muse-db:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD
+        - pg_isready
+        - -U
+        - muse
+        - -d
+        - muse
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   muse:
     build:
       context: .
@@ -14,9 +49,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # v0 has no configuration. Kept explicit so the first real setting has an
-      # obvious home and compose fails loudly on a typo'd name.
       MUSE_ENV: development
+      MUSE_DATABASE_URL: postgres://muse:muse@db:5432/muse
+      # No default, on purpose. An empty value is a missing value, and muse treats a
+      # missing key as a boot failure rather than a first-request failure.
+      MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test:
@@ -28,3 +68,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+volumes:
+  muse-db:

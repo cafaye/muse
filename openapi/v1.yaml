@@ -1,0 +1,523 @@
+openapi: 3.1.0
+
+# The committed HTTP contract for muse. FastAPI generates a document from the code at
+# /openapi.json, and `exposes.api` in cafaye.yml points at this file — so the two
+# exist side by side and can drift.
+#
+# `tests/test_openapi.py` is the mechanism that stops them: it asserts every path,
+# status code and schema here against the running app, in both directions. A field
+# added to a response model without being added here fails the suite, and so does an
+# endpoint added here that the app does not serve.
+#
+# Conventions followed, from core's docs/openapi-conventions.md:
+#   * every path under a single /v1 prefix
+#   * info.version present, and it moves when the document does
+#   * every non-2xx is application/problem+json (RFC 9457) with a reserved `code`
+#   * X-Trace-Id echoed in the header and the body
+#   * bearer auth stated in the security scheme
+#
+# The probe endpoints are deliberately absent. They are infrastructure, not contract:
+# guard and any orchestrator reach them by convention, and documenting them would put
+# /healthz under the /v1 rule it does not belong under. They are in the README.
+
+info:
+  title: muse
+  version: 1.0.0
+  summary: LLM routing, credentials vault, and token metering for cafaye.
+  description: |
+    muse routes a chat completion to the first provider that can serve it, holds
+    provider credentials encrypted at rest, and emits a `muse.tokens.consumed` event
+    for every completion it serves.
+
+    A caller asks for a *model* — a name in this service's `config/routes.yaml` — and
+    never learns which vendor answered. That indirection is the point: it is what
+    lets a request fall through to a second provider when the first is rate limited or
+    down, and it is why a caller cannot pin a request to a vendor.
+
+    ## What this version does not do
+
+    * No streaming. Every response is a complete completion.
+    * No tool calls. A provider response with null content is reported as an error
+      rather than as empty text.
+    * No embeddings, no images, no batches.
+    * Auth is a stub: the presence of a bearer credential is checked, and the token is
+      not verified. Real JWT verification arrives with the guard contract.
+
+    ## Errors
+
+    Every non-2xx response is `application/problem+json` with a `code` from cafaye's
+    reserved list. The codes this service returns:
+
+    | Code | Status | When |
+    | --- | --- | --- |
+    | `unauthorized` | 401 | No bearer credential was supplied. |
+    | `not_found` | 404 | No route is configured for the requested model. |
+    | `validation_failed` | 422 | The request body is not a valid route request. |
+    | `unavailable` | 503 | Every candidate provider for the route failed. |
+    | `internal` | 500 | muse failed. The body says nothing further; `trace_id` is the handle. |
+
+    A 503 means this service is up and the models are not — a distinction a client
+    needs, because it is the one where retrying the *same* request is worthwhile.
+
+    ## Cost and metering
+
+    Every served completion emits a `muse.tokens.consumed` event containing the model,
+    the provider that actually served it, the token counts and `cost_micros` (integer
+    micro-dollars). The response repeats `cost_micros` so a caller can reconcile
+    against its own records without subscribing to the bus.
+
+    If that event cannot be written, the request fails. The completion has already
+    been paid for, and returning it without its record would lose the spend silently.
+  license:
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
+  contact:
+    name: muse
+    email: muse@cafaye.com
+
+servers:
+  - url: https://muse.cafaye.com
+    description: Production.
+  - url: http://localhost:8000
+    description: Local development.
+
+tags:
+  - name: llm
+    description: Routing a chat completion to a provider.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/route:
+    post:
+      tags: [llm]
+      operationId: routeCompletion
+      summary: Route a chat completion
+      description: |
+        Serves a completion from the first candidate that succeeds for the named
+        route, in the order `config/routes.yaml` lists them. A transient failure is
+        retried with exponential backoff; a permanent one advances immediately. If
+        every candidate fails, the whole chain is reported in one 503.
+
+        The caller does not choose a provider. That is what makes the fallback chain
+        possible, and it is why a request cannot be pinned to a vendor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteRequest'
+            examples:
+              single-turn:
+                summary: One user message
+                value:
+                  model: fast
+                  messages:
+                    - role: user
+                      content: Summarise this in one sentence.
+              multi-turn:
+                summary: A conversation, oldest first
+                value:
+                  model: smart
+                  max_tokens: 512
+                  temperature: 0.2
+                  messages:
+                    - role: system
+                      content: You are terse.
+                    - role: user
+                      content: What is an outbox pattern?
+                    - role: assistant
+                      content: A table written in the same transaction as the state.
+                    - role: user
+                      content: Why does that matter?
+      responses:
+        '200':
+          description: A completion. One `muse.tokens.consumed` event was emitted.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteResponse'
+              examples:
+                completion:
+                  summary: A served completion
+                  value:
+                    id: chatcmpl-9f2c1a4b7e0d3f8a5c6b2e1d
+                    object: chat.completion
+                    created: 1798849200
+                    model: gpt-4o-mini
+                    provider: openai
+                    route: fast
+                    choices:
+                      - index: 0
+                        message:
+                          role: assistant
+                          content: An outbox table, written in the same transaction.
+                        finish_reason: stop
+                    usage:
+                      prompt_tokens: 12
+                      completion_tokens: 8
+                      total_tokens: 20
+                    cost_micros: 7
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+        '401':
+          description: No bearer credential was supplied.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/unauthorized
+                title: Unauthorized
+                status: 401
+                detail: a bearer credential is required
+                instance: /v1/route
+                code: unauthorized
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '404':
+          description: No route is configured for the requested model.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no route is configured for model 'gpt-5-turbo'
+                instance: /v1/route
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '405':
+          description: The path exists but not for this method. A completion costs
+            money, so it is POST-only and there is nothing safe to serve on a GET.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: |
+            The request body is not a valid route request. `errors[]` lists each
+            offending field.
+
+            A malformed JSON body is also a 422 rather than a 400: cafaye's
+            `validation_failed` code is a documented 422, and a 400 carrying it would
+            be a code whose status disagrees with the reserved list.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/validation_failed
+                title: Validation failed
+                status: 422
+                detail: 'messages.0.role: Input should be ''user'', ''assistant'' or ''system'''
+                instance: /v1/route
+                code: validation_failed
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+                errors:
+                  - field: messages.0.role
+                    code: literal_error
+        '500':
+          description: |
+            muse failed. The body carries no detail beyond the code and the trace id;
+            the log line does. This includes a failure to record the completion's
+            usage, which is deliberately not swallowed — the completion was paid for
+            and returning it without its metered record would lose the spend.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/internal
+                title: Internal error
+                status: 500
+                detail: an unexpected error occurred
+                instance: /v1/route
+                code: internal
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '503':
+          description: |
+            Every candidate for the route failed. `detail` names each provider, the
+            error class, and how many attempts it took.
+
+            This is `unavailable` rather than `internal` because muse is up and the
+            models are not — the one case where retrying the same request is
+            reasonable.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/unavailable
+                title: Service unavailable
+                status: 503
+                detail: >-
+                  every candidate for model 'fast' failed —
+                  openai/gpt-4o-mini: ProviderTimeout (after 3 attempts);
+                  anthropic/claude-haiku-4-5: ProviderAuthError
+                instance: /v1/route
+                code: unavailable
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A cafaye JWT, `Authorization: Bearer <jwt>`.
+
+        **This version does not verify the token.** It checks that the header is
+        present and carries a bearer credential, and nothing else — no signature, no
+        expiry, no scopes. Verification arrives with the guard contract, and a
+        half-implemented check that looks like a real one is worse than a stub that
+        says it is one.
+
+        No cookies: core allows bearer JWTs only for API traffic.
+
+  headers:
+    TraceId:
+      description: |
+        The request's trace id, echoed from the request when it looked like an
+        opaque token and minted otherwise. Also in the response body, and the two
+        always agree — support starts from this value.
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{8,64}$'
+      example: 0af7651916cd43dd8448eb211c80319c
+
+  schemas:
+    Role:
+      type: string
+      enum: [system, user, assistant]
+      description: OpenAI's set, which is a superset of what the vendors need.
+
+    Message:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+        content:
+          type: string
+          minLength: 1
+          description: |
+            The message text. Must not be empty: an empty message is never what a
+            caller meant, and accepting it turns a client bug into a billed response
+            with no content.
+
+    RouteRequest:
+      type: object
+      additionalProperties: false
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: |
+            A route name from this service's `config/routes.yaml` — currently `fast`
+            and `smart`. Not a vendor model id: which vendor serves it is this
+            service's decision, and letting a caller name one would defeat the
+            fallback chain.
+          examples: [fast, smart]
+        messages:
+          type: array
+          minItems: 1
+          description: The conversation, oldest message first. Order is significant.
+          items:
+            $ref: '#/components/schemas/Message'
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            A cap on the response. Omitted means the provider's default. A null is
+            not sent to the provider at all — some vendors reject it.
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: Sampling temperature, passed through unchanged.
+
+    Choice:
+      type: object
+      additionalProperties: false
+      required: [index, message, finish_reason]
+      properties:
+        index:
+          type: integer
+          const: 0
+          description: Always 0. `n > 1` is not supported in this version.
+        message:
+          type: object
+          additionalProperties: false
+          required: [role, content]
+          properties:
+            role:
+              type: string
+              const: assistant
+            content:
+              type: string
+        finish_reason:
+          type: string
+          description: |
+            Why the model stopped. `stop` means it finished; `length` means it was
+            cut off at `max_tokens`. A caller that cannot tell those apart will treat
+            a truncated answer as a complete one.
+          examples: [stop, length]
+
+    Usage:
+      type: object
+      additionalProperties: false
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+          minimum: 0
+        completion_tokens:
+          type: integer
+          minimum: 0
+        total_tokens:
+          type: integer
+          minimum: 0
+          description: The sum of the two, computed by this service rather than
+            reported, so a provider that reports them inconsistently cannot make the
+            three disagree.
+
+    RouteResponse:
+      type: object
+      additionalProperties: false
+      required:
+        [id, object, created, model, provider, route, choices, usage, cost_micros, trace_id]
+      properties:
+        id:
+          type: string
+          description: |
+            This service's identifier for the completion. Not the provider's own id:
+            a caller's fallback chain produces one id for one request, whatever
+            vendor ended up serving it.
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix seconds, for compatibility with OpenAI-shaped clients.
+        model:
+          type: string
+          description: The vendor's model id that actually served the request.
+        provider:
+          type: string
+          description: |
+            The vendor that served it. Present so an operator can reconcile against a
+            provider's invoice; a caller does not need it to make a decision, because
+            the next request may be served by a different one.
+        route:
+          type: string
+          description: |
+            The route that was used — the name the caller asked for. Distinct from
+            `model`, and it stays meaningful when a fallback changes vendor.
+        choices:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+        cost_micros:
+          type: integer
+          minimum: 0
+          description: |
+            The cost of this completion in micro-dollars (1 USD = 1,000,000 micros).
+            An integer, never a float: a float that rounds differently on two machines
+            is a reconciliation bug nobody can reproduce. This is the same value the
+            `muse.tokens.consumed` event carries.
+        trace_id:
+          type: string
+          description: Matches the `X-Trace-Id` response header.
+
+    FieldError:
+      type: object
+      additionalProperties: false
+      required: [field, code]
+      properties:
+        field:
+          type: string
+          description: Dotted path to the offending field, e.g. `messages.0.role`.
+        code:
+          type: string
+          description: The validator's code for this failure.
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details, with cafaye's extensions.
+      additionalProperties: false
+      required: [type, title, status, detail, instance, code, trace_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: |
+            Stable, machine-readable: `https://errors.cafaye.com/<code>`. The last
+            segment is always the same slug as `code`.
+        title:
+          type: string
+          description: |
+            A fixed human-readable summary for the code. It may be reworded without a
+            version bump, so do not parse it.
+        status:
+          type: integer
+          description: The HTTP status code, repeated in the body for a log.
+        detail:
+          type: string
+          description: |
+            Specific to this occurrence, and not parsed by clients. For a 503 it names
+            each provider that was tried, the error class, and the attempt count.
+        instance:
+          type: string
+          description: The path that was requested.
+        code:
+          type: string
+          enum:
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - validation_failed
+            - rate_limited
+            - internal
+            - unavailable
+          description: |
+            cafaye's reserved error code. The enum is the subset this service
+            returns; the full reserved list includes codes a gateway returns instead.
+        trace_id:
+          type: string
+          description: Always present, and always equal to the `X-Trace-Id` header.
+        errors:
+          type: array
+          description: Per-field failures. Present only on a 422.
+          items:
+            $ref: '#/components/schemas/FieldError'

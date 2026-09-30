@@ -459,6 +459,41 @@ async def test_get_is_not_allowed() -> None:
         assert (await client.get("/v1/route", headers=AUTH_HEADERS)).status_code == 405
 
 
+async def test_a_method_error_is_problem_json() -> None:
+    """Starlette's built-in 405 body is `{"detail": "..."}` as `application/json`, and
+    core says *every* non-2xx is `application/problem+json`. A client that can parse
+    our errors must be able to parse the two it is most likely to hit while
+    integrating — and 405 is one of them."""
+    async with asgi_client(app_for(serving())) as client:
+        response = await client.get("/v1/route", headers=AUTH_HEADERS)
+
+    assert response.headers["content-type"].startswith("application/problem+json")
+    body = response.json()
+    assert body["status"] == 405
+    assert body["code"] == "not_found"
+    assert body["type"] == "https://errors.cafaye.com/not_found"
+
+
+async def test_an_unknown_path_is_problem_json() -> None:
+    """Same reason, and 404 is the other one. Core's rule: 404 is correct where a
+    caller cannot see the resource, which is every unrouted path."""
+    async with asgi_client(app_for(serving())) as client:
+        response = await client.get("/v1/nope", headers=AUTH_HEADERS)
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["code"] == "not_found"
+    assert response.json()["trace_id"] == response.headers["X-Trace-Id"]
+
+
+async def test_a_probe_on_the_wrong_method_is_still_problem_json() -> None:
+    """Even the ops surface, so a client that assumes one error shape has one."""
+    async with asgi_client(app_for(serving())) as client:
+        response = await client.post("/healthz")
+    assert response.status_code == 405
+    assert response.headers["content-type"].startswith("application/problem+json")
+
+
 async def test_a_malformed_body_is_a_validation_failure() -> None:
     """422, not 400, and the reason is core's own table: `validation_failed` is a
     documented 422, so a 400 carrying that code would be a code whose status

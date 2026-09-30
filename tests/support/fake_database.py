@@ -18,7 +18,8 @@ same-transaction rule is asserted: two statements at the same depth inside one
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+import json
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -69,7 +70,7 @@ class FakeDatabase:
         if VAULT_TABLE in sql:
             self._write_vault(sql, tuple(params))
         elif OUTBOX_TABLE in sql:
-            self._write_outbox(tuple(params))
+            self._write_outbox(sql, tuple(params))
 
     async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Mapping[str, Any] | None:
         self._record(sql, params)
@@ -154,13 +155,49 @@ class FakeDatabase:
             return self.vault.get(params[0]) if params else None
         return None
 
-    def _write_outbox(self, params: tuple[Any, ...]) -> None:
-        self.outbox.append(dict(zip(_OUTBOX_COLUMNS, params, strict=False)))
+    def _write_outbox(self, sql: str, params: tuple[Any, ...]) -> None:
+        if "insert into" in sql:
+            self.outbox.append(dict(zip(_OUTBOX_COLUMNS, params, strict=False)))
+        elif "set published_at" in sql:
+            self._mark_outbox(params[0], lambda row: row.update(published_at="now()"))
+        elif "set attempts" in sql:
+            self._mark_outbox(
+                params[0], lambda row: row.update(attempts=int(row.get("attempts", 0)) + 1)
+            )
+
+    def _mark_outbox(self, event_id: Any, mark: Callable[[dict[str, Any]], None]) -> None:
+        """Apply the publisher's mark to the stored row, as postgres would.
+
+        The publisher updates the same table the meter inserts into, so matching on the
+        table name alone files a `published_at` mark as a second event — and the next
+        claim hands the loop a row with no `event_type` in it. A row the id does not
+        match is left alone, which is what an update of zero rows looks like.
+        """
+        for row in self.outbox:
+            if row.get("id") == event_id:
+                mark(row)
 
     def _read_outbox(self, sql: str, params: tuple[Any, ...]) -> Mapping[str, Any] | None:
         if "where published_at is null" in sql:
-            return {"rows": [row for row in self.outbox if row.get("published_at") is None]}
+            return {
+                "rows": [
+                    _as_driver_row(row) for row in self.outbox if row.get("published_at") is None
+                ]
+            }
         return None
+
+
+def _as_driver_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The row as psycopg hands it back: `jsonb` decoded, every other column verbatim.
+
+    The store keeps `data` as the JSON text the insert wrote, because surviving the
+    round trip through the database is the property the metering test asserts. A *reader*
+    gets a dict, though — so a publisher that forgets that fails at runtime with
+    `dict("...")` on a string, which is exactly the kind of thing a fake that agrees
+    with the code instead of the driver hides.
+    """
+    payload = row.get("data")
+    return {**row, "data": json.loads(payload) if isinstance(payload, str) else payload}
 
 
 #: The parameter order the outbox insert is written in, so the fake can turn a

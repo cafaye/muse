@@ -36,6 +36,7 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from muse.errors import (
     AllCandidatesFailed,
@@ -295,6 +296,27 @@ def build_router() -> APIRouter:
     return api
 
 
+#: A Starlette status mapped onto a reserved code. Core's list has no 405, so the
+#: method error borrows `not_found`: both answer "you asked for something that is not
+#: here", and inventing a code for it would be a client that has to special-case muse.
+_STATUS_CODES = {
+    400: "validation_failed",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "not_found",
+    409: "conflict",
+    422: "validation_failed",
+    429: "rate_limited",
+    500: "internal",
+    503: "unavailable",
+}
+
+
+def _code_for_status(status: int) -> str:
+    return _STATUS_CODES.get(status, "internal")
+
+
 def _chain(error: AllCandidatesFailed) -> str:
     """The failure chain as one sentence.
 
@@ -330,12 +352,23 @@ def _fields(error: ValidationError) -> list[dict[str, str]]:
 
 
 def register_error_handlers(app: FastAPI) -> None:
-    """Map muse's typed errors onto the envelope, and everything else onto `internal`.
+    """Map every error onto the envelope: HTTP errors, muse's typed errors, and
+    everything else.
 
-    The last handler is the important one: an exception that is not a `MuseError` is a
-    bug in muse, and its type and message must not reach a caller. The trace id is the
-    handle; the log line is where the detail lives.
+    The `HTTPException` handler is the one that is easy to miss. Starlette's built-in
+    404 and 405 bodies are `{"detail": "..."}` as `application/json`, and core says
+    *every* non-2xx is `application/problem+json` — so without this a client that can
+    parse our errors cannot parse the two it is most likely to hit while integrating.
     """
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, error: StarletteHTTPException) -> JSONResponse:
+        return problem(
+            request,
+            _code_for_status(error.status_code),
+            error.status_code,
+            str(error.detail),
+        )
 
     @app.exception_handler(RouteConfigError)
     async def _config_error(request: Request, error: RouteConfigError) -> JSONResponse:

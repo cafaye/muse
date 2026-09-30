@@ -5,57 +5,104 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-30
+
+Packet `muse-02`: providers, router, vault, metering, and the HTTP surface. muse can
+now serve a completion and bill for it.
+
 ### Added
 
-- Packet `muse-02` foundations.
-  - Runtime deps: `litellm` (the routing/metering engine muse embeds as a
-    library), `cryptography` (AES-256-GCM for the vault), `tenacity` (per-candidate
-    retry backoff), `psycopg` + `psycopg-pool` (postgres), `pyyaml`
-    (`config/routes.yaml`). Each is justified in `README.md`.
-  - `muse/errors.py` — the error taxonomy. Subclasses of `ProviderError` split on
-    one question: would the identical call plausibly succeed a moment later?
-    `RETRYABLE_PROVIDER_ERRORS` is the list the router retries on, so an unlisted
-    error ends the request on the first candidate.
-  - `muse/redaction.py` — `Secret` (a `str` whose `repr`/`str`/`__format__` are
-    the redaction marker, with a constant-time `__eq__`) and `redact()`, which
-    scrubs a credential out of provider-supplied text before it becomes a log line
-    or a `problem+json` body.
-  - `muse/contracts.py` — core's `eventType`, `serviceName` and `subject`
-    patterns, with validators. The patterns are a copy of
-    `core/schemas/event-envelope.schema.json`; `tests/test_contracts.py` asserts
-    the copy is byte-identical whenever `MUSE_CORE_SCHEMAS` points at a core
-    checkout.
-  - `muse/db.py` — the `Database` protocol (execute / fetchone / transaction) and
-    `PsycopgDatabase` over a *pool*, so a transaction is an isolated handle rather
-    than shared state.
-  - `migrations/00001_outbox_events.sql` — core's outbox table, column for column,
-    with core's own patterns as CHECK constraints and the partial index the
-    publisher's claim query needs.
-  - `migrations/00002_vault_secrets.sql` — one encrypted key per provider. No
-    plaintext column, by design.
-  - `muse/providers/` — the `Provider` protocol (`complete`, `health`,
-    `cost_per_1k_tokens`), a registry that refuses to register a name twice, the
-    LiteLLM adapter for openai and anthropic, and `FakeProvider` /
-    `ScriptedProvider`. Prices are integer micro-dollars per 1k tokens; the single
-    place a float touches money is the adapter's conversion from litellm's
-    per-token table, which rounds up so a sub-micro price is never zero.
-    The adapter scrubs the credential out of provider error text and health
-    details, and maps litellm's exception taxonomy onto muse's — with
-    `ContextWindowExceededError` checked before `BadRequestError`, which it
-    subclasses upstream.
+- **Dependencies**, each justified in `README.md`:
+  - `litellm` — the routing and metering engine, embedded as a library through its
+    Python API (PLAN §2b). No code copied.
+  - `cryptography` — AES-256-GCM for the credentials vault.
+  - `tenacity` — per-candidate retry with exponential backoff, with an injectable sleep.
+  - `psycopg` + `psycopg-pool` — postgres, and a pool rather than a connection so a
+    transaction is an isolated handle rather than shared state.
+  - `pyyaml` — `config/routes.yaml`.
+  - `jsonschema` (dev only) — validates `cafaye.yml` against core's schema when a core
+    checkout is available.
+- `muse/providers/` — the `Provider` protocol (`complete`, `health`,
+  `cost_per_1k_tokens`), a registry that refuses to register a name twice, the LiteLLM
+  adapter for openai and anthropic, and `FakeProvider` / `ScriptedProvider`.
+  - Prices are integer micro-dollars per 1k tokens. The single place a float touches
+    money is the adapter's conversion from litellm's per-token table, which rounds *up*:
+    a sub-micro-dollar price must not become zero, which would make a month of usage
+    invisible until the invoice did not add up.
+  - The adapter scrubs the credential out of provider error text and health details,
+    and maps litellm's exception taxonomy onto muse's — with
+    `ContextWindowExceededError` checked *before* `BadRequestError`, which it
+    subclasses upstream. Reordering them does not crash; it files a too-long prompt as
+    a malformed request.
+- `muse/routes.py` — `config/routes.yaml` and its loader. A candidate's model is
+  resolved at `Route` construction; an unknown key is a load error rather than a
+  warning, because a misspelled `max_attemtps` that is silently dropped leaves a route
+  retrying once while its author believes it retries three times.
+- `muse/router.py` — request to ordered candidates, first success wins, failures
+  advance. Real tenacity backoff with an injected sleep, so the suite asserts the
+  durations the policy asked for. The price is resolved *before* dispatch, so a model
+  muse cannot price is never called.
+- `muse/vault.py` — AES-256-GCM under `MUSE_VAULT_KEY`, which must be present, base64
+  and exactly 32 bytes or the process does not start. The provider name is the
+  additional authenticated data, so a ciphertext copied between rows fails to decrypt
+  rather than decrypting under the wrong vendor. Plaintext comes back as a `Secret`.
+- `muse/providers/credentials.py` — `VaultCredentials` reads through the vault per
+  request, so a rotated key takes effect on the next request rather than at the next
+  deploy.
+- `muse/metering.py` — one `muse.tokens.consumed` event per served completion, in a
+  transaction, with exactly five payload fields. A metering failure is not swallowed:
+  the completion was paid for, and returning it without its record would lose the spend
+  silently.
+- `muse/outbox.py` — the publisher skeleton. core's claim query with
+  `for update skip locked`, ack-then-mark, exponential backoff with a cap, and a
+  transport interface with no implementation: this packet has no NATS client, and
+  `InMemoryTransport` is named for what it is.
+- `muse/db.py` — the `Database` protocol and the psycopg adapter.
+- `muse/redaction.py` — `Secret`, whose `repr`/`str`/`__format__` are the redaction
+  marker, and `redact()` for provider-supplied text.
+- `muse/contracts.py` — core's `eventType`, `serviceName` and `subject` patterns, with
+  a parity test against a core checkout.
+- `migrations/00001_outbox_events.sql` — core's outbox table, column for column.
+- `migrations/00002_vault_secrets.sql` — one encrypted key per provider, no plaintext
+  column.
+- `config/routes.yaml` — the committed routing table: `fast` and `smart`, each with a
+  fallback.
+- `POST /v1/route` — the completion endpoint. Every non-2xx is
+  `application/problem+json` with a cafaye `code`, and `X-Trace-Id` in the header and
+  the body.
+- `openapi/v1.yaml` — the committed HTTP contract, checked against the running app in
+  both directions so it cannot drift from the code.
+- `cafaye.yml` — migrated to core's manifest schema, with
+  `exposes.events: [muse.tokens.consumed]`.
 
-### Fixed
+### Changed
 
-- Credential redaction in the LiteLLM adapter's error path now covers the whole
-  rendered traceback, not only the reported message. `complete` raises the mapped
-  error `from` the vendor exception, so the plaintext key survived in the chained
-  `__cause__`; every traceback renderer (`traceback.format_exception`,
-  `logging.exception`, an APM agent) prints that cause with its own message, which
-  put a live credential in the log line even though the reported error body read
-  clean. `_sanitise` now scrubs the cause's message in place, keeping the vendor
-  exception class and its frames — the cause is deliberately *not* dropped, since
-  a `from None` would pass every redaction test and make provider failures
-  undiagnosable. Messages carrying no credential are left exactly as-is.
+- `/readyz` fills the `db` slot the v0 scaffold reserved: `ok` when the store answers,
+  `error` when it does not, and the status is `degraded` rather than `unavailable`
+  because a route whose provider needs no database read can still be served. The key
+  and the shape are unchanged, which is what "later packets fill the value in" meant.
+- 404 and 405 are now `application/problem+json` rather than Starlette's
+  `{"detail": ...}`. core says every non-2xx is problem+json, and a client that can
+  parse our errors should be able to parse the two it hits while integrating.
+- `muse.app` is now the composition root: `create_app(settings, container)` builds a
+  `Container` during the lifespan, and accepts one so tests do not need a database.
+
+### Notes
+
+- `muse.tokens.consumed`'s action `consumed` is **not** in core's v0 action
+  vocabulary. The packet brief named it, so it is implemented as specified and flagged
+  for the manager in `cafaye.yml`: either the vocabulary gains `consumed` or this
+  becomes `muse.usage.recorded`. Both are one-line changes; the vocabulary is core's.
+- The payload schema for `muse.tokens.consumed` belongs in core, not here — core owns
+  every payload schema because a publisher that owns its own is a contract nobody else
+  can rely on. It is not written in this packet.
+- The outbox publisher has no transport. This packet has no NATS client, and
+  `InMemoryTransport` is what the tests and the local stack use.
+- Dependency floors are the newest releases satisfying the machine-wide uv
+  `exclude-newer = "7 days"` quarantine, so they may trail the true latest. See the
+  Dependencies section of `AGENTS.md`.
+- 592 tests, 100% branch coverage. The one excluded function is
+  `PsycopgDatabase.open()`, which dials.
 
 ## [0.1.0] — 2026-09-30
 
@@ -90,5 +137,6 @@ Initial scaffold (packet `muse-01`). No LLM logic yet — see `AGENTS.md`.
   `AGENTS.md`.
 - `cafaye.yml` is a draft: `core` owns the schema and does not exist yet.
 
-[Unreleased]: https://github.com/cafaye/muse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cafaye/muse/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cafaye/muse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cafaye/muse/releases/tag/v0.1.0
