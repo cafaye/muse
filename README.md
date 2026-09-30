@@ -396,17 +396,35 @@ Three things follow, and each has a test:
 
 ```sh
 bin/prime                       # the gate: sync, lint, 100% branch coverage
+mise run prime                  # the same gate, by the name the fleet uses
 uv run pytest                   # the suite and the coverage gate
 uv run pytest -m unit           # skip anything marked integration
 uv run pytest -k vault -vv       # one concern
 uv run pytest --cov-report=html  # htmlcov/index.html
 ```
 
-765 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
+898 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
 process over `httpx.ASGITransport`, the database is an in-memory store behind the same
 `Database` seam production uses, and litellm is a stand-in module — so the real
 adapter's exception mapping is the code under test, not a mock of it. The one
 excluded function is `PsycopgDatabase.open()`, which dials.
+
+**The gate is declared, not guessed.** `gate.yml` at the root states what gates this
+repository — the command, the mise task, what it needs from the machine, and the
+lines it must print before "passed" means anything — and is checked against the tree by
+core's `harness/gate_check.py`:
+
+```sh
+../core/harness/bin/gate-check .
+../core/harness/bin/gate-check --prove .
+bash tests/gate_self_test.sh          # the declaration can fail: 13 breakages
+```
+
+One property is worth knowing before you touch it. `bin/prime` exits 0 with
+`895 passed, 3 skipped` on any machine without a `cafaye/core` checkout, and those
+three are the tests that catch muse's vendored copies of core's specs drifting.
+`gate.yml`'s `core-parity` proof is what turns that state red. See
+[AGENTS.md](AGENTS.md#the-gate-is-declared-not-discovered).
 
 Three tests skip unless pointed at a core checkout:
 

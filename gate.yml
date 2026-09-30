@@ -1,0 +1,160 @@
+# gate.yml — how muse is gated, declared rather than guessed.
+#
+# WHY THIS FILE EXISTS. Across the fifteen repositories in the cafaye fleet,
+# "run the gate" had five spellings, and muse was one of the two that had no
+# mise task at all: `mise x -- ./bin/prime`, against a `mise.toml` carrying
+# only `[tools]`. The other spelling was `mise run prime`, in nine
+# repositories. Both were found by a human getting it wrong, which is the
+# argument: a gate that is discovered by failure is a gate that was never
+# declared. The format is cafaye/core's `schemas/gate.schema.json`, the
+# checker is its `harness/gate_check.py`, and the reasoning — including the
+# two alternatives that were measured and rejected — is its `docs/gate.md`.
+#
+# WHAT THIS DECLARATION IS FOR, SPECIFICALLY. muse's gate is the one gate in
+# this fleet that is green while part of its suite has not run. `bin/prime`
+# exits 0 with `895 passed, 3 skipped` on any machine that does not happen to
+# have a cafaye/core checkout beside it, and those three are the only tests
+# that catch muse's vendored copies of core's specs drifting. This file makes
+# that state red instead: `gate.proof[].core-parity` only matches a summary
+# line with no skip on it, so `gate-check --prove` fails with
+# `gate.proof-missing` on the exact run that `bin/prime` calls a pass.
+#
+# THAT IS A DELIBERATE CHOICE, and the cost is stated so a later reader can
+# reverse it cheaply. A looser `suite` proof alone would let `895 passed,
+# 3 skipped` through, because the count is above the floor and the word
+# "skipped" is not in the pattern. The alternative is one line: delete the
+# `core-parity` proof. The count does not change and the gate goes green over
+# an unrun tier again.
+version: 1
+name: muse
+
+gate:
+  # The command a person or a tool runs. An argv, never a shell string, so the
+  # exit code is the gate's own. This fleet's one recorded false green was
+  # `… | tail -45; echo "PRIME EXIT=$?"` under zsh, where `$?` is tail's and
+  # tail is always 0.
+  command: [bin/prime]
+  # Added by this packet, deliberately, and worth explaining. muse had no
+  # `[tasks]` at all, so the declaration could have omitted `miseTask` and
+  # drawn no warning — the checker's `gate.task-undeclared` only fires when a
+  # mise config *has* tasks. Declaring it anyway buys two things: the fleet's
+  # spelling works here, and `miseTask` becomes a second, independent reading
+  # of what the gate is, which is what `gate.task-unresolvable` exists to
+  # catch. The task's `run` is the file, not a shell string, so the checker
+  # can resolve it without a shell. Nothing about `bin/prime` changed.
+  miseTask: prime
+  # The file behind the command, and the file the mise task must resolve to.
+  entrypoint: bin/prime
+  # 1200 is CI's own budget: the `gate` job in .github/workflows/ci.yml is
+  # `timeout-minutes: 20`. A warm local run is about a minute; a cold
+  # checkout spends most of it in `uv sync --locked` pulling this
+  # repository's closure from PyPI. Generous on purpose — a floor tight
+  # enough to be a bug detector is tight enough to be a flake generator on
+  # someone's first run.
+  timeoutSeconds: 1200
+  proof:
+    # The suite's own summary line, as a decrease-detector. `bin/prime` is
+    # `uv run --locked pytest`, so this is the line pytest prints, wrapped in
+    # its `=` rule. Verified against real output, not guessed: it is
+    # `================== 895 passed, 3 skipped in 133.32s (0:02:13) ==…`
+    # without a core checkout and `============================= 898 passed in
+    # 34.96s =============================` with one.
+    - id: suite
+      match: '^=+ ([0-9]+) passed'
+      # 890, deliberately below today's 895. The count only ever rises, so a
+      # floor at exactly today's number is a floor that has to be raised by
+      # hand before anything can be added; five tests of margin buys that
+      # headroom. It is still a detector: a suite that quietly lost six tests
+      # is `gate.floor`, which is a failure.
+      minimum: 890
+    #
+    # The load-bearing one. The negative lookahead is the whole point: it
+    # matches a summary line only when nothing was skipped. On the
+    # `895 passed, 3 skipped` line the lookahead sees "skipped" further along
+    # the same line and refuses, so `gate.proof-missing` is a FAILURE and
+    # `gate-check --prove` goes red on a gate that exited zero.
+    #
+    # A regex rather than a second hand-written assertion in the workflow
+    # because the assertion already exists there and is the reason for this
+    # proof: .github/workflows/ci.yml has a step whose entire job is to fail
+    # the build when pytest's summary mentions a skip, with the comment "a
+    # per-test allowlist is a list that grows, and the day a third tier is
+    # added nobody edits the list". This is that step, expressed where a
+    # developer and a tool can both see it.
+    - id: core-parity
+      match: '^=+ (?!.*skipped)([0-9]+) passed'
+      # 898 exactly, and not a rounded number. 895 of the tests are
+      # self-contained; the three that are not are
+      # tests/test_contracts.py::test_patterns_are_byte_identical_to_core,
+      # the telemetry-vocabulary drift guard in test_error_vocabulary.py, and
+      # the manifest-drift guard in test_openapi.py. 898 - 895 is exactly
+      # those three, so this floor cannot be satisfied by a run in which the
+      # cross-repo tier did not execute. It is also a ratchet in the other
+      # direction: delete one of the three and the parity gate goes red.
+      minimum: 898
+    #
+    # NOT asserted here, because the checker cannot see it: that CI sets
+    # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
+    # workflow's `run:` bodies textually and an `env:` block is not in one,
+    # so a workflow that dropped that variable would still pass this
+    # declaration's static phase. Named in REPORT-core-10-muse.md.
+
+external:
+  # false, and saying so is the point. `bin/prime` starts with
+  # `uv sync --locked`, which installs this repository's whole dependency
+  # closure and needs PyPI on a cold checkout and a pinned toolchain that the
+  # machine does not carry until mise installs it. A declaration calling this
+  # self-contained would describe a gate nobody has ever run on a clean
+  # machine — the same defect as identity's suite being green against a
+  # database nobody had migrated, told the other way round.
+  selfContained: false
+  requirements:
+    - kind: toolchain
+      name: CPython 3.14 and uv 0.12.20, the two pins mise.toml carries
+      satisfy:
+        # A bare name, so the checker deliberately does not run it and says
+        # so as `gate.requirement-unproven` — a warning, never a failure.
+        # A requirement satisfied by something on PATH is a claim about this
+        # machine, and a checker that went looking for uv would be red on a
+        # laptop and green on CI.
+        command: [mise, install]
+        unmet: bin/prime exits 127 at `uv sync --locked`, or mise refuses the pins in mise.toml
+    - kind: network
+      name: PyPI, ONCE, on a cold checkout — this repository's locked dependency closure
+      satisfy:
+        # A repository-relative path, so the checker verifies the file is
+        # there: a requirement satisfied by a file that does not exist is a
+        # pointer to a page that does not exist, which is what this field
+        # replaced. `bin/prime` is the argv that actually reaches the network,
+        # because `uv sync --locked` is the first thing it runs and there is
+        # no separate setup script in this repository to name instead.
+        command: [bin/prime]
+        unmet: uv cannot resolve or download, and bin/prime exits nonzero before its lint step
+    - kind: filesystem
+      name: a cafaye/core checkout at ../core, with MUSE_CORE_SCHEMAS pointing at its schemas directory
+      satisfy:
+        # The second half of satisfying this one is the environment variable,
+        # and no file in this repository can assert it — which is precisely
+        # why the `core-parity` proof above, and not this requirement, is what
+        # makes the tier non-optional. A requirement says what to get; a proof
+        # says the gate may not be green without it.
+        # The `'1'` is quoted because it is an argv element, and a reader that
+        # coerces a bare `1` to an integer hands the checker something that is
+        # not a string — `gate.schema` caught exactly that on the first draft.
+        command: [git, clone, --depth, '1', git@github.com:cafaye/core.git, ../core]
+        unmet: the suite reports `895 passed, 3 skipped` instead of `898 passed`, and the core-parity proof never appears
+  # NOT required, and named so nobody goes looking for them: no database, no
+  # service, no credential, no secret. `tests/support/fake_database.py` and
+  # `tests/support/fake_psycopg.py` mean the suite never opens a socket to
+  # Postgres, and `MUSE_VAULT_KEY` has no default anywhere so a missing one is
+  # a boot failure rather than a test environment. The three skipped tests are
+  # the only external dependency the suite has, and it is listed above.
+
+ci:
+  workflow: .github/workflows/ci.yml
+  # `[bin/prime]` and not `[bin/prime, -q, -rs]`, on purpose. The argv CI runs
+  # is `bin/prime -q -rs` in the `gate` job, and both spellings would pass
+  # `gate.ci-disagrees` today. Declaring the flags would make the check
+  # sensitive to a verbosity change that has nothing to do with whether CI
+  # gates this repository, which is the only question this field asks.
+  invokes: [bin/prime]

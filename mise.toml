@@ -4,3 +4,7 @@ uv = "0.12.20"
 
 [env]
 _.path = [".venv/bin"]
+
+[tasks.prime]
+description = "The gate: uv sync --locked, ruff, then the suite (bin/prime)"
+run = "bin/prime"
