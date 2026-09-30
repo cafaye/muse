@@ -42,8 +42,20 @@ class ConfigError(MuseError):
 class VaultKeyError(ConfigError):
     """`MUSE_VAULT_KEY` is missing, not base64, or not 32 bytes.
 
-    Refusing to boot is the point. A vault that starts with a default key is a
-    vault whose keys are readable by anyone who has read the source.
+    Refusing to boot is the point. A vault that starts with a default key is a vault
+    whose keys are readable by anyone who has read the source. The message names the
+    variable and never its value, because a boot error is the one message guaranteed
+    to be read aloud and pasted into a ticket.
+    """
+
+
+class VaultConfigError(ConfigError):
+    """A vault operation was asked for something it cannot do: an unusable provider
+    name, or an empty key.
+
+    An empty key is refused rather than stored. Forwarded to a provider it comes back
+    as a 401, which reads like a *wrong* key and sends an operator to rotate a
+    credential that does not exist.
     """
 
 
@@ -125,6 +137,27 @@ class ResponseShapeError(ProviderError):
     Not retryable in the router's sense: the same provider answering the same way
     again is the expected outcome of an adapter bug, and the honest response is to
     fall through to the next candidate and record why.
+    """
+
+
+class MeteringError(MuseError):
+    """A completion cannot be turned into a metered event.
+
+    Raised before the insert, while the call is still attributable to this request.
+    The alternatives are both worse: a zero-cost event makes the spend invisible, and
+    a negative one makes it a credit in somebody's invoice.
+    """
+
+
+class VaultDecryptError(MuseError):
+    """A stored value could not be decrypted.
+
+    Deliberately does not distinguish "wrong key" from "tampered ciphertext" from
+    "row written by a future version": all three mean the same thing to an operator —
+    this row is unreadable — and GCM's guarantee is precisely that you cannot tell
+    them apart without the key. The message names the provider, which is the part they
+    can act on, and never the ciphertext, which is the part they must not paste into a
+    ticket.
     """
 
 
