@@ -49,8 +49,9 @@ loop" facts about this code rather than hopes about a machine (AGENTS.md rule 13
 
 Spans are created here too, through `muse.telemetry.Telemetry`. The attributes
 recorded are model, provider, token counts, cost, latency, breaker state and the
-error *class* — never a prompt, a completion, or a credential, because
-`muse.telemetry` refuses anything not on its allowlist and the canary test in
+error *class* — one of core's thirteen, through `muse.telemetry.record_error`,
+never a prompt, a completion, or a credential, because `muse.telemetry` refuses
+anything not on its allowlist and the canary test in
 `tests/test_trace_propagation.py` asserts that against the exported payload.
 """
 
@@ -238,7 +239,8 @@ class Router:
             # Raised before the span, and the model name is not recorded anywhere: it
             # is caller-supplied text, and `muse.telemetry` does not put
             # caller-supplied text on a span. An unknown model earns a status and an
-            # error class, which is all it deserves.
+            # error class (`invalid_request`), which is all it deserves — a route span
+            # that claimed to have failed would drag a 404 into every error rate.
             raise RouteNotFound(model)
         # The messages are validated here, before the candidate loop, so a bad role
         # is a typed ValueError the endpoint turns into a 422 rather than a
@@ -324,14 +326,12 @@ class Router:
                 muse_candidate_index=index,
                 muse_breaker_state=str(breaker.state),
             ) as span:
-                # The mapping form because `error.type` is a semantic convention and
-                # keeps its dot, which is not a legal Python keyword argument. The 503
-                # is what makes this span distinguishable in a trace viewer from a call
-                # that was actually made and failed.
+                # The 503 is what makes this span distinguishable in a trace viewer
+                # from a call that was actually made and failed.
                 record(span, {"http.response.status_code": 503})
-                # Not inline: `record_error` is what makes the class and the span's
-                # failed status one act, and the class is core's vocabulary rather than
-                # this class's name.
+                # `record_error`, not an inline attribute: it is what makes the class
+                # and the span's failed status one act, and it is what puts the class
+                # in core's vocabulary rather than this class's name.
                 record_error(span, CircuitOpen)
             return _Attempt(
                 failure=CandidateFailure(

@@ -29,7 +29,10 @@ Two things are deliberately *not* on the list:
 
 - **`error.message`.** A vendor's error text is third-party text, and a
   content-policy rejection quotes the offending content back to you. `error.type` —
-  the exception's class name — answers "what kind of failure" with no content in it.
+  one of core's thirteen classes, drawn by `muse.errortype` — answers "what kind of
+  failure" with no content in it, and so does the exception's own class name; the
+  difference between the two is that this one is spelled the same way in every
+  service, which is what lets the fleet-wide error view be a query.
 - **Anything the caller sent.** The model name a client asked for is caller text, so
   it is recorded only after `RouteTable.find` has matched it to a configured route.
   Before that point the request produced a status and an error type, which is all an
@@ -65,8 +68,9 @@ from muse.errors import ConfigError, UnclassifiedError
 from muse.errortype import FALLBACK, error_type
 from muse.redaction import Secret
 
-#: Where the two words nobody should see together end up. A logger rather than a bare
-#: print, so a deployment's existing log configuration decides where it goes.
+#: Where a span attribute that could not be classified is announced. A named logger
+#: rather than a bare `print`, so a deployment's existing log configuration decides
+#: where it goes, and only the class name ever reaches it.
 logger = logging.getLogger("muse.telemetry")
 
 #: The W3C trace-context header. Lowercase on purpose: HTTP header names are
@@ -135,10 +139,11 @@ ALLOWED_SPAN_ATTRIBUTES: frozenset[str] = frozenset(
         "muse_retry_backoff_ms",
         "muse_retry_budget_exhausted",
         "muse_retry_indeterminate",
-        # Errors: the exception's *class name* and nothing else. The message is
-        # third-party text and a content-policy rejection quotes the offending
-        # content back, so `error.message` is precisely the attribute that could
-        # carry a prompt. It is not on this list and must not be added.
+        # Errors: the *class*, drawn from core's vocabulary by `muse.errortype`, and
+        # nothing else. The message is third-party text and a content-policy rejection
+        # quotes the offending content back, so `error.message` is precisely the
+        # attribute that could carry a prompt. It is not on this list and must not be
+        # added.
         "error.type",
     }
 )
