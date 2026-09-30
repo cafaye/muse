@@ -19,6 +19,10 @@ dependencies = [
     "psycopg-pool>=3.3.0",
     "opentelemetry-api>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
+    # Imported by src/muse at module scope, so declared rather than inherited from
+    # fastapi's pins. See tests/test_dependencies.py.
+    "pydantic>=2.13.5",         # the request/response models in api.py and main.py
+    "starlette>=1.6.0",         # the ASGI types, headers and HTTPException
 ]
 
 [project.optional-dependencies]
@@ -28,6 +32,15 @@ otel = [
 
 [dependency-groups]
 dev = [
+    # The suite exercises the endpoint path, which imports the OTLP exporter, so the
+    # exporter is a *test* dependency whatever else it is. Asking for it through the
+    # extra rather than repeating its floor here keeps one declaration: a floor
+    # written twice is a floor that drifts, and a drifted floor is this bug again.
+    # `uv sync --locked` installs the dev group, so `bin/prime` gets the exporter —
+    # which is what it could not do on a fresh clone before (muse-03b). The image is
+    # unaffected: the Dockerfile installs with --no-dev, which
+    # tests/test_dependencies.py::test_the_exporter_stays_out_of_the_image asserts.
+    "muse[otel]",
     "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",

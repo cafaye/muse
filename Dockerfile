@@ -17,15 +17,20 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first: this layer is cached until pyproject.toml/uv.lock change.
-# --frozen refuses to re-resolve, so a stale lock fails the build instead of
-# silently installing something different from what CI tested.
+# --locked refuses to re-resolve, so a lock that no longer matches pyproject.toml
+# fails the build instead of silently installing something different from what CI
+# tested. (--frozen would not: it only means "do not update the lock".)
+#
+# --no-dev on every sync is load-bearing rather than tidiness. The dev group carries
+# the OTLP exporter because the suite imports it, and the image must not inherit it.
+# Asserted by tests/test_dependencies.py::test_the_exporter_stays_out_of_the_image.
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --locked --no-install-project --no-dev
 
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --locked --no-dev
 
 # --- stage 2: runtime --------------------------------------------------------
 FROM python:3.14-slim AS runtime

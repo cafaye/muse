@@ -2,18 +2,26 @@
 # bin/prime — the gate. Sync the environment, then run the suite.
 #
 # This is what CI runs and what a reviewer runs before believing a change. It
-# fails loudly: `uv sync --frozen` refuses to re-resolve a stale lock, and
-# pytest enforces the 100% coverage gate.
+# fails loudly: `--locked` refuses to run against a `uv.lock` that no longer
+# matches `pyproject.toml`, and pytest enforces the 100% coverage gate.
+#
+# `--locked`, not `--frozen`, on every uv invocation — and that includes the
+# `uv run` lines, not just the sync. `--frozen` means "do not update the lock",
+# which is what lets a stale lock install silently; `--locked` means "assert the
+# lock would not change". `uv run` re-resolves by default, so a `uv sync --locked`
+# followed by a bare `uv run` still rewrites `uv.lock` on the way to pytest: the
+# gate would pass over a lockfile nobody committed. tests/test_dependencies.py
+# asserts both halves.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "==> syncing (frozen lock)"
-uv sync --frozen
+echo "==> syncing (locked)"
+uv sync --locked
 
 echo "==> lint"
-uv run ruff check .
-uv run ruff format --check .
+uv run --locked ruff check .
+uv run --locked ruff format --check .
 
 echo "==> tests"
-uv run pytest "$@"
+uv run --locked pytest "$@"
