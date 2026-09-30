@@ -84,6 +84,31 @@ class InvalidServiceName(ContractError):
     """A service name is not lowercase kebab-case per core's pattern."""
 
 
+class UnclassifiedError(ContractError):
+    """A class muse raises has no entry in the error-class vocabulary.
+
+    Raised by `muse.errortype.error_type`, never by a request path directly. The point
+    is that the omission is a *refusal* rather than a default: `error.type` is a closed
+    enum in core's `traces.schema.json`, so the alternative — silently emitting
+    `_OTHER` for a class nobody thought about — produces a dashboard full of `_OTHER`
+    that nobody can act on, which is how a vocabulary stops being used.
+
+    Named with the class that has no mapping and nothing else. An exception message here
+    would be the one place in this module where third-party text could travel, and the
+    class name is the whole of what a reader needs to fix it.
+    """
+
+
+class InvalidErrorType(ContractError):
+    """A mapping points at a value that is not one of core's classes.
+
+    The other half of `UnclassifiedError`, and checked at import rather than at use: a
+    table that maps to a value core does not have is a programming error, and finding it
+    out on the first provider failure is later than finding it out when the module
+    loads.
+    """
+
+
 class ProviderError(MuseError):
     """One provider failed.
 
