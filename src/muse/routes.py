@@ -68,6 +68,15 @@ DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
+#: The defaults, as named constants rather than as reads of the dataclass fields.
+#: A `slots=True` dataclass has no class-level attribute to read, and a constant that
+#: cannot be read is a constant nobody reuses.
+DEFAULT_BACKOFF_INITIAL = 0.25
+DEFAULT_BACKOFF_MAXIMUM = 2.0
+DEFAULT_MAX_ATTEMPTS = 1
+DEFAULT_TIMEOUT_SECONDS = 30.0
+
+
 @dataclass(frozen=True, slots=True)
 class BackoffPolicy:
     """Exponential backoff between retries of one candidate.
@@ -161,6 +170,18 @@ class Route:
             raise ValueError("a route must have a model name")
         if not self.candidates:
             raise ValueError(f"route {self.model!r} has no candidates")
+        # Resolved here rather than at read time. A `Route` holding a candidate whose
+        # model is `None` is a footgun: every consumer has to remember to resolve it,
+        # and the one that forgets sends `None` to a provider as a model name. One
+        # representation means there is nothing to forget.
+        object.__setattr__(
+            self,
+            "candidates",
+            tuple(
+                candidate if candidate.model else replace(candidate, model=self.model)
+                for candidate in self.candidates
+            ),
+        )
 
     @property
     def has_fallback(self) -> bool:
@@ -171,13 +192,6 @@ class Route:
         syntax, and the description should say so.
         """
         return len(self.candidates) > 1
-
-    def candidates_for(self) -> tuple[Candidate, ...]:
-        """The candidates with each one's model resolved against this route."""
-        return tuple(
-            candidate if candidate.model else replace(candidate, model=self.model)
-            for candidate in self.candidates
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,8 +264,7 @@ def routes_from_yaml(text: str) -> RouteTable:
     version = _require(document, "version", "the top level")
     if version != SUPPORTED_VERSION:
         raise RouteConfigError(
-            f"unsupported routes version {version!r}; this build reads version "
-            f"{SUPPORTED_VERSION}"
+            f"unsupported routes version {version!r}; this build reads version {SUPPORTED_VERSION}"
         )
     if "routes" not in document:
         raise RouteConfigError("the routes file has no `routes` key")
@@ -283,14 +296,63 @@ def _parse(text: str) -> dict[str, Any]:
 
 def _read_defaults(block: Any) -> tuple[RetryPolicy, TimeoutPolicy]:
     _check_keys(block, _DEFAULT_KEYS, "`defaults`")
-    backoff = BackoffPolicy(
-        initial=_number(block, "backoff_initial_seconds", DEFAULT_BACKOFF_INITIAL),
-        maximum=_number(block, "backoff_max_seconds", DEFAULT_BACKOFF_MAXIMUM),
-    )
     return (
-        _policy(RetryPolicy, block, "max_attempts", backoff=backoff),
-        TimeoutPolicy(seconds=_number(block, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+        RetryPolicy(
+            max_attempts=_attempts(block, DEFAULT_MAX_ATTEMPTS),
+            backoff=_backoff_from(block, None),
+        ),
+        _timeout(block),
     )
+
+
+def _backoff_from(block: dict[str, Any], inherited: BackoffPolicy | None) -> BackoffPolicy:
+    """The backoff for this block: the file default, overridden field by field.
+
+    The cross-field check lives here rather than catching the dataclass's
+    `ValueError`, because only this layer knows which *key* was wrong. The dataclass
+    says "maximum is below initial"; the operator needs to be told which line of the
+    file to edit.
+    """
+    initial = _number(
+        block,
+        "backoff_initial_seconds",
+        inherited.initial if inherited else DEFAULT_BACKOFF_INITIAL,
+    )
+    maximum = _number(
+        block,
+        "backoff_max_seconds",
+        inherited.maximum if inherited else DEFAULT_BACKOFF_MAXIMUM,
+    )
+    if maximum < initial:
+        raise RouteConfigError(
+            f"`backoff_max_seconds` ({maximum}) is below `backoff_initial_seconds` "
+            f"({initial}); the first retry would wait longer than the ceiling allows"
+        )
+    return BackoffPolicy(initial=initial, maximum=maximum)
+
+
+def _timeout(block: dict[str, Any], fallback: float = DEFAULT_TIMEOUT_SECONDS) -> TimeoutPolicy:
+    # `_number` has already refused a non-positive value, so the dataclass's own
+    # check cannot fire here. No second check: an unreachable branch is one more
+    # thing to keep true, and a coverage report pointing at it is noise.
+    return TimeoutPolicy(seconds=_number(block, "timeout_seconds", fallback))
+
+
+def _attempts(block: dict[str, Any], inherited: int) -> int:
+    """`max_attempts` for this block, falling back to the inherited value.
+
+    The fallback is an int the caller supplies rather than a dataclass default, so a
+    route inheriting `max_attempts: 3` from `defaults` must get 3, not the
+    dataclass's 1.
+    """
+    value = block.get("max_attempts")
+    if value is None:
+        return inherited
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RouteConfigError(f"`max_attempts` must be a whole number, got {value!r}")
+    if value < 1:
+        raise RouteConfigError(f"`max_attempts` must be at least 1, got {value}")
+    return value
 
 
 def _read_routes(
@@ -299,7 +361,7 @@ def _read_routes(
     if not isinstance(entries, list):
         raise RouteConfigError(f"`routes` must be a list, got {type(entries).__name__}")
     if not entries:
-        raise RouteConfigError("the routes file declares no routes; every request would 404")
+        raise RouteConfigError("the routes file must declare at least one route")
     routes = tuple(_read_route(entry, defaults, default_timeout) for entry in entries)
     seen: set[str] = set()
     for route in routes:
@@ -325,13 +387,11 @@ def _read_route(entry: Any, defaults: RetryPolicy, default_timeout: TimeoutPolic
         model=model,
         candidates=_read_candidates(entry.get("candidates"), model),
         description=entry.get("description", ""),
-        retry=_policy(RetryPolicy, entry, "max_attempts", backoff=BackoffPolicy(
-            initial=_number(entry, "backoff_initial_seconds", defaults.backoff.initial),
-            maximum=_number(entry, "backoff_max_seconds", defaults.backoff.maximum),
-        )),
-        timeout=TimeoutPolicy(
-            seconds=_number(entry, "timeout_seconds", default_timeout.seconds)
+        retry=RetryPolicy(
+            max_attempts=_attempts(entry, defaults.max_attempts),
+            backoff=_backoff_from(entry, defaults.backoff),
         ),
+        timeout=_timeout(entry, default_timeout.seconds),
     )
 
 
@@ -348,8 +408,7 @@ def _read_candidates(entries: Any, model: str) -> tuple[Candidate, ...]:
 def _read_candidate(entry: Any, route_model: str) -> Candidate:
     if not isinstance(entry, dict):
         raise RouteConfigError(
-            f"route {route_model!r}: each candidate must be a mapping, "
-            f"got {type(entry).__name__}"
+            f"route {route_model!r}: each candidate must be a mapping, got {type(entry).__name__}"
         )
     _check_keys(entry, _CANDIDATE_KEYS, f"a candidate of route {route_model!r}")
     provider = entry.get("provider")
@@ -362,16 +421,6 @@ def _read_candidate(entry: Any, route_model: str) -> Candidate:
     # — a weight that is parsed and not honoured is a promise the file makes that
     # the router does not keep.
     return Candidate(provider=provider, model=entry.get("model"))
-
-
-def _policy(factory: type, block: dict[str, Any], key: str, **fixed: Any) -> Any:
-    """Build a policy dataclass, defaulting the keys this block omits."""
-    value = block.get(key)
-    if value is None:
-        return factory(**fixed)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise RouteConfigError(f"`{key}` must be a whole number, got {value!r}")
-    return factory(value, **fixed)
 
 
 def _number(block: dict[str, Any], key: str, fallback: float) -> float:
@@ -394,8 +443,7 @@ def _check_keys(block: Any, allowed: frozenset[str], where: str) -> None:
         # setting that looks configured and is not, which is worse than a boot
         # failure because nothing reports it.
         raise RouteConfigError(
-            f"unknown key in {where}: {', '.join(unknown)}; allowed: "
-            f"{', '.join(sorted(allowed))}"
+            f"unknown key in {where}: {', '.join(unknown)}; allowed: {', '.join(sorted(allowed))}"
         )
 
 

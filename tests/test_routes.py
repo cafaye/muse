@@ -14,7 +14,6 @@ is run through it in the suite so the file that ships is the file that was teste
 
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -275,7 +274,9 @@ def test_a_candidate_with_no_provider_is_rejected() -> None:
 def test_a_blank_model_name_is_rejected() -> None:
     with pytest.raises(RouteConfigError, match="model"):
         routes_from_yaml(
-            yaml.safe_dump({"version": 1, "routes": [{"model": "  ", "candidates": [{"provider": "o"}]}]})
+            yaml.safe_dump(
+                {"version": 1, "routes": [{"model": "  ", "candidates": [{"provider": "o"}]}]}
+            )
         )
 
 
@@ -353,9 +354,7 @@ def test_an_unknown_candidate_key_is_rejected() -> None:
             yaml.safe_dump(
                 {
                     "version": 1,
-                    "routes": [
-                        {"model": "f", "candidates": [{"porvider": "openai"}]}
-                    ],
+                    "routes": [{"model": "f", "candidates": [{"porvider": "openai"}]}],
                 }
             )
         )
@@ -394,7 +393,9 @@ def test_validation_passes_when_every_provider_is_registered() -> None:
             ],
         }
     )
-    table.validate(ProviderRegistry().register(FakeProvider("openai")).register(FakeProvider("anthropic")))
+    table.validate(
+        ProviderRegistry().register(FakeProvider("openai")).register(FakeProvider("anthropic"))
+    )
 
 
 def test_validation_rejects_an_unregistered_provider() -> None:
@@ -476,6 +477,200 @@ def test_a_route_built_directly_with_an_explicit_model_keeps_it() -> None:
     )
 
 
-def test_an_empty_yaml_body_is_reported_with_its_own_message() -> None:
-    with pytest.raises(RouteConfigError, match="empty"):
-        routes_from_yaml(textwrap.dedent("   \n\n  ").strip() + "\n")
+def test_an_empty_yaml_body_counts_as_empty() -> None:
+    """A file of newlines is what a heredoc with a stripped body produces, and it is
+    the same failure as a zero-byte one — reported the same way, so there is one
+    message to recognise."""
+    with pytest.raises(RouteConfigError, match="is empty"):
+        routes_from_yaml("   \n\n\t\n")
+
+
+# --- the shapes the loader refuses -----------------------------------------
+
+
+def test_a_defaults_block_that_is_not_a_mapping_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="`defaults` must be a mapping"):
+        load(minimal(defaults=["max_attempts"]))
+
+
+def test_a_routes_key_that_is_not_a_list_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="`routes` must be a list"):
+        routes_from_yaml(yaml.safe_dump({"version": 1, "routes": {"fast": []}}))
+
+
+def test_a_route_that_is_not_a_mapping_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="each route must be a mapping"):
+        routes_from_yaml(yaml.safe_dump({"version": 1, "routes": ["fast"]}))
+
+
+def test_a_candidate_that_is_not_a_mapping_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="each candidate must be a mapping"):
+        load({"version": 1, "routes": [{"model": "f", "candidates": ["openai"]}]})
+
+
+def test_a_candidates_key_that_is_not_a_list_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="`candidates` must be a list"):
+        routes_from_yaml(
+            yaml.safe_dump({"version": 1, "routes": [{"model": "fast", "candidates": {}}]})
+        )
+
+
+def test_a_document_with_no_routes_key_is_rejected() -> None:
+    """Distinct from `routes: []`. A missing key means a file written against a
+    different shape; an empty list is a deliberate file with nothing in it. They need
+    different fixes, so they get different messages."""
+    with pytest.raises(RouteConfigError, match="no `routes` key"):
+        routes_from_yaml(yaml.safe_dump({"version": 1}))
+
+
+# --- numbers the loader refuses to coerce ----------------------------------
+
+
+def test_a_non_numeric_max_attempts_is_rejected() -> None:
+    """`"3"` as a string is what a template produces. Coercing it would work; refusing
+    it makes the mistake visible in the file rather than at 3am."""
+    with pytest.raises(RouteConfigError, match="whole number"):
+        load(minimal(defaults={"max_attempts": "3"}))
+
+
+def test_a_boolean_max_attempts_is_rejected() -> None:
+    """`true` is an int in Python. Left unchecked, `max_attempts: true` would silently
+    mean one attempt — the same as the default, and nothing like what the file says."""
+    with pytest.raises(RouteConfigError, match="whole number"):
+        load(minimal(defaults={"max_attempts": True}))
+
+
+def test_a_non_numeric_timeout_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="must be a number"):
+        load(minimal(defaults={"timeout_seconds": "30s"}))
+
+
+def test_a_boolean_timeout_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="must be a number"):
+        load(minimal(defaults={"timeout_seconds": True}))
+
+
+def test_a_non_numeric_backoff_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="must be a number"):
+        load(minimal(defaults={"backoff_initial_seconds": "fast"}))
+
+
+def test_a_zero_backoff_is_rejected() -> None:
+    """Zero would be a hot loop against a provider that is already overloaded, which
+    is the opposite of what a backoff is for."""
+    with pytest.raises(RouteConfigError, match="must be positive"):
+        load(minimal(defaults={"backoff_initial_seconds": 0}))
+
+
+def test_a_negative_timeout_on_a_route_is_rejected() -> None:
+    with pytest.raises(RouteConfigError, match="must be positive"):
+        load(
+            {
+                "version": 1,
+                "routes": [
+                    {
+                        "model": "f",
+                        "candidates": [{"provider": "openai"}],
+                        "timeout_seconds": -1.0,
+                    }
+                ],
+            }
+        )
+
+
+# --- kept fields -----------------------------------------------------------
+
+
+def test_a_route_description_is_kept() -> None:
+    """Kept because it is what a human reads in a diff, and dropped descriptions are
+    how a routing table becomes a list of unexplained vendor pairs."""
+    route = load(
+        {
+            "version": 1,
+            "routes": [
+                {
+                    "model": "f",
+                    "description": "cheap and small",
+                    "candidates": [{"provider": "openai"}],
+                }
+            ],
+        }
+    ).routes[0]
+    assert route.description == "cheap and small"
+
+
+def test_a_route_without_a_description_has_an_empty_one() -> None:
+    """Optional. Requiring prose in a config file is how config files stop being read.
+    The committed file writes one for every route; nothing forces it."""
+    assert load(minimal()).routes[0].description == ""
+
+
+def test_a_table_lists_the_providers_it_names() -> None:
+    """What `validate` iterates, and what a boot error lists."""
+    table = load(
+        {
+            "version": 1,
+            "routes": [
+                {
+                    "model": "f",
+                    "candidates": [{"provider": "openai"}, {"provider": "anthropic"}],
+                },
+                {"model": "g", "candidates": [{"provider": "openai"}]},
+            ],
+        }
+    )
+    assert table.providers() == ("anthropic", "openai")
+
+
+def test_a_table_keeps_its_default_timeout() -> None:
+    """The file-level default, kept on the table so a caller can read the whole policy
+    without walking every route."""
+    assert load(minimal(defaults={"timeout_seconds": 12.0})).timeout == TimeoutPolicy(seconds=12.0)
+
+
+# --- the policies validate themselves ---------------------------------------
+
+
+def test_a_negative_backoff_is_refused_by_the_policy_itself() -> None:
+    """The dataclass validates independently of the loader, so a route built in code
+    — by a later packet — is held to the same rule as one read from a file."""
+    with pytest.raises(ValueError, match="must not be negative"):
+        BackoffPolicy(initial=-1.0)
+
+
+def test_a_backoff_ceiling_below_the_initial_delay_is_refused_by_the_policy() -> None:
+    with pytest.raises(ValueError, match="below the initial delay"):
+        BackoffPolicy(initial=5.0, maximum=1.0)
+
+
+def test_a_zero_max_attempts_is_refused_by_the_policy() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        RetryPolicy(max_attempts=0)
+
+
+def test_a_zero_timeout_is_refused_by_the_policy() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        TimeoutPolicy(seconds=0)
+
+
+def test_a_candidate_without_a_provider_is_refused_by_the_dataclass() -> None:
+    with pytest.raises(ValueError, match="must name a provider"):
+        Candidate(provider="")
+
+
+def test_a_route_without_a_model_is_refused_by_the_dataclass() -> None:
+    with pytest.raises(ValueError, match="model name"):
+        Route(model="  ", candidates=(Candidate("openai"),))
+
+
+def test_a_route_without_candidates_is_refused_by_the_dataclass() -> None:
+    with pytest.raises(ValueError, match="no candidates"):
+        Route(model="fast", candidates=())
+
+
+def test_a_route_resolves_its_candidates_models_at_construction() -> None:
+    """One representation, so there is nothing for a consumer to forget to resolve. A
+    `Route` holding `model=None` is a footgun for the one caller that forgets, and
+    that caller sends `None` to a provider as a model name."""
+    route = Route("smart", (Candidate("anthropic"), Candidate("openai", "gpt-4o")))
+    assert [candidate.model for candidate in route.candidates] == ["smart", "gpt-4o"]

@@ -43,16 +43,16 @@ from muse.errors import (
 from muse.providers import Completion, Price, ProviderRegistry, UnregisteredProvider
 from muse.providers.fake import FakeProvider, ScriptedProvider
 from muse.redaction import Secret
+from muse.router import Router
 from muse.routes import (
     BackoffPolicy,
     Candidate,
+    RetryPolicy,
     Route,
     RouteTable,
-    RetryPolicy,
     TimeoutPolicy,
     routes_from_yaml,
 )
-from muse.router import RoutedCompletion, Router
 
 from .conftest import ROUTES_YAML, write_routes
 
@@ -63,6 +63,10 @@ FALLBACK = "fallback"
 #: Both doubles price at the same rate, so a metered cost in a routing test is the
 #: one the test computed rather than one that moved with the model.
 PRICE = Price(1000, 2000)
+#: A price table holding an entry for a *different* model, so a provider is
+#: unpriced for the model under test without the double needing a "price nothing"
+#: mode. An empty dict would read as "no table given", which means the opposite.
+UNPRICED = {"some-other-model": Price(1, 1)}
 
 
 def registry_with(*providers) -> ProviderRegistry:
@@ -74,7 +78,12 @@ def registry_with(*providers) -> ProviderRegistry:
 
 
 def table(*candidates: Candidate, model: str = "fast", **policy) -> RouteTable:
-    """A one-route table, so a routing test states candidates and nothing else."""
+    """A one-route table, so a routing test states candidates and nothing else.
+
+    `policy` is the `Route`'s own fields (retry, timeout, description). The router's
+    knobs — `sleep` — go to `Router` directly, so a routing test never has to know
+    which constructor a given knob belongs to.
+    """
     return RouteTable(
         version=1,
         defaults=RetryPolicy(),
@@ -118,7 +127,9 @@ def recording_sleep() -> tuple[list[float], object]:
 async def test_the_primary_serves_the_request_when_it_succeeds() -> None:
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, completions=(completion(),))
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     result = await router.route("fast", (("user", "hello"),))
 
@@ -134,7 +145,9 @@ async def test_a_failing_primary_advances_to_the_fallback() -> None:
     fallback = ScriptedProvider(
         name=FALLBACK, price=PRICE, completions=(completion(FALLBACK, "from the fallback"),)
     )
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     result = await router.route("fast", (("user", "hello"),))
 
@@ -146,10 +159,10 @@ async def test_a_failing_primary_advances_to_the_fallback() -> None:
 
 async def test_every_candidate_failing_raises_a_typed_error() -> None:
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("slow"),))
-    fallback = ScriptedProvider(
-        name=FALLBACK, price=PRICE, errors=(ProviderAuthError("bad key"),)
+    fallback = ScriptedProvider(name=FALLBACK, price=PRICE, errors=(ProviderAuthError("bad key"),))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
     )
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
 
     with pytest.raises(AllCandidatesFailed) as excinfo:
         await router.route("fast", (("user", "hello"),))
@@ -203,6 +216,40 @@ async def test_the_failure_chain_never_carries_a_credential() -> None:
     assert redact(str(excinfo.value), Secret("sk-live-SECRET")) == str(excinfo.value)
 
 
+async def test_the_failure_detail_survives_untouched_when_no_credential_is_held() -> None:
+    """The no-secrets path. The provider's own text is the most useful thing in the
+    detail, so nothing is lost when there is nothing to scrub — and this is the
+    common case for a route whose provider takes no key.
+    """
+    primary = ScriptedProvider(
+        name=PRIMARY, price=PRICE, errors=(ProviderTimeout("gateway timeout after 30s"),)
+    )
+    router = Router(registry_with(primary), table(Candidate(PRIMARY)))
+
+    with pytest.raises(AllCandidatesFailed) as excinfo:
+        await router.route("fast", (("user", "hello"),))
+
+    assert excinfo.value.failures[0].detail == "gateway timeout after 30s"
+
+
+async def test_several_credentials_are_all_scrubbed_from_one_detail() -> None:
+    """A route with two vendors holds two keys, and a provider message could contain
+    either. Scrubbing only the first would leave the second in a log line."""
+    primary = ScriptedProvider(
+        name=PRIMARY,
+        price=PRICE,
+        errors=(ProviderAuthError("tried sk-one then sk-two"),),
+    )
+    router = Router(registry_with(primary), table(Candidate(PRIMARY)))
+
+    with pytest.raises(AllCandidatesFailed) as excinfo:
+        await router.route("fast", (("user", "hello"),), secrets=("sk-one", Secret("sk-two")))
+
+    detail = excinfo.value.failures[0].detail
+    assert "sk-one" not in detail
+    assert "sk-two" not in detail
+
+
 # --- candidate ordering ----------------------------------------------------
 
 
@@ -211,7 +258,9 @@ async def test_candidates_are_tried_in_the_order_the_route_lists_them() -> None:
     first even when a later one would work."""
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, completions=(completion(),))
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     await router.route("fast", (("user", "hello"),))
 
@@ -240,7 +289,9 @@ async def test_a_second_failure_does_not_retry_the_first_candidate() -> None:
     after the fallback failed is a retry policy stated in two places."""
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderUnavailable("down"),))
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, errors=(ProviderUnavailable("down"),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     with pytest.raises(AllCandidatesFailed):
         await router.route("fast", (("user", "hello"),))
@@ -298,7 +349,9 @@ async def test_a_permanent_failure_is_not_retried() -> None:
 async def test_every_transient_error_is_retried(error: ProviderError) -> None:
     """All three of the transient classes, explicitly. A test that only covered
     timeouts would let a rate limit start failing requests instead of retrying."""
-    primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(error,), completions=(completion(),))
+    primary = ScriptedProvider(
+        name=PRIMARY, price=PRICE, errors=(error,), completions=(completion(),)
+    )
     router = Router(
         registry_with(primary), table(Candidate(PRIMARY), retry=RetryPolicy(max_attempts=2))
     )
@@ -312,7 +365,9 @@ async def test_the_backoff_grows_exponentially() -> None:
     linear or flat backoff would pass a test that only counted attempts, and a flat
     backoff against a provider that is already overloaded is a hot loop."""
     primary = ScriptedProvider(
-        name=PRIMARY, price=PRICE, errors=(ProviderTimeout("1"), ProviderTimeout("2"), ProviderTimeout("3"))
+        name=PRIMARY,
+        price=PRICE,
+        errors=(ProviderTimeout("1"), ProviderTimeout("2"), ProviderTimeout("3")),
     )
     waited, sleep = recording_sleep()
     router = Router(
@@ -320,8 +375,8 @@ async def test_the_backoff_grows_exponentially() -> None:
         table(
             Candidate(PRIMARY),
             retry=RetryPolicy(max_attempts=3, backoff=BackoffPolicy(initial=0.25, maximum=2.0)),
-            sleep=sleep,
         ),
+        sleep=sleep,
     )
 
     with pytest.raises(AllCandidatesFailed):
@@ -333,19 +388,15 @@ async def test_the_backoff_grows_exponentially() -> None:
 async def test_the_backoff_respects_its_ceiling() -> None:
     """Unbounded exponential backoff against a provider that is down for minutes is
     a request that hangs. The ceiling is what bounds it."""
-    primary = ScriptedProvider(
-        name=PRIMARY, price=PRICE, errors=(ProviderTimeout("nope"),) * 6
-    )
+    primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("nope"),) * 6)
     waited, sleep = recording_sleep()
     router = Router(
         registry_with(primary),
         table(
             Candidate(PRIMARY),
-            retry=RetryPolicy(
-                max_attempts=6, backoff=BackoffPolicy(initial=1.0, maximum=4.0)
-            ),
-            sleep=sleep,
+            retry=RetryPolicy(max_attempts=6, backoff=BackoffPolicy(initial=1.0, maximum=4.0)),
         ),
+        sleep=sleep,
     )
 
     with pytest.raises(AllCandidatesFailed):
@@ -360,7 +411,7 @@ async def test_a_single_attempt_never_sleeps() -> None:
     adding backoff to every failure."""
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("slow"),))
     waited, sleep = recording_sleep()
-    router = Router(registry_with(primary), table(Candidate(PRIMARY), sleep=sleep))
+    router = Router(registry_with(primary), table(Candidate(PRIMARY)), sleep=sleep)
 
     with pytest.raises(AllCandidatesFailed):
         await router.route("fast", (("user", "hello"),))
@@ -374,7 +425,8 @@ async def test_a_successful_candidate_sleeps_nothing() -> None:
     waited, sleep = recording_sleep()
     router = Router(
         registry_with(primary),
-        table(Candidate(PRIMARY), retry=RetryPolicy(max_attempts=3), sleep=sleep),
+        table(Candidate(PRIMARY), retry=RetryPolicy(max_attempts=3)),
+        sleep=sleep,
     )
 
     await router.route("fast", (("user", "hello"),))
@@ -389,9 +441,11 @@ async def test_an_unpriced_primary_is_skipped_without_being_called() -> None:
     """The check that makes unmetered spend impossible. `PriceUnavailable` is raised
     before `complete`, so the provider sees zero requests and the fallback serves
     the call."""
-    primary = ScriptedProvider(name=PRIMARY, prices={})
+    primary = ScriptedProvider(name=PRIMARY, prices=UNPRICED)
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     result = await router.route("fast", (("user", "hello"),))
 
@@ -402,7 +456,7 @@ async def test_an_unpriced_primary_is_skipped_without_being_called() -> None:
 async def test_an_unpriced_model_reaches_the_failure_chain_rather_than_a_zero_price() -> None:
     """`PriceUnavailable`, not a zero cost. A zero would flow into the metered event
     and make the call free, silently, for the whole history of the model."""
-    primary = ScriptedProvider(name=PRIMARY, prices={})
+    primary = ScriptedProvider(name=PRIMARY, prices=UNPRICED)
     router = Router(registry_with(primary), table(Candidate(PRIMARY)))
 
     with pytest.raises(AllCandidatesFailed) as excinfo:
@@ -414,9 +468,11 @@ async def test_an_unpriced_model_reaches_the_failure_chain_rather_than_a_zero_pr
 async def test_every_candidate_unpriced_fails_rather_than_serving_a_free_completion() -> None:
     """No candidate may serve a completion muse cannot price. The alternative is a
     `ZeroDivisionError`-shaped hole in the billing path."""
-    primary = ScriptedProvider(name=PRIMARY, prices={})
-    fallback = ScriptedProvider(name=FALLBACK, prices={})
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    primary = ScriptedProvider(name=PRIMARY, prices=UNPRICED)
+    fallback = ScriptedProvider(name=FALLBACK, prices=UNPRICED)
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     with pytest.raises(AllCandidatesFailed) as excinfo:
         await router.route("fast", (("user", "hello"),))
@@ -458,16 +514,39 @@ async def test_an_unregistered_provider_is_a_configuration_error() -> None:
 # --- the result ------------------------------------------------------------
 
 
-async def test_the_result_reports_the_route_that_served_it() -> None:
-    """Not just the vendor: the route is what a caller's own configuration refers
-    to, and it is the field that stays meaningful when a fallback changes vendor."""
-    primary = ScriptedProvider(name=PRIMARY, price=PRICE, completions=(completion(),))
+async def test_the_result_reports_the_route_and_the_vendor_model_separately() -> None:
+    """Two fields, not one. `route` is what a caller configured and must stay
+    meaningful when a fallback changes vendor; `model` is the vendor's own model id,
+    which is what an operator needs to find the call in a provider's dashboard.
+
+    The route is `smart` and the candidate serves `claude-sonnet-4-5`, so the two
+    genuinely differ here — a single field could not satisfy both readers.
+    """
+    primary = ScriptedProvider(
+        name=PRIMARY, price=PRICE, completions=(completion(model="claude-sonnet-4-5"),)
+    )
+    router = Router(
+        registry_with(primary),
+        table(Candidate(PRIMARY, model="claude-sonnet-4-5"), model="smart"),
+    )
+
+    result = await router.route("smart", (("user", "hello"),))
+
+    assert result.route == "smart"
+    assert result.model == "claude-sonnet-4-5"
+    assert result.completion.provider == PRIMARY
+
+
+async def test_a_candidate_inheriting_the_route_model_reports_it_as_both() -> None:
+    """The common case, where the two names agree — asserted so the field is not
+    quietly empty on a route that does not override its candidates' models."""
+    primary = ScriptedProvider(name=PRIMARY, price=PRICE, completions=(completion(model="fast"),))
     router = Router(registry_with(primary), table(Candidate(PRIMARY), model="fast"))
 
     result = await router.route("fast", (("user", "hello"),))
 
     assert result.route == "fast"
-    assert result.model == "some-model"
+    assert result.model == "fast"
 
 
 async def test_the_result_counts_the_candidates_it_tried() -> None:
@@ -475,7 +554,9 @@ async def test_the_result_counts_the_candidates_it_tried() -> None:
     fallback that has started firing constantly would show."""
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("slow"),))
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     assert (await router.route("fast", (("user", "hello"),))).candidates_tried == 2
 
@@ -582,7 +663,9 @@ async def test_a_malformed_response_falls_through_to_the_next_candidate() -> Non
         name=PRIMARY, price=PRICE, errors=(ResponseShapeError("no choices"),)
     )
     fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(),))
-    router = Router(registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK)))
+    router = Router(
+        registry_with(primary, fallback), table(Candidate(PRIMARY), Candidate(FALLBACK))
+    )
 
     assert (await router.route("fast", (("user", "hello"),))).completion.provider == FALLBACK
     assert primary.calls == 1
@@ -658,9 +741,7 @@ def test_a_candidate_without_a_model_inherits_the_routes_model() -> None:
         write_routes(
             {
                 "version": 1,
-                "routes": [
-                    {"model": "gpt-4o-mini", "candidates": [{"provider": "openai"}]}
-                ],
+                "routes": [{"model": "gpt-4o-mini", "candidates": [{"provider": "openai"}]}],
             }
         )
     )
@@ -670,7 +751,11 @@ def test_a_candidate_without_a_model_inherits_the_routes_model() -> None:
 def test_a_route_inherits_the_default_retry_policy() -> None:
     table = routes_from_yaml(
         write_routes(
-            {"version": 1, "defaults": {"max_attempts": 4}, "routes": [{"model": "f", "candidates": [{"provider": "openai"}]}]}
+            {
+                "version": 1,
+                "defaults": {"max_attempts": 4},
+                "routes": [{"model": "f", "candidates": [{"provider": "openai"}]}],
+            }
         )
     )
     assert table.routes[0].retry.max_attempts == 4
@@ -721,7 +806,9 @@ def test_defaults_are_used_when_no_defaults_block_exists() -> None:
     """A minimal file with no `defaults` still loads, with the conservative
     defaults: one attempt, no retry."""
     table = routes_from_yaml(
-        write_routes({"version": 1, "routes": [{"model": "f", "candidates": [{"provider": "openai"}]}]})
+        write_routes(
+            {"version": 1, "routes": [{"model": "f", "candidates": [{"provider": "openai"}]}]}
+        )
     )
     assert table.routes[0].retry.max_attempts == 1
     assert table.defaults.max_attempts == 1
@@ -748,9 +835,7 @@ async def test_a_router_built_from_yaml_routes_end_to_end() -> None:
         )
     )
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("slow"),))
-    fallback = ScriptedProvider(
-        name=FALLBACK, price=PRICE, completions=(completion(FALLBACK),)
-    )
+    fallback = ScriptedProvider(name=FALLBACK, price=PRICE, completions=(completion(FALLBACK),))
     router = Router(registry_with(primary, fallback), table)
 
     result = await router.route("fast", (("user", "hello"),))
@@ -765,9 +850,9 @@ async def test_a_router_built_from_yaml_routes_end_to_end() -> None:
 def test_the_default_sleep_is_a_real_sleep() -> None:
     """The production path. A router constructed without an injected sleep must
     actually wait, or the backoff policy is decoration in production only."""
-    from muse.router import _asyncio_sleep
-
     import inspect
+
+    from muse.router import _asyncio_sleep
 
     assert inspect.iscoroutinefunction(_asyncio_sleep)
 
@@ -778,3 +863,16 @@ def test_a_router_reports_its_route_table() -> None:
     routes = table(Candidate(PRIMARY))
     router = Router(ProviderRegistry(), routes)
     assert router.routes is routes
+
+
+def test_a_router_repr_names_its_routes() -> None:
+    """A `repr` that does not say what a router is configured with is a `repr` that
+    costs a debugger a step. The route names are the whole of its configuration."""
+    routes = table(Candidate(PRIMARY), model="fast")
+    assert "fast" in repr(Router(ProviderRegistry(), routes))
+
+
+def test_a_router_with_no_routes_reprs_as_empty() -> None:
+    assert "[]" in repr(
+        Router(ProviderRegistry(), RouteTable(version=1, defaults=RetryPolicy(), routes=()))
+    )

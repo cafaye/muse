@@ -54,8 +54,6 @@ from muse.providers import (
     Completion,
     CompletionRequest,
     Message,
-    Price,
-    Provider,
     ProviderRegistry,
 )
 from muse.redaction import Secret, redact
@@ -179,16 +177,20 @@ class Router:
         # The messages are validated here, before the candidate loop, so a bad role
         # is a typed ValueError the endpoint turns into a 422 rather than a
         # provider's differently-worded 400 after a paid call.
-        validated = tuple(
-            Message(role=role, content=content) for role, content in messages
-        )
+        validated = tuple(Message(role=role, content=content) for role, content in messages)
 
         failures: list[CandidateFailure] = []
         attempts = 0
-        for candidate in route.candidates_for():
+        # `route.candidates` is already resolved: a `Route` holds each candidate's
+        # vendor model, defaulted to the route's own at construction.
+        for candidate in route.candidates:
             outcome = await self._attempt(
-                candidate=candidate, route=route, messages=validated,
-                max_tokens=max_tokens, temperature=temperature, secrets=secrets,
+                candidate=candidate,
+                route=route,
+                messages=validated,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                secrets=secrets,
             )
             attempts += outcome.calls
             if outcome.completion is not None:
@@ -199,8 +201,13 @@ class Router:
                     candidates_tried=len(failures) + 1,
                     attempts=attempts,
                 )
-            if outcome.failure is not None:
-                failures.append(outcome.failure)
+            # An outcome always carries exactly one of the two, so `failure` is not
+            # None here. Asserted rather than guarded: `_attempt` builds both
+            # branches itself, and a `None` would mean a new return path was added
+            # without this loop being told — which would silently drop a failure from
+            # the chain and make a fallback look like a single-candidate route.
+            assert outcome.failure is not None, "an attempt produced neither a result nor a failure"
+            failures.append(outcome.failure)
         raise AllCandidatesFailed(route.model, tuple(failures))
 
     async def _attempt(
@@ -298,5 +305,12 @@ class Router:
 
 
 def _scrub(detail: str, secrets: Sequence[Secret | str]) -> str:
-    """Remove known credentials from a provider-supplied detail string."""
-    return redact(detail, *secrets) if secrets else detail
+    """Remove known credentials from a provider-supplied detail string.
+
+    The empty case returns the text unchanged rather than calling `redact` with
+    nothing, so a request that holds no credentials does not pay for a copy of every
+    provider message it produces.
+    """
+    if not secrets:
+        return detail
+    return redact(detail, *secrets)
