@@ -62,6 +62,7 @@ def make_stub(
     raises: str | None = None,
     error_message: str = "",
     model_info: dict[str, dict[str, Any]] | None = None,
+    status_code: int | None = None,
 ) -> types.ModuleType:
     """Build the stub.
 
@@ -74,6 +75,10 @@ def make_stub(
     `response=None` is honoured as a null response rather than replaced by the
     default, which is what a test asserting the shape check needs.
 
+    `status_code` is attached to the raised exception, because that is where the
+    real litellm puts it and the adapter's 408 handling reads it. A test that raised
+    a 408 without a status would exercise the deadline branch instead.
+
     `model_info` overrides the price table, and a model missing from it raises
     `KeyError` — what the real `get_model_info` does, and what `PriceUnavailable`
     exists to translate.
@@ -81,14 +86,21 @@ def make_stub(
     module = types.ModuleType("litellm_stub")
     captured: dict[str, Any] = {}
     module.captured = captured  # type: ignore[attr-defined]
+    #: How many times `acompletion` was entered. The counter a "no request was
+    #: issued" assertion needs, and the last statement before a socket would exist.
+    module.acompletion_calls = 0  # type: ignore[attr-defined]
 
     for name in LITELLM_ERROR_NAMES:
         module.__dict__[name] = type(name, (Exception,), {})
 
     async def acompletion(**kwargs: Any) -> Any:
+        module.acompletion_calls += 1  # type: ignore[attr-defined]
         captured.update(kwargs)
         if raises is not None:
-            raise module.__dict__[raises](error_message)
+            error = module.__dict__[raises](error_message)
+            if status_code is not None:
+                error.status_code = status_code
+            raise error
         return RESPONSE if response is DEFAULT else response
 
     def get_model_info(model: str) -> dict[str, Any]:

@@ -361,9 +361,15 @@ async def test_every_transient_error_is_retried(error: ProviderError) -> None:
 
 
 async def test_the_backoff_grows_exponentially() -> None:
-    """`wait_exponential` from tenacity, asserted on the durations it asked for. A
+    """The schedule the policy asked for, asserted on the durations it produced. A
     linear or flat backoff would pass a test that only counted attempts, and a flat
-    backoff against a provider that is already overloaded is a hot loop."""
+    backoff against a provider that is already overloaded is a hot loop.
+
+    `jitter=0.0` is deliberate: this test is about the *shape* of the curve, so the
+    randomisation is switched off to make the numbers exact. Jitter is asserted
+    separately, window for window, in `tests/test_retry_budget.py` — and the default
+    is on, so a policy that ignored it would fail there.
+    """
     primary = ScriptedProvider(
         name=PRIMARY,
         price=PRICE,
@@ -374,7 +380,11 @@ async def test_the_backoff_grows_exponentially() -> None:
         registry_with(primary),
         table(
             Candidate(PRIMARY),
-            retry=RetryPolicy(max_attempts=3, backoff=BackoffPolicy(initial=0.25, maximum=2.0)),
+            retry=RetryPolicy(
+                max_attempts=3,
+                backoff=BackoffPolicy(initial=0.25, maximum=2.0, jitter=0.0),
+                budget_seconds=600.0,
+            ),
         ),
         sleep=sleep,
     )
@@ -387,14 +397,23 @@ async def test_the_backoff_grows_exponentially() -> None:
 
 async def test_the_backoff_respects_its_ceiling() -> None:
     """Unbounded exponential backoff against a provider that is down for minutes is
-    a request that hangs. The ceiling is what bounds it."""
+    a request that hangs. The ceiling is what bounds it.
+
+    `jitter=0.0` and an explicit budget, for the same reason as the test above: this
+    asserts the ceiling, and a random delay would make the assertion about a range
+    rather than about the ceiling.
+    """
     primary = ScriptedProvider(name=PRIMARY, price=PRICE, errors=(ProviderTimeout("nope"),) * 6)
     waited, sleep = recording_sleep()
     router = Router(
         registry_with(primary),
         table(
             Candidate(PRIMARY),
-            retry=RetryPolicy(max_attempts=6, backoff=BackoffPolicy(initial=1.0, maximum=4.0)),
+            retry=RetryPolicy(
+                max_attempts=6,
+                backoff=BackoffPolicy(initial=1.0, maximum=4.0, jitter=0.0),
+                budget_seconds=600.0,
+            ),
         ),
         sleep=sleep,
     )

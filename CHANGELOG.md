@@ -5,6 +5,101 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+Packet `muse-03`: OpenTelemetry, trace propagation, and bounded retry budgets. PLAN §7
+adopts W3C `traceparent` with traces in the platform collector, and bounded retry
+budgets with circuit breakers ("briefs forbid naive retries").
+
+### Added
+
+- **Dependencies**, each justified in `README.md`:
+  - `opentelemetry-api`, `opentelemetry-sdk` — PLAN §7's "adopt from first deploy".
+    The SDK's own provider and span types rather than a hand-rolled span, so traces
+    are the shape every other OpenTelemetry tool expects.
+  - `opentelemetry-exporter-otlp` as the **optional `otel` extra**, imported only
+    when an endpoint is configured. As a hard dependency it would pull grpcio and
+    protobuf into every install to serve a path most deployments never reach.
+- `muse/telemetry.py` — `TraceParent` and `parse_traceparent`, plus
+  `ALLOWED_SPAN_ATTRIBUTES` and `record()`: the redaction boundary for telemetry.
+- `TraceMiddleware` in `muse/main.py` — continues a well-formed inbound
+  `traceparent`, starts a new trace when it is absent or malformed, and echoes both
+  `traceparent` and the existing `X-Trace-Id`. **Pure ASGI**, not
+  `@app.middleware("http")`: the decorator runs the downstream app in a separate
+  task, so the router would have seen no trace and every provider span would have
+  been orphaned.
+- Outbound propagation: `LiteLLMProvider` reads the ambient OpenTelemetry context
+  and sends `traceparent` as `extra_headers`, so the `Provider` protocol does not
+  grow an argument every future adapter would have to remember to honour.
+- Three spans: `muse.request`, `muse.route` (the routing decision), and
+  `muse.provider.call`.
+- `muse/breaker.py` — a circuit breaker per provider. Opens after N consecutive
+  *transient* failures, admits one half-open probe, closes on success. Consulted
+  before the provider is touched, so a held-back provider is never dialled.
+- `budget_seconds` and `backoff_jitter` in `config/routes.yaml`; a per-route
+  `retry_indeterminate` flag.
+- `MUSE_BREAKER_THRESHOLD`, `MUSE_BREAKER_RESET_SECONDS`,
+  `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`.
+- `traceparent` in `openapi/v1.yaml`, as an optional request parameter and on every
+  response, with a test that drives the running app and reads the real headers.
+- Tests: `test_telemetry.py`, `test_breaker.py`, `test_retry_budget.py`,
+  `test_trace_propagation.py`, `test_resilience_config.py`, plus a
+  `tests/support/tracing.py` that swaps the SDK's in-memory exporter in for the OTLP
+  one.
+
+### Changed
+
+- **A read timeout is no longer retried by default.** litellm's `Timeout` with no
+  HTTP status behind it now maps to the new `ProviderIndeterminate` rather than a
+  retryable `ProviderTimeout`. The request was in flight when the deadline passed, so
+  the vendor may have completed and billed it, and without an idempotency key there
+  is no way to ask which happened — retrying can charge a customer twice for one
+  request. A route opts in with `retry_indeterminate: true`. A **408** stays
+  retryable: that is the server saying the request never arrived complete.
+  Two adapter tests changed with this and say why.
+- **The backoff is jittered.** Without it, every muse that failed at the same instant
+  retried at the same instant, so a provider recovering from an outage was hit by a
+  synchronised wave. The window is `[ceiling * (1 - jitter), ceiling]`, so the floor
+  rises with the exponential (the backoff cannot go backwards) and jitter can never
+  push a delay past the cap. `jitter: 0` restores the exact previous schedule.
+- The retry stop condition is now muse's own rather than tenacity's, so the clock is
+  injectable. A count alone did not bound time: six attempts against a 4s ceiling is
+  20s of waiting before the last attempt is sent. The deadline is checked before each
+  wait, so muse never begins a sleep that would carry the request past it.
+
+### Security
+
+- **No span attribute may carry prompt, completion or credential text.** Enforced by
+  an allowlist at one choke point (`muse.telemetry.record`), not by discipline at each
+  call site: the realistic leak is a well-meaning `muse.prompt` added in six months,
+  not an attacker. A `Secret` is refused on its *type*, never compared by value.
+  `error.message` is deliberately **not** allowlisted — a vendor's content-policy
+  rejection quotes the offending content back, so the class name is recorded and the
+  message is not. The canary test drives a completion through the real app with a
+  unique string in both prompt and completion and asserts it appears nowhere in the
+  rendered span payload; mutation testing confirms it fails when a prompt is recorded.
+
+### Notes
+
+- **muse has no `Idempotency-Key`.** PLAN §7 assigns one to muse and it is not built,
+  which is the direct reason `ProviderIndeterminate` defaults to un-retried. Flagged
+  for the manager: it is the one thing standing between muse and safely retrying
+  ambiguous timeouts, and it also matters for the caller-visible double-billing risk.
+- **`timeout_seconds` in `routes.yaml` is still not enforced.** It is declared and
+  documented but nothing applies it, so a single hung provider call is bounded only by
+  the caller's own timeout. Pre-existing from muse-02 and left alone deliberately: the
+  packet is about retry budgets, and the only way to test a real `asyncio.timeout`
+  expiry is a real sleep, which this repo's flake policy forbids. Follow-up packet.
+- A held-back provider does not fail the request — the fallback still serves it. A
+  breaker that failed the whole request would be strictly worse than none, since one
+  vendor being down would take out every route with a healthy fallback.
+- Only transient failures count against the breaker. A 400 or a 401 is muse sending
+  something the provider is right to refuse, and counting it would let one caller with
+  a malformed request take the route down for everybody.
+- `error.type` uses its OpenTelemetry dotted spelling (set through `record`'s mapping
+  form, since a dotted name is not a legal keyword argument); muse's own attributes
+  are underscored. Both conventions are documented on the allowlist.
+- 757 tests, 100% branch coverage. Dependency floors satisfy the machine-wide uv
+  `exclude-newer = "7 days"` quarantine and so may trail the true latest.
+
 ## [0.2.0] — 2026-09-30
 
 Packet `muse-02`: providers, router, vault, metering, and the HTTP surface. muse can

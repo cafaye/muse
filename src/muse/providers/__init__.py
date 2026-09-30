@@ -31,6 +31,7 @@ from muse.errors import (
     CredentialUnavailable,
     PriceUnavailable,
     ProviderAuthError,
+    ProviderIndeterminate,
     ProviderInvalidRequest,
     ProviderRateLimited,
     ProviderTimeout,
@@ -47,6 +48,7 @@ from muse.providers.credentials import CredentialResolver
 from muse.providers.credentials import StaticCredentials as StaticCredentials
 from muse.providers.credentials import VaultCredentials as VaultCredentials
 from muse.redaction import Secret, redact
+from muse.telemetry import TRACEPARENT_HEADER, outbound_traceparent
 
 #: The roles a message may have. OpenAI's set, which is a superset of what the
 #: other vendors need; the adapter maps them if a vendor disagrees.
@@ -408,6 +410,9 @@ class LiteLLMProvider:
             "messages": [message.as_wire() for message in request.messages],
             "api_key": key.reveal(),
         }
+        headers = self._outbound_headers()
+        if headers:
+            kwargs["extra_headers"] = headers
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         if request.temperature is not None:
@@ -417,6 +422,22 @@ class LiteLLMProvider:
         except Exception as error:  # a third-party exception taxonomy, mapped below
             raise self._translate(error, key) from error
         return self._to_completion(request.model, response)
+
+    def _outbound_headers(self) -> dict[str, str]:
+        """The tracing headers to send with this call.
+
+        Read from the ambient OpenTelemetry context rather than passed in, so the
+        `Provider` protocol does not grow a `traceparent` argument that every future
+        adapter would have to remember to honour — and so a provider that does not
+        implement it cannot get it wrong.
+
+        Empty when nothing is tracing, rather than a fabricated header. Inventing a
+        trace id would drop muse's spans into whatever trace the vendor assigned, and
+        would make "we propagate the caller's trace" untrue in the one configuration
+        nobody configured.
+        """
+        header = outbound_traceparent()
+        return {TRACEPARENT_HEADER: header} if header else {}
 
     def _to_completion(self, model: str, response: Any) -> Completion:
         """Normalise litellm's response, or raise `ResponseShapeError`.
@@ -490,7 +511,17 @@ class LiteLLMProvider:
         if _is(module, "RateLimitError", error):
             return ProviderRateLimited(f"{self.name} rate limited the request: {detail}")
         if _is(module, "Timeout", error):
-            return ProviderTimeout(f"{self.name} timed out: {detail}")
+            # A 408 is the *server* saying the request never arrived complete, which
+            # is a definite "not processed" and therefore safe to repeat. Any other
+            # timeout is a deadline on our side of a request that was already in
+            # flight: the vendor may have completed and billed it, so retrying it can
+            # charge the customer twice for one request. See ProviderIndeterminate.
+            if _status_of(error) == 408:
+                return ProviderTimeout(f"{self.name} returned 408: {detail}")
+            return ProviderIndeterminate(
+                f"{self.name} did not answer in time and the request may have been "
+                f"processed: {detail}"
+            )
         if _is(module, "ServiceUnavailableError", error):
             return ProviderUnavailable(f"{self.name} is unavailable: {detail}")
         if _is(module, "APIConnectionError", error):
@@ -556,6 +587,18 @@ def _is(module: Any, class_name: str, error: Exception) -> bool:
     """
     cls = getattr(module, class_name, None)
     return isinstance(cls, type) and isinstance(error, cls)
+
+
+def _status_of(error: Exception) -> int | None:
+    """The HTTP status an upstream exception carries, if it carries one.
+
+    Read defensively because the attribute is third-party: litellm attaches
+    `status_code` to most of its exceptions, but not to all, and a transport error
+    has no HTTP layer at all. `None` means "unproven" and is never treated as
+    transient — see `muse.errors.is_retryable_status`.
+    """
+    status = getattr(error, "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
 _MISSING_CREDENTIAL_HINTS = (

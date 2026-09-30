@@ -131,6 +131,38 @@ class ProviderUnavailable(ProviderError):
     """The provider is up but failing — 5xx, connection reset, overloaded. Retryable."""
 
 
+class ProviderIndeterminate(ProviderError):
+    """The request was dispatched and the outcome is unknown.
+
+    A read timeout: the bytes went out, the answer did not come back, and the vendor
+    may have completed and billed the call. This is the one failure where a retry can
+    **bill the customer twice for one request**, and it is separated from
+    `ProviderTimeout` for exactly that reason.
+
+    Not in `RETRYABLE_PROVIDER_ERRORS`. A route that wants it anyway says
+    `retry_indeterminate: true`, per route, because the decision is a trade between
+    availability and duplicate spend and only the route knows the price. The correct
+    fix is an idempotency key (PLAN §7 assigns one to muse), which does not exist
+    yet — so the safe default is one attempt.
+
+    Note the deliberate asymmetry with `ProviderTimeout`: a 408 is the *server*
+    saying the request never arrived complete, which is a definite "not processed" and
+    therefore retryable. A timeout on our side of a request that was already in flight
+    is not the same statement.
+    """
+
+
+class CircuitOpen(ProviderUnavailable):
+    """The breaker is holding this provider back.
+
+    A `ProviderUnavailable` so it reads correctly in a failure chain — the request
+    could not be served by this provider, which is the same operational fact — while
+    remaining distinguishable from a provider that was actually tried and failed. The
+    difference is the whole point: one means "hold back", the other means "try the
+    next candidate".
+    """
+
+
 class ResponseShapeError(ProviderError):
     """The provider answered with something that is not a completion.
 
@@ -202,13 +234,77 @@ class AllCandidatesFailed(MuseError):
 #: The exact set the router retries. Adding a subclass of `ProviderError` without
 #: deciding this is the decision — an unlisted error ends the request on the first
 #: candidate, which is the conservative failure.
+#:
+#: Each member is here because a repeat of the identical request provably did not
+#: reach a billable state:
+#:
+#: - `ProviderTimeout` — a 408. The server is saying the request never arrived
+#:   complete, so nothing was processed. A read timeout is *not* this; see
+#:   `ProviderIndeterminate`.
+#: - `ProviderRateLimited` — a 429. The vendor is asking to be left alone; a request
+#:   refused for rate is not a request served.
+#: - `ProviderUnavailable` — a 5xx, a reset socket, a DNS failure, an overload. The
+#:   call failed at the transport or the server, not at the work.
+#:
+#: What is deliberately absent, and why:
+#:
+#: - `ProviderIndeterminate` — the request may already have been completed and
+#:   billed. Retrying it is how one caller's request is paid for twice.
+#: - `ProviderAuthError` / `ProviderInvalidRequest` / `ContentPolicyError` /
+#:   `CredentialUnavailable` — the identical retry gets the identical answer, and each
+#:   spends latency and rate-limit budget to get there.
+#: - `ResponseShapeError` — the provider answered, and answered the same way it will
+#:   answer again. That is an adapter bug, and retrying it hides the bug.
+#: - `PriceUnavailable` — checked before dispatch; a model muse cannot price is never
+#:   called, so there is nothing to retry.
 RETRYABLE_PROVIDER_ERRORS: tuple[type[ProviderError], ...] = (
     ProviderTimeout,
     ProviderRateLimited,
     ProviderUnavailable,
 )
 
+#: The HTTP statuses a repeat of the identical request can survive.
+#:
+#: This is the packet's rule stated as data: of the 4xx family only 408 and 429, and
+#: the 5xx family in full. 408 and 429 are the two 4xx that mean "I did not do the
+#: work" — the first because the request never arrived complete, the second because
+#: the vendor is asking to be left alone. Every other 4xx is an *answer*.
+#:
+#: An unrecognised status is not in this set. Guessing "probably transient" for
+#: something unrecognised is how a malformed request ends up in a retry loop, and how
+#: a new vendor's 4xx gets several chances to bill the same call.
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+
 
 def is_retryable(error: BaseException) -> bool:
-    """Whether the router should try this candidate again after a backoff."""
-    return isinstance(error, RETRYABLE_PROVIDER_ERRORS)
+    """Whether the router should try this candidate again after a backoff.
+
+    Note the *type* test rather than a walk of the class hierarchy, which is what
+    keeps `CircuitOpen` (a `ProviderUnavailable` subclass) from being retried: a
+    provider being held back is exactly the case where a retry is least useful.
+    """
+    return type(error) in RETRYABLE_PROVIDER_ERRORS
+
+
+def is_retryable_status(status: int | None) -> bool:
+    """Whether an HTTP status on its own justifies another attempt.
+
+    `None` — no status, because the SDK raised something that carried none — is
+    treated as unproven rather than as transient.
+    """
+    return status in RETRYABLE_STATUS_CODES
+
+
+def trips_breaker(error: BaseException) -> bool:
+    """Whether a failure counts against the provider's circuit breaker.
+
+    The transient set only. The breaker exists to stop muse adding load to a provider
+    that cannot take it; a 400 or a 401 is muse sending something the provider is
+    right to refuse, and counting those would let one caller with a malformed request
+    take the route down for everybody.
+
+    `CircuitOpen` is excluded explicitly: it *is* the breaker, so letting it feed
+    itself would open a held-back provider further open and reset its timer on every
+    refused call — a provider could then never be re-probed.
+    """
+    return type(error) in RETRYABLE_PROVIDER_ERRORS or type(error) is ProviderIndeterminate

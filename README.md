@@ -186,11 +186,34 @@ Each is a runtime dependency this packet added, and the reason it is not avoidab
 | `psycopg`       | Postgres. `vault_secrets` and `outbox_events` both live there.               |
 | `psycopg-pool`  | A pool, not a connection, so a transaction is an isolated handle.             |
 | `pyyaml`        | `config/routes.yaml`.                                                        |
+| `opentelemetry-api` | W3C trace context and the `Tracer`/`Span` types (PLAN §7 "adopt from first deploy"). |
+| `opentelemetry-sdk`  | The `TracerProvider` and span processors. Used rather than a hand-rolled span type, so traces are the shape every other OpenTelemetry tool expects. |
+| `opentelemetry-exporter-otlp` | **Optional extra** (`muse[otel]`), imported only when `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` is set. As a hard dependency it would pull grpcio and protobuf into every install to serve a path most deployments never reach. |
 | `jsonschema`    | Dev only: validates `cafaye.yml` against core's schema when a checkout is available. |
 
 Floors are the newest releases satisfying the machine-wide uv
 `exclude-newer = "7 days"` supply-chain quarantine, so they may trail the true latest.
 `uv lock` is the check, not PyPI — see `AGENTS.md`.
+
+### Tracing
+
+Traces are **off by default**: with no endpoint configured muse creates a tracer
+provider with no span processor, so spans are built, nested and closed correctly and
+then discarded. Nothing leaves the process, which is what keeps the suite hermetic
+(AGENTS.md rule 3) and means a default install phones nobody.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP endpoint. Unset means export nowhere. Setting it without `muse[otel]` installed is a boot error naming both fixes, not a silent no-op. |
+| `OTEL_SERVICE_NAME` | `muse` | `service.name` on the exported resource. |
+
+The container image installs the locked dependency set without the `otel` extra, so
+adding an endpoint to a compose deployment needs the extra built in — or the boot
+error, which is the honest outcome.
+
+```sh
+uv sync --extra otel    # to export traces
+```
 
 ## Layout
 
@@ -208,6 +231,8 @@ src/muse/
   contracts.py       core's patterns, copied and checked for parity
   redaction.py       Secret, and the scrubber for provider text
   errors.py          the error taxonomy and the retry list
+  telemetry.py       W3C traceparent, and the span-attribute allowlist
+  breaker.py         the per-provider circuit breaker
 migrations/          outbox_events, then vault_secrets
 config/routes.yaml   the routing table
 openapi/v1.yaml      the committed HTTP contract

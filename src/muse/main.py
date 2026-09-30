@@ -24,14 +24,23 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Request
+from opentelemetry import context as context_api
+from opentelemetry.trace import Span
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from muse.api import TRACE_HEADER, build_router, new_trace_id, register_error_handlers
+from muse.breaker import (
+    DEFAULT_BREAKER_RESET_SECONDS,
+    DEFAULT_BREAKER_THRESHOLD,
+    BreakerRegistry,
+)
 from muse.db import Database, PsycopgDatabase
 from muse.metering import Meter
 from muse.providers import LiteLLMProvider, ProviderRegistry
@@ -39,6 +48,14 @@ from muse.providers.credentials import CredentialResolver, VaultCredentials
 from muse.redaction import Secret
 from muse.router import Router
 from muse.routes import RouteTable, routes_from_yaml
+from muse.telemetry import (
+    TRACEPARENT_HEADER,
+    Telemetry,
+    build_provider,
+    parent_context,
+    parse_traceparent,
+    record,
+)
 from muse.vault import Vault, load_vault_key
 
 APP_TITLE = "muse"
@@ -86,6 +103,16 @@ class Settings:
     routes_path: Path = DEFAULT_ROUTES
     pool_min_size: int = 1
     pool_max_size: int = 8
+    #: Where spans are exported, or `None` for "create them and export nowhere".
+    #: Never defaulted to a collector: a service that ships pointed at somebody's
+    #: telemetry backend is a service that phones home, and one that *fails* when the
+    #: collector is absent is a service whose observability is now its availability.
+    otel_endpoint: str | None = None
+    otel_service_name: str = "muse"
+    #: Consecutive transient failures before a provider is held back. See
+    #: `muse.breaker` for why the default is five and not one.
+    breaker_threshold: int = DEFAULT_BREAKER_THRESHOLD
+    breaker_reset_seconds: float = DEFAULT_BREAKER_RESET_SECONDS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -95,7 +122,38 @@ class Settings:
             env=source.get("MUSE_ENV", "development"),
             database_url=url,
             routes_path=Path(source.get("MUSE_ROUTES_FILE", str(DEFAULT_ROUTES))),
+            otel_endpoint=source.get("MUSE_OTEL_EXPORTER_OTLP_ENDPOINT") or None,
+            otel_service_name=source.get("OTEL_SERVICE_NAME", "muse"),
+            breaker_threshold=_positive_int(
+                source, "MUSE_BREAKER_THRESHOLD", DEFAULT_BREAKER_THRESHOLD
+            ),
+            breaker_reset_seconds=_positive_float(
+                source, "MUSE_BREAKER_RESET_SECONDS", DEFAULT_BREAKER_RESET_SECONDS
+            ),
         )
+
+
+def _positive_int(source: Mapping[str, str], name: str, fallback: int) -> int:
+    """An integer setting, falling back on anything unreadable.
+
+    Falling back rather than raising is the decision the packet asks for: missing or
+    malformed configuration must never be the reason the service does not start. A
+    resilience knob set to nonsense degrades to the documented default, and the
+    default is safe — which is the opposite of what a boot failure would give.
+    """
+    try:
+        value = int(source[name])
+    except KeyError, ValueError:
+        return fallback
+    return value if value >= 1 else fallback
+
+
+def _positive_float(source: Mapping[str, str], name: str, fallback: float) -> float:
+    try:
+        value = float(source[name])
+    except KeyError, ValueError:
+        return fallback
+    return value if value > 0 else fallback
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +181,10 @@ class Container:
     meter: Meter
     credentials: CredentialResolver
     scrub_secrets: tuple[Secret, ...] = ()
+    #: The tracer, shared with `router` so the provider spans nest under the request
+    #: span. Defaults to a no-op rather than being required, because a container
+    #: assembled by a test should not have to know that tracing exists to be valid.
+    telemetry: Telemetry = field(default_factory=Telemetry.noop)
 
     def credentials_held(self) -> list[Secret]:
         """The plaintext of every configured credential, for scrubbing only.
@@ -163,15 +225,27 @@ async def build_container(settings: Settings) -> Container:
     for vendor in VENDORS:
         registry.register(LiteLLMProvider(name=vendor, credentials=credentials))
     routes.validate(registry)
+    telemetry = Telemetry(
+        build_provider(endpoint=settings.otel_endpoint, service_name=settings.otel_service_name)
+    )
     return Container(
         settings=settings,
         database=database,
         registry=registry,
         routes=routes,
-        router=Router(registry, routes),
+        router=Router(
+            registry,
+            routes,
+            telemetry=telemetry,
+            breakers=BreakerRegistry(
+                threshold=settings.breaker_threshold,
+                reset_seconds=settings.breaker_reset_seconds,
+            ),
+        ),
         vault=vault,
         meter=Meter(database),
         credentials=credentials,
+        telemetry=telemetry,
     )
 
 
@@ -197,6 +271,125 @@ class _UnavailableDatabase:
         raise RuntimeError("no MUSE_DATABASE_URL is configured, so there is nothing to transact")
 
 
+class TraceMiddleware:
+    """Continue the caller's trace, stamp a `traceparent`, and open the request span.
+
+    A **pure ASGI** middleware rather than `@app.middleware("http")`, and that is not
+    a style preference. The decorator's implementation runs the downstream app in a
+    *separate task*, so a context variable set in the middleware is not visible to
+    the route handler — which would mean the provider spans were never children of the
+    request span, the router would see no trace at all, and `outbound_traceparent()`
+    would return `None` on every call. The routing decision is the whole reason this
+    packet exists, so the middleware has to run in the same task as the handler.
+
+    Three behaviours, in order:
+
+    1. **An inbound `traceparent` is continued.** A well-formed one becomes the
+       parent context, so muse joins the caller's trace rather than starting a
+       parallel one with a number that looks similar.
+    2. **A malformed or absent one starts a new trace.** Never a 400 and never an
+       exception: `traceparent` is an observability affordance, and an affordance
+       that can take a customer's request down is a denial-of-service vector aimed at
+       our own probe. The only thing a broken header may cost is correlation.
+    3. **The response carries both correlation headers.** `traceparent`, so the
+       caller can join the trace it started; and `X-Trace-Id`, which packet `muse-02`
+       published in the committed OpenAPI document and the generated SDKs. Two ids on
+       one response is a deliberate cost: the old one is a published contract and
+       removing it is breaking.
+
+    The trace id on `scope["state"]` is the legacy opaque id, untouched by all of
+    this. `traceparent` trace ids are 32 hex characters and `X-Trace-Id` ids are
+    `uuid4().hex`, so they are the same length and the same alphabet by coincidence
+    — but only the second is the one in the `problem+json` body, which is a
+    published contract.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":  # pragma: no cover - lifespan/websocket reach here
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        legacy = new_trace_id(headers.get(TRACE_HEADER))
+        incoming = parse_traceparent(headers.get(TRACEPARENT_HEADER))
+
+        # The legacy opaque id the `problem+json` body and the `X-Trace-Id` header
+        # carry. Untouched by the tracing work: it is a published contract.
+        scope.setdefault("state", {})["trace_id"] = legacy
+
+        telemetry = getattr(scope["app"].state, "telemetry", None) or Telemetry.noop()
+        # Parent attached *before* the span opens, so the span is a child of the
+        # caller's rather than a sibling. Attaching afterwards would produce a
+        # correctly-named span with the wrong parent, which is worse than no span: it
+        # looks right in a trace viewer.
+        parent = parent_context(incoming) if incoming else context_api.get_current()
+        with context_api.attach(parent), telemetry.span("muse.request") as span:
+            context = span.get_span_context()
+            record(
+                span,
+                {
+                    "http.request.method": scope.get("method", ""),
+                    "url.path": scope.get("path", ""),
+                    "muse_trace_id": f"{context.trace_id:032x}",
+                    "muse_parent_span_id": incoming.span_id if incoming else "",
+                },
+            )
+            await self.app(
+                scope,
+                receive,
+                _correlating(send, _span_traceparent(context), legacy, span),
+            )
+
+
+def _span_traceparent(context: object) -> str | None:
+    """The `traceparent` naming this request's own span, or `None` if nothing is tracing.
+
+    Built from the span rather than from the inbound header so the caller gets a
+    header they can *continue* — the same trace id at a child span. Echoing the
+    inbound header verbatim would name a span that belongs to the caller, and a
+    caller that started a second request from the first would correlate the two.
+
+    `None` for an invalid context, which is the no-op tracer's. Formatting an invalid
+    context would produce an all-zero traceparent — the exact value W3C reserves and
+    `muse.telemetry.parse_traceparent` refuses on the way in, so the service would be
+    emitting a header it would itself reject.
+    """
+    if not context.is_valid:
+        return None
+    return f"00-{context.trace_id:032x}-{context.span_id:016x}-01"
+
+
+def _correlating(send: Send, traceparent: str | None, legacy: str, span: Span) -> Send:
+    """Wrap `send` to add the correlation headers and the status to the request span.
+
+    Wrapping rather than mutating afterwards because at ASGI level the response
+    headers are one `http.response.start` message that has already been written by
+    the time the body arrives — there is no "after" to mutate.
+
+    The status is recorded here, on the request span, because that is the span that
+    means "a request arrived". A 503 on it is the first thing an operator filters
+    on; a status on the provider span would be a category error, since a provider
+    call has no HTTP response of its own.
+    """
+    done = False
+
+    async def send_with_headers(message: Message) -> None:
+        nonlocal done
+        if message["type"] == "http.response.start" and not done:
+            done = True
+            headers = MutableHeaders(scope=message)
+            if traceparent is not None:
+                headers[TRACEPARENT_HEADER] = traceparent
+            headers[TRACE_HEADER] = legacy
+            record(span, {"http.response.status_code": message.get("status", 0)})
+        await send(message)
+
+    return send_with_headers
+
+
 def create_app(settings: Settings | None = None, container: Container | None = None) -> FastAPI:
     """Build a muse application.
 
@@ -211,6 +404,11 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if getattr(app.state, "container", None) is None:
             app.state.container = await build_container(resolved)
+        # Replaced rather than set once, because the container built above is where
+        # the real tracer lives. Reading it from the container is what guarantees the
+        # request span and the router's spans come from the same tracer — two
+        # tracers would produce two disjoint traces under one trace id.
+        app.state.telemetry = app.state.container.telemetry
         yield
 
     app = FastAPI(
@@ -225,19 +423,14 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         # before it is usable would mean the test path and the production path reach
         # the same state by different routes.
         app.state.container = container
+    # Always present, so the middleware never has to decide what a missing tracer
+    # means. Replaced by the lifespan with the container's real one.
+    app.state.telemetry = container.telemetry if container is not None else Telemetry.noop()
 
-    @app.middleware("http")
-    async def trace(request: Request, call_next):
-        """Stamp a trace id on every request, and echo it on every response.
-
-        Middleware rather than a dependency so the probe routes get one too: a 401 is
-        the response an operator is most likely to be looking at, and a trace id only
-        on success is a service you cannot debug at 3am.
-        """
-        request.state.trace_id = new_trace_id(request.headers.get(TRACE_HEADER))
-        response = await call_next(request)
-        response.headers[TRACE_HEADER] = request.state.trace_id
-        return response
+    # Outermost, so the probe routes are traced too: a 401 is the response an operator
+    # is most likely to be looking at, and a trace id only on success is a service you
+    # cannot debug at 3am.
+    app.add_middleware(TraceMiddleware)
 
     @app.get("/healthz", response_model=Health, tags=["ops"], summary="Liveness probe")
     async def healthz() -> Health:
