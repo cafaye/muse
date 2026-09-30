@@ -246,9 +246,8 @@ def _locked() -> dict[str, set[str]]:
     muse = next(
         package
         for package in tomllib.loads(LOCK.read_text(encoding="utf-8"))["package"]
-        if _normalized(package["name"]) == _normalized(
-            tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["name"]
-        )
+        if _normalized(package["name"])
+        == _normalized(tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["name"])
     )
     origins: dict[str, set[str]] = {}
     for entry in muse["metadata"]["requires-dist"]:
@@ -291,6 +290,48 @@ def _provided(owners: dict[str, set[str]], closure: set[str]) -> set[str]:
     return provided
 
 
+def _assert_the_walk_found_something() -> None:
+    """The canary this module needs before any of its absences mean anything.
+
+    `test_no_span_attribute_carries_prompt_or_completion_text` asserts
+    `names(exporter)` is non-empty before asserting the canary is absent, because
+    "the canary is absent" is also true of an export that produced no spans. The same
+    reasoning applies here, and it is not hypothetical: every check in this file is a
+    set-difference over the result of a helper, so a helper that returns nothing makes
+    every assertion below pass. Verified by breaking `_imports`, `_declared`,
+    `_gate_closure` and `_owners` one at a time — the two difference assertions went
+    green under all four, and only the OTLP test noticed.
+
+    So the floor is asserted where it can be seen: the walk has to find imports, the
+    declarations have to name distributions, the closure has to reach them, and the
+    owner map has to have read something. Each of those is a fact about the venv and
+    the repo rather than about the code under test, so asserting them cannot mask a
+    real regression — it can only catch this one.
+    """
+    imports = _imports()
+    assert imports, (
+        "the import walk found nothing in src/ or tests/, so no absence below means anything"
+    )
+
+    declared = _declared()
+    assert declared, "pyproject.toml declares no distributions, so nothing can be provided"
+    assert len(declared) > 1, (
+        "only [project.dependencies] was read; the dependency groups are missing, so "
+        "the gate's own test dependencies would look undeclared"
+    )
+
+    closure = _gate_closure()
+    missing = sorted(declared - closure)
+    assert not missing, f"declared but outside the closure computed from uv.lock: {missing}"
+
+    owners = _owners()
+    assert owners, "no installed distribution reported any Python file; the RECORD walk is broken"
+    assert len(owners) > 100, (
+        f"only {len(owners)} modules were attributed to a distribution, which is far "
+        "too few for this venv and means the RECORD walk is matching almost nothing"
+    )
+
+
 def test_every_import_is_provided_by_the_set_the_gate_installs() -> None:
     """The closure check, over every module the code and the suite import.
 
@@ -298,6 +339,8 @@ def test_every_import_is_provided_by_the_set_the_gate_installs() -> None:
     distributors: that is how you tell "nobody declares this" from "an extra declares
     it and the gate does not ask for that extra".
     """
+    _assert_the_walk_found_something()
+
     owners = _owners()
     provided = _provided(owners, _gate_closure())
 
@@ -323,6 +366,8 @@ def test_every_third_party_root_is_claimed_by_a_direct_declaration() -> None:
     the resulting failure is a clean-machine build error with nothing in muse's
     declarations to explain it.
     """
+    _assert_the_walk_found_something()
+
     claims = _root_claims(_declared())
     roots: dict[str, set[str]] = {}
     for module, files in _imports().items():
