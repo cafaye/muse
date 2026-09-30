@@ -257,7 +257,7 @@ uv run pytest -k vault -vv       # one concern
 uv run pytest --cov-report=html  # htmlcov/index.html
 ```
 
-562 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
+765 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
 process over `httpx.ASGITransport`, the database is an in-memory store behind the same
 `Database` seam production uses, and litellm is a stand-in module — so the real
 adapter's exception mapping is the code under test, not a mock of it. The one
@@ -272,6 +272,10 @@ MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
 They assert that the event patterns copied into `muse/contracts.py` are byte-identical
 to core's schema and that `cafaye.yml` validates against core's manifest schema. A
 copy is a drift risk, and this is the check that catches it.
+
+So the counts are not the same number twice: `765` with a core checkout, `763 passed,
+2 skipped` without one, both at 100% coverage and both green. Nothing is proved by the
+second one.
 
 ### A green gate is a claim about a clean machine
 
@@ -307,6 +311,29 @@ The gap is not academic. With a lock that predates a `pyproject.toml` edit, `uv 
 nobody had committed. So `--locked` goes on every `uv sync` *and* every `uv run` in
 `bin/prime` and the Dockerfile; `uv run` re-resolves by default, and one bare `uv run`
 undoes a guarded sync.
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) calls
+[kit](https://github.com/cafaye/kit)'s reusable workflow rather than copying it, and adds
+the two jobs kit cannot own:
+
+| Job | What it is | Why it is not in kit |
+|-----|-----------|---------------------|
+| `python (kit)` | `uses: cafaye/kit/.github/workflows/ci.reusable.yml@master` — install, ruff, the suite, coverage at 100 | Nothing. This is the shared half, and it is a `uses:` and nothing else. |
+| `gate + core parity` | `bin/prime` with `MUSE_CORE_SCHEMAS` pointed at a checked-out `cafaye/core`, then a lockfile guard and a no-skip guard | It knows muse's env var and reaches into another cafaye repository. kit cannot own a step that needs either. |
+| `pins` | Asserts the runtime pins in the workflow are the ones the repo declares | The pin is written twice, because GitHub exposes no file context to a reusable workflow call's `with:`. |
+
+The second job exists because of the count above. A caller cannot inject `env:` into a
+called reusable workflow, so kit's python job runs those two cross-repo drift guards as
+**skipped** — and that is why the job that does run them **fails on any skip at all**,
+with no allowlist of known-good skips. A CI run that quietly drops the only check that
+catches drift with core is worse than no CI, because a green badge is a claim.
+
+That job also asserts `git diff --exit-code -- uv.lock`, and then proves the drift guard
+can actually go red: it copies core's schemas, mutates `eventType.pattern` in the copy,
+and fails if the parity test still passes. A gate nobody has watched fail is a gate
+nobody knows is a gate.
 
 ## License
 

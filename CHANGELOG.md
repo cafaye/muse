@@ -5,11 +5,46 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-04 — CI, and the tier that would have skipped
+
+Packet `muse-04`: muse had no CI. It calls kit's reusable workflow, and adds the
+two jobs kit cannot own — because the shared workflow alone would have gone green
+while skipping the only two tests that catch drift with core.
+
+#### Added
+
+- **`.github/workflows/ci.yml`**, calling
+  `cafaye/kit/.github/workflows/ci.reusable.yml@master` for `language: python`
+  with `coverage-fail-under: 100`. kit owns the shared half — install, ruff, the
+  suite, the coverage gate — and muse holds a `uses:` rather than a copy, so a fix
+  to how the fleet builds reaches muse without a per-repo PR.
+- **`gate + core parity`**, the job that makes the badge mean something. It checks
+  out `cafaye/core` (sparse, `schemas` only, at a pinned SHA), sets
+  `MUSE_CORE_SCHEMAS`, and runs `bin/prime` — the same command a developer runs,
+  not a CI-only variant. It then asserts `git diff --exit-code -- uv.lock`, fails
+  on **any** skipped test, and proves the core-parity guard can go red by mutating
+  a throwaway copy of core's `eventType.pattern` and failing if the test still
+  passes. A caller cannot inject `env:` into a called reusable workflow, so kit's
+  python job reports `763 passed, 2 skipped` and exits 0; this job reports
+  `765 passed` and treats any skip as a red build.
+- **`pins`**, because the runtime pin has to be written twice (GitHub exposes no
+  file context to a reusable workflow call's `with:`). It asserts
+  `.python-version`, `mise.toml`'s `[tools]` and the workflow's own `versions:` /
+  setup-uv values all say the same thing, so a bump cannot be done halfway.
+
+#### Fixed
+
+- **The README claimed 562 tests.** It is 765, and the two numbers mean different
+  things: 765 with a core checkout, `763 passed, 2 skipped` without one. The
+  README now says both counts and says plainly that the second proves nothing.
+
+### muse-03b — dependencies
+
 Packet `muse-03b`: the gate was red on a clean checkout. A regression found at merge,
 fixed at the declarations rather than at the test. While proving the fix, a second
 defect of the same class turned up in the gate itself.
 
-### Fixed
+#### Fixed
 
 - **`bin/prime` could not pass on a fresh clone.** `muse-03` put
   `opentelemetry-exporter-otlp` in the optional `otel` extra, but
