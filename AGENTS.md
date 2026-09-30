@@ -46,6 +46,8 @@ tests/                pytest; one module per concern, plus tests/support/
                      the declared set, and bin/prime against --locked — see
                      Dependencies)
 bin/prime             the gate: uv sync --locked && ruff && pytest
+.github/workflows/    ci.yml: calls kit's reusable workflow, plus the two
+                      jobs kit cannot own (core parity, pins) — see CI
 ```
 
 ## Rules
@@ -223,7 +225,40 @@ quarantine*, which is often a version or two behind the true latest. So:
 
 `mise.toml` pins `python = "3.14"` and `uv = "0.12.20"`; `.python-version`
 pins 3.14. If a new interpreter release lands, bump `.python-version` and
-`mise.toml` together and re-run the gate.
+`mise.toml` together, update `versions:` in `.github/workflows/ci.yml`, and
+re-run the gate. The `pins` CI job fails until all four agree, so the bump
+cannot be done halfway and missed.
+
+## CI
+
+`.github/workflows/ci.yml` **calls**
+`cafaye/kit/.github/workflows/ci.reusable.yml@master` — it does not copy it.
+The `uses:` is the whole `python` job; everything kit shares lives in kit.
+
+Three rules, and they are the reason the file has three jobs rather than one:
+
+1. **`bin/prime` is the gate in CI too, not a CI-only variant of it.** The same
+   command, so the two cannot disagree — if they can, one of them is lying.
+   Anything CI needs that `bin/prime` does not do belongs *around* the call.
+2. **No test may skip in CI.** Two tests are gated on `MUSE_CORE_SCHEMAS`, and
+   a reusable workflow caller cannot inject `env:` into the workflow it calls,
+   so kit's python job runs them skipped (`763 passed, 2 skipped`) and is green.
+   That is the trap: the only two tests that catch drift with core would stop
+   running, and the badge would not move. So the `gate + core parity` job checks
+   out `cafaye/core`, sets the variable, runs `bin/prime`, and **fails on any
+   skip at all** — no allowlist, because an allowlist only ever grows. The run
+   must report `765 passed`.
+3. **A guard nobody has watched fail is not a guard.** So the same job asserts
+   `git diff --exit-code -- uv.lock` after the gate, and then proves the parity
+   guard can go red by mutating a throwaway copy of core's schemas and failing
+   if the test still passes. Both are the canary discipline from
+   `tests/test_trace_propagation.py`, applied to CI: assert the floor before
+   asserting the absence, and break it on purpose.
+
+Why the companion jobs cannot live in kit: they know muse's environment
+variable and its lockfile, and one of them reaches into another cafaye
+repository. kit is deliberately not allowed to own a step that needs any of
+those.
 
 ## Commands
 
@@ -237,8 +272,11 @@ uv run ruff check . && uv run ruff format .
 uv run uvicorn --factory muse.main:create_app --reload   # local dev
 docker compose up --build
 
-# The two contract tests that need a core checkout:
+# The two contract tests that need a core checkout — what CI forces on:
 MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
+
+# The local equivalent of the CI `gate` job, core checkout and all:
+MUSE_CORE_SCHEMAS=../core/schemas bin/prime
 ```
 
 Long commands get a `timeout`. Never push — the manager merges to `master`.
