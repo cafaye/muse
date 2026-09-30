@@ -151,9 +151,7 @@ def test_every_error_class_muse_defines_is_mapped() -> None:
     eight is a mapping whose twenty-eighth entry is a 3am incident and a dashboard
     full of `_OTHER`.
     """
-    unmapped = sorted(
-        name for name, cls in _declared_error_classes().items() if cls not in mapping
-    )
+    unmapped = sorted(name for name, cls in _declared_error_classes().items() if cls not in mapping)
     assert unmapped == []
 
 
@@ -200,9 +198,7 @@ def test_no_mapping_points_at_a_value_the_schema_does_not_have() -> None:
     rejects — so a typo here is a 500-shaped telemetry hole, not a warning.
     """
     unknown = sorted(
-        f"{cls.__name__} -> {value}"
-        for cls, value in mapping.items()
-        if value not in error_types()
+        f"{cls.__name__} -> {value}" for cls, value in mapping.items() if value not in error_types()
     )
     assert unknown == []
 

@@ -21,9 +21,15 @@ the header is added by the adapter and a double would prove nothing about it.
 
 from __future__ import annotations
 
+import json
+from functools import cache
+from pathlib import Path
+
 import pytest
+from jsonschema import Draft202012Validator
 
 from muse.breaker import BreakerRegistry
+from muse.errortype import SCHEMA_PATH
 from muse.main import Container, Settings, create_app
 from muse.metering import Meter
 from muse.providers import Completion, LiteLLMProvider, Price, ProviderRegistry
@@ -39,7 +45,7 @@ from .conftest import AUTH_HEADERS, asgi_client
 from .support.fake_database import FakeDatabase
 from .support.litellm_stub import make_stub
 from .support.test_app import TEST_KEY
-from .support.tracing import by_name, names, recording_telemetry, rendered
+from .support.tracing import by_name, names, payloads, recording_telemetry, rendered
 
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
@@ -67,14 +73,14 @@ def _table(provider: str = "openai", model: str = "fast") -> RouteTable:
 STUB_MODEL = "gpt-4o-mini"
 
 
-def _app(registry: ProviderRegistry, table: RouteTable, telemetry: Telemetry):
+def _app(registry: ProviderRegistry, table: RouteTable, telemetry: Telemetry, **kwargs):
     database = FakeDatabase()
     container = Container(
         settings=Settings(env="test"),
         database=database,
         registry=registry,
         routes=table,
-        router=Router(registry, table, telemetry=telemetry),
+        router=Router(registry, table, telemetry=telemetry, **kwargs),
         vault=Vault(database, TEST_KEY),
         meter=Meter(database),
         credentials=StaticCredentials({}),
@@ -281,6 +287,11 @@ async def test_a_failed_request_still_emits_its_spans_with_an_error_type() -> No
     vendor's error text is third-party text, and a content-policy rejection quotes
     the offending content back — so `error.message` is the one attribute that could
     carry a prompt, which is why it is not on the allowlist.
+
+    The value is core's vocabulary and not muse's class name. `provider_auth` is what
+    every service in the fleet will spell this as, and the assertion is on the exact
+    string so a mapping that answered `internal_error` — or `_OTHER` — fails here
+    instead of quietly reshaping a dashboard nobody is looking at yet.
     """
     from muse.errors import ProviderAuthError
     from muse.providers.fake import ScriptedProvider
@@ -303,9 +314,225 @@ async def test_a_failed_request_still_emits_its_spans_with_an_error_type() -> No
 
     assert response.status_code == 503
     provider_span = by_name(exporter, "muse.provider.call")[0]
-    assert provider_span["attributes"]["error.type"] == "ProviderAuthError"
+    assert provider_span["attributes"]["error.type"] == "provider_auth"
     assert by_name(exporter, "muse.request")[0]["attributes"]["http.response.status_code"] == 503
     assert "sk-live-SECRET" not in rendered(exporter)
+
+
+# --- error status and error class are one biconditional --------------------
+#
+# core-05 made these two an `allOf` in traces.schema.json rather than two
+# suggestions: a span whose status is `error` must carry a class, and a span
+# carrying a class must have failed. Before this packet muse recorded the class
+# and left the status `unset`, which is exactly the half of the pair that leaves a
+# span two queries reading it differently — the fleet view filters on status
+# `error`, so a classified failure that never reached the predicate was invisible
+# in the one place the fleet looks for it.
+
+
+async def test_a_failed_provider_call_marks_the_span_failed_and_classifies_it() -> None:
+    """Both halves of the pair, asserted on the span that actually failed.
+
+    The class alone is what muse emitted before; the status alone is what a span
+    with no classification would have to offer a query. Asserting the exact class as
+    well keeps this from passing on `error.type` merely being present.
+    """
+    from muse.errors import ProviderTimeout
+    from muse.providers.fake import ScriptedProvider
+
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        ScriptedProvider(name="openai", price=Price(1000, 2000), errors=(ProviderTimeout("slow"),))
+    )
+    app = _app(registry, _table(), telemetry)
+
+    async with asgi_client(app) as client:
+        response = await client.post(
+            "/v1/route", json=_body(), headers={**AUTH_HEADERS, TRACEPARENT_HEADER: INBOUND}
+        )
+
+    assert response.status_code == 503
+    provider_span = by_name(exporter, "muse.provider.call")[0]
+    assert provider_span["status"] == "error"
+    assert provider_span["attributes"]["error.type"] == "timeout"
+
+
+async def test_every_span_agrees_about_whether_it_failed() -> None:
+    """The fleet-wide property, over every span one exporter holds.
+
+    Two requests through one app, deliberately shaped to produce all three kinds of
+    span: a success, a provider that failed and was retried-then-fell-through to the
+    fallback, and a refusal from a breaker that opened on that failure. The
+    assertion is the biconditional itself — a class is present **if and only if** the
+    span failed — applied to every span rather than to one the test picked.
+
+    The floor comes first, for the reason the canary test gives: "nothing here
+    carries a class" is also true of an exporter that exported nothing, and of a
+    vocabulary where the mapping raised and every call fell back to no attribute at
+    all. So the classes are asserted as present, on the spans that should have them,
+    before any absence is claimed.
+    """
+    from muse.errors import ProviderTimeout
+    from muse.providers.fake import ScriptedProvider
+
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        ScriptedProvider(name="openai", price=Price(1000, 2000), errors=(ProviderTimeout("slow"),))
+    )
+    registry.register(FakeProvider(name="anthropic", price=Price(1000, 2000)))
+    two_candidates = routes_from_yaml(
+        "version: 1\nroutes:\n  - model: fast\n    candidates:\n"
+        "      - provider: openai\n      - provider: anthropic\n"
+    )
+    app = _app(registry, two_candidates, telemetry, breakers=BreakerRegistry(threshold=1))
+
+    async with asgi_client(app) as client:
+        first = await client.post("/v1/route", json=_body(), headers=AUTH_HEADERS)
+        second = await client.post("/v1/route", json=_body(), headers=AUTH_HEADERS)
+
+    # Both requests were served — by the fallback, and by the fallback again once the
+    # breaker held the primary back. An error rate that counted these would be a lie.
+    assert (first.status_code, second.status_code) == (200, 200)
+
+    classes = [
+        span["attributes"].get("error.type")
+        for span in payloads(exporter)
+        if span["name"] == "muse.provider.call"
+    ]
+    assert sorted(value for value in classes if value is not None) == ["circuit_open", "timeout"]
+
+    disagreeing = [
+        span
+        for span in payloads(exporter)
+        if (span["status"] == "error") != ("error.type" in span["attributes"])
+    ]
+    assert disagreeing == [], "a span's status and its error class tell different stories"
+
+
+async def test_a_mapped_span_validates_against_core_schema() -> None:
+    """muse's own rule, checked by core's own schema rather than by my reading of it.
+
+    `traces.schema.json` is vendored into `muse/schemas/`, so this runs on the default
+    gate rather than only when `MUSE_CORE_SCHEMAS` points at a checkout — the byte-for-
+    byte drift check on that copy is what needs the checkout, not the schema itself. A
+    hand-written assertion of the biconditional is my interpretation of core's rule;
+    this is core's rule, applied to a span a real request produced.
+
+    The document is projected onto the fields core knows: muse's own `muse_*` attribute
+    names are **not** in core's trace allowlist yet (see the report), and asserting
+    around that here would make this a test about an unrelated gap.
+    """
+    from muse.errors import ProviderAuthError
+    from muse.providers.fake import ScriptedProvider
+
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        ScriptedProvider(name="openai", price=Price(1000, 2000), errors=(ProviderAuthError("no"),))
+    )
+    app = _app(registry, _table(), telemetry)
+
+    async with asgi_client(app) as client:
+        await client.post("/v1/route", json=_body(), headers=AUTH_HEADERS)
+
+    document = _core_document(by_name(exporter, "muse.provider.call")[0])
+    _validator().validate(document)
+
+    # The same document claiming to have succeeded is rejected, and so is the same
+    # document with the class replaced by muse's own class name. These are core's
+    # rules, and the second half of the pair is the reason this packet had to touch the
+    # span status at all.
+    not_failed = {**document, "status": {"code": "unset"}}
+    assert not _validator().is_valid(not_failed)
+
+    undeclared = {**document, "attributes": {"error.type": "ProviderAuthError"}}
+    assert not _validator().is_valid(undeclared)
+
+    no_class = {**document, "attributes": {}}
+    assert not _validator().is_valid(no_class)
+
+    # Every span muse exports carries a status, because the SDK always sets one —
+    # asserted rather than assumed, because the assertion below depends on it. core's
+    # `then` constrains `status` without requiring it to exist, so a document that
+    # omitted the key entirely would slip past the biconditional; that hole is in core's
+    # schema and is reported rather than worked around here.
+    assert all(span["status"] in {"unset", "ok", "error"} for span in payloads(exporter))
+
+
+def _core_document(span: dict) -> dict:
+    """A real exported span, in the shape `traces.schema.json` describes.
+
+    Read off the exporter rather than written out, so what is validated is what a
+    collector would have received rather than what this test believes muse emits.
+    """
+    allowlist = set(
+        json.loads(Path(SCHEMA_PATH).read_text(encoding="utf-8"))["$defs"]["tracesAttributes"][
+            "properties"
+        ]
+    )
+    return {
+        "name": span["name"],
+        "kind": span["kind"],
+        "status": {"code": span["status"]},
+        "attributes": {
+            name: value for name, value in span["attributes"].items() if name in allowlist
+        },
+    }
+
+
+@cache
+def _validator():
+    """core's schema, compiled once.
+
+    Cached because a `Draft202012Validator` walks the whole document to compile itself,
+    and this is called once per assertion rather than once per test.
+    """
+    return Draft202012Validator(json.loads(Path(SCHEMA_PATH).read_text(encoding="utf-8")))
+
+
+async def test_an_unmapped_class_is_reported_as_other_and_named_in_the_log() -> None:
+    """The safety net, through the real app.
+
+    `muse.errortype.error_type` refuses a class it does not know; this is what happens
+    next. `_OTHER` and a log line naming the class — and *only* the class, because the
+    message here is a vendor's and a content-policy rejection quotes the offending
+    content back. So the request still returns the 503 the caller deserves, the span
+    still says something true, and the omission is loud in the one place an operator
+    will look before the dashboard.
+
+    The red test for this is in `test_error_vocabulary.py`: a class in `muse.errors`
+    with no mapping fails the gate. This one is about what happens in the window
+    before somebody adds the entry.
+    """
+    from muse.errors import ProviderUnavailable
+    from muse.providers.fake import ScriptedProvider
+
+    class AProviderErrorNobodyClassified(ProviderUnavailable):
+        """A brand new failure, added without a mapping."""
+
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        ScriptedProvider(
+            name="openai",
+            price=Price(1000, 2000),
+            errors=(AProviderErrorNobodyClassified("the vendor said something"),),
+        )
+    )
+    app = _app(registry, _table(), telemetry)
+
+    async with asgi_client(app) as client:
+        response = await client.post(
+            "/v1/route", json=_body(), headers={**AUTH_HEADERS, TRACEPARENT_HEADER: INBOUND}
+        )
+
+    assert response.status_code == 503
+    provider_span = by_name(exporter, "muse.provider.call")[0]
+    assert provider_span["attributes"]["error.type"] == "_OTHER"
+    assert provider_span["status"] == "error"
+    assert "the vendor said something" not in rendered(exporter)
 
 
 async def test_the_breaker_state_is_recorded_on_the_provider_span() -> None:
@@ -410,7 +637,7 @@ async def test_a_provider_echoing_the_credential_is_not_recorded_on_a_span() -> 
     assert response.status_code == 503
     assert "sk-live-XYZ" not in response.json()["detail"]
     assert by_name(exporter, "muse.provider.call")[0]["attributes"]["error.type"] == (
-        "ProviderAuthError"
+        "provider_auth"
     )
     assert "sk-live-XYZ" not in rendered(exporter)
 

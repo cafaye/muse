@@ -84,7 +84,7 @@ from muse.providers import (
 )
 from muse.redaction import Secret, redact
 from muse.routes import BackoffPolicy, Candidate, RetryPolicy, Route, RouteTable
-from muse.telemetry import Telemetry, record
+from muse.telemetry import Telemetry, record, record_error
 
 #: A `(role, content)` pair as a caller states it. The router turns these into
 #: `Message` values, so the endpoint and the router agree on one request shape
@@ -328,13 +328,11 @@ class Router:
                 # keeps its dot, which is not a legal Python keyword argument. The 503
                 # is what makes this span distinguishable in a trace viewer from a call
                 # that was actually made and failed.
-                record(
-                    span,
-                    {
-                        "http.response.status_code": 503,
-                        "error.type": CircuitOpen.__name__,
-                    },
-                )
+                record(span, {"http.response.status_code": 503})
+                # Not inline: `record_error` is what makes the class and the span's
+                # failed status one act, and the class is core's vocabulary rather than
+                # this class's name.
+                record_error(span, CircuitOpen)
             return _Attempt(
                 failure=CandidateFailure(
                     provider=candidate.provider,
@@ -388,17 +386,15 @@ class Router:
                 try:
                     completion = await provider.complete(request)
                 except ProviderError as error:
-                    # The class name, never the message. A vendor's message is
-                    # third-party text and a content-policy rejection quotes the
-                    # offending content back, so recording it would put a prompt in a
-                    # tracing backend — which is retained, searchable and readable by
-                    # anyone with collector access. Re-raised rather than swallowed:
-                    # the retry loop below owns the decision, this span only reports.
-                    record(
-                        span,
-                        {"error.type": type(error).__name__},
-                        muse_latency_ms=int((self._clock() - began) * 1000),
-                    )
+                    # The fleet's class for this failure, never the message. A
+                    # vendor's message is third-party text and a content-policy
+                    # rejection quotes the offending content back, so recording it
+                    # would put a prompt in a tracing backend — which is retained,
+                    # searchable and readable by anyone with collector access.
+                    # Re-raised rather than swallowed: the retry loop below owns the
+                    # decision, this span only reports.
+                    record(span, muse_latency_ms=int((self._clock() - began) * 1000))
+                    record_error(span, error)
                     raise
                 record(
                     span,

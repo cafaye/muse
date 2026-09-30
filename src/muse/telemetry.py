@@ -44,6 +44,7 @@ that can be a list of the caller's prompts.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -51,10 +52,22 @@ from dataclasses import dataclass
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Tracer, TracerProvider
-from opentelemetry.trace import NoOpTracerProvider, Span, get_current_span, set_span_in_context
+from opentelemetry.trace import (
+    NoOpTracerProvider,
+    Span,
+    Status,
+    StatusCode,
+    get_current_span,
+    set_span_in_context,
+)
 
-from muse.errors import ConfigError
+from muse.errors import ConfigError, UnclassifiedError
+from muse.errortype import FALLBACK, error_type
 from muse.redaction import Secret
+
+#: Where the two words nobody should see together end up. A logger rather than a bare
+#: print, so a deployment's existing log configuration decides where it goes.
+logger = logging.getLogger("muse.telemetry")
 
 #: The W3C trace-context header. Lowercase on purpose: HTTP header names are
 #: case-insensitive and this is the spelling the spec publishes.
@@ -207,6 +220,49 @@ def record(span: Span, attributes: Mapping[str, object] | None = None, **kwargs:
         if isinstance(value, Secret) or not isinstance(value, (str, int, float, bool)):
             continue
         span.set_attribute(name, value[:MAX_ATTRIBUTE_LENGTH] if isinstance(value, str) else value)
+
+
+def record_error(
+    span: Span, error: BaseException | type[BaseException], **attributes: object
+) -> None:
+    """Say that this span failed, and what class of failure it was.
+
+    The only way to put a failure on a span, and both halves of core's biconditional
+    happen here so they cannot come apart: `error.type` is recorded *and* the span's
+    status is set to `error`. core-05 encoded that pair as an `allOf` in
+    `traces.schema.json` because a class without a failed status and a failed status
+    without a class are both spans two different queries read differently — the
+    fleet-wide view filters on status `error` and then drills down by class, so a span
+    carrying a class but never reaching the predicate is invisible in the one place the
+    fleet looks.
+
+    Takes the exception or the class: a breaker refusal is recorded before the
+    exception that would describe it exists, and raising one in order to throw it away
+    would be a lie about what happened.
+
+    **A class with no mapping does not take the request down with it.** `error_type`
+    refuses, because `_OTHER` as a default is how a vocabulary stops being read — so
+    the refusal is caught *here*, at the one place where the alternative is a 500 in
+    place of the caller's own error, and resolved into `_OTHER` plus a log line naming
+    the class. The class name is a symbol; the message is not, and a vendor's
+    content-policy rejection quotes the offending content back. The gate is the other
+    half: `tests/test_error_vocabulary.py` fails on a class in `muse.errors` with no
+    entry, so this path is the window between a new class landing and somebody adding
+    its mapping, not a way to ship one unmapped.
+    """
+    try:
+        value = error_type(error)
+    except UnclassifiedError:
+        cls = error if isinstance(error, type) else type(error)
+        logger.warning(
+            "%s has no entry in the error-class mapping; recording it as %s. Add it to "
+            "muse.errortype.mapping — tests/test_error_vocabulary.py will fail until you do.",
+            cls.__name__,
+            FALLBACK,
+        )
+        value = FALLBACK
+    record(span, {"error.type": value}, **attributes)
+    span.set_status(Status(StatusCode.ERROR))
 
 
 def outbound_traceparent() -> str | None:

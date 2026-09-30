@@ -221,8 +221,8 @@ A local checkout already has it: the dev group pulls `muse[otel]` in, because th
 test suite exercises the endpoint path and a test that imports a package makes it a
 test dependency. That costs the image nothing — `tests/test_dependencies.py` asserts
 `[project.dependencies]` never names the exporter and that every Dockerfile `uv sync`
-carries `--no-dev`, so the group cannot leak into a deployment. See `AGENTS.md`
-rule 19.
+carries `--no-dev`, so the group cannot leak into a deployment. See the `Dependencies`
+section of `AGENTS.md`.
 
 ## Layout
 
@@ -240,12 +240,43 @@ src/muse/
   contracts.py       core's patterns, copied and checked for parity
   redaction.py       Secret, and the scrubber for provider text
   errors.py          the error taxonomy and the retry list
-  telemetry.py       W3C traceparent, and the span-attribute allowlist
+  errortype.py       the fleet's error classes, and the table onto them
+  telemetry.py       W3C traceparent, the span allowlist, and `record_error`
   breaker.py         the per-provider circuit breaker
+  schemas/telemetry/ core's traces schema, vendored byte-identically
 migrations/          outbox_events, then vault_secrets
 config/routes.yaml   the routing table
 openapi/v1.yaml      the committed HTTP contract
 ```
+
+## Errors, and the vocabulary they are reported under
+
+`error.type` is the class a span failed with, and it is **core's** thirteen-value
+vocabulary rather than muse's class names — `ProviderAuthError` goes on the wire as
+`provider_auth`, so a fleet-wide error view (PLAN §7b: partition by `service.name`,
+filter on span status `error`, drill down by `error.type`) is a query rather than a
+mapping table somebody maintains by hand.
+
+`muse/errortype.py` reads that vocabulary out of core's `traces.schema.json` rather
+than restating it, and holds the one table that maps every class in `muse.errors` onto
+it. `muse/telemetry.record_error` is the only path that puts a failure on a span, and
+it sets the span's status at the same time — core's schema makes the class and the
+failed status a biconditional, and a span carrying one without the other is a span two
+queries read differently.
+
+Three things follow, and each has a test:
+
+- **A class with no mapping is refused, not defaulted.** `_OTHER` is a member of the
+  vocabulary and `ProviderIndeterminate` is mapped onto it on purpose, but it is never
+  a fallback: `dict.get(cls, "_OTHER")` makes forgetting a mapping silent.
+- **The request does not fail because telemetry could not classify it.** The refusal is
+  caught at the one place where the alternative is a 500 in place of the caller's own
+  error, and becomes `_OTHER` plus a log line naming the class. The gate is
+  `tests/test_error_vocabulary.py`, which fails on a class in `muse.errors` with no
+  entry.
+- **`error.message` is still not on the allowlist.** A provider's content-policy
+  rejection quotes the offending content back, so a span that records only the class
+  cannot carry the text even if redaction were removed.
 
 ## Tests
 
@@ -263,15 +294,19 @@ process over `httpx.ASGITransport`, the database is an in-memory store behind th
 adapter's exception mapping is the code under test, not a mock of it. The one
 excluded function is `PsycopgDatabase.open()`, which dials.
 
-Two tests skip unless pointed at a core checkout:
+Three tests skip unless pointed at a core checkout:
 
 ```sh
 MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
 ```
 
 They assert that the event patterns copied into `muse/contracts.py` are byte-identical
-to core's schema and that `cafaye.yml` validates against core's manifest schema. A
-copy is a drift risk, and this is the check that catches it.
+to core's schema, that `cafaye.yml` validates against core's manifest schema, and that
+the vendored `src/muse/schemas/telemetry/traces.schema.json` — the file
+`muse/errortype.py` reads the error vocabulary out of — is still byte-identical to
+core's. A copy is a drift risk, and this is the check that catches it. The tests that
+*use* that schema to validate a span muse actually exported are not among them: the copy
+ships with the package, so they run on the default gate.
 
 ### A green gate is a claim about a clean machine
 

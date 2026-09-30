@@ -5,6 +5,69 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+Packet `muse-05`: `error.type` moves from muse's class names to core's fleet
+vocabulary, and a span's error class and its status become one thing recorded in
+one place.
+
+### Changed
+
+- **`error.type` is core's vocabulary, not `type(error).__name__`.**
+  `ProviderAuthError` now goes on the wire as `provider_auth`, `CircuitOpen` as
+  `circuit_open`, and so on through all 27 classes in `muse.errors`. The old
+  spelling was a fine identifier and a useless one: every service spells the same
+  failure its own way, and PLAN §7b's fleet-wide error view — partition by
+  `service.name`, filter on span status `error`, drill down by `error.type` — is a
+  query only when every service draws from one list. muse is the only service that
+  emitted a class at all, which is the cheapest moment to fix it; after three more
+  services start copying the shape it is a migration rather than an edit.
+  **Breaking for anything that read the attribute**, which so far is
+  `tests/test_trace_propagation.py` (updated to assert `provider_auth`, the
+  specific value, in both places that asserted `ProviderAuthError`).
+- **The mapping table is exhaustive and the lookup is by exact type.**
+  `tests/test_error_vocabulary.py` walks `muse.errors` and fails on any class with
+  no entry, and `error_type` does not walk the hierarchy, so a new subclass of
+  `ProviderUnavailable` is refused rather than silently reported as
+  `dependency_unavailable`. Same discipline as `is_retryable`.
+- **`_OTHER` is reachable and is not a default.** It is mapped onto deliberately
+  for `ProviderIndeterminate` — the case core kept it for, so instrumentation is
+  never forced to invent a class. An unmapped class raises `UnclassifiedError`
+  rather than becoming `_OTHER`, because a default is how a vocabulary stops
+  being read. `record_error` catches that refusal, records `_OTHER` and logs the
+  class name, so telemetry that cannot classify a failure does not turn the
+  caller's 503 into a 500.
+
+### Added
+
+- **`muse/errortype.py`** — the one table from muse's exception classes to the
+  thirteen classes, with the reasoning for the four that are a judgement rather
+  than a lookup (`ContentPolicyError` → `provider_rejected`,
+  `CredentialUnavailable`/`VaultDecryptError` → `internal_error`,
+  `AllCandidatesFailed` → `dependency_unavailable`, `ConfigError` →
+  `internal_error`) written next to the rows.
+- **The vocabulary is loaded from core's schema, not restated.** `error_types()`
+  reads the enum out of `traces.schema.json`, vendored byte-identically under
+  `src/muse/schemas/telemetry/`. `tests/test_error_vocabulary.py` asserts that copy
+  is byte-identical to core's whenever `MUSE_CORE_SCHEMAS` points at a checkout,
+  and the suite validates spans muse actually exported against the vendored
+  schema — including the three ways the error biconditional can be wrong — on
+  the default gate, with no core checkout needed.
+- **`telemetry.record_error(span, error)`** — the only path from an exception to a
+  span failure, setting `error.type` and the span's status together.
+
+### Fixed
+
+- **A span recorded a class while claiming it had succeeded.** muse set
+  `error.type` and left the span status `unset`, which is one half of the
+  biconditional core-05 encoded as an `allOf`: a class without a failed status, so
+  the fleet view — which filters on status `error` and only then drills down —
+  never saw a failure muse had already classified. Both existing call sites (the
+  provider failure and the breaker refusal) now set both halves, and
+  `tests/test_trace_propagation.py` asserts the biconditional over *every* span
+  one exporter holds, after asserting the classes are present so an empty export
+  cannot make the absence vacuous.
+- `tests/support/tracing.py` reports span status and kind as well as attributes.
+  A payload without them cannot answer the question the biconditional asks.
+
 Packet `muse-03b`: the gate was red on a clean checkout. A regression found at merge,
 fixed at the declarations rather than at the test. While proving the fix, a second
 defect of the same class turned up in the gate itself.

@@ -84,6 +84,13 @@ from muse.errors import (
 #: for the drift check that keeps it a copy rather than a fork.
 SCHEMA_PATH = Path(__file__).parent / "schemas" / "telemetry" / "traces.schema.json"
 
+#: The OpenTelemetry fallback, named once so the two places that use it are not also the
+#: places that retype it. `ProviderIndeterminate` is mapped onto it deliberately, and
+#: `muse.telemetry.record_error` records it as a last resort — both go through this
+#: name, and both are checked against core's enum when `mapping` is built below, so
+#: there is one string here and one spelling of it.
+FALLBACK = "_OTHER"
+
 
 @cache
 def error_types() -> frozenset[str]:
@@ -186,7 +193,7 @@ _TABLE: dict[type[BaseException], str] = {
     # unknown, so it is not a timeout (which is a definite "not processed") and not a
     # connection failure (which is a definite "never left"). Nothing in the thirteen
     # fits, and inventing a fourteenth for it would be worse than using the fallback.
-    ProviderIndeterminate: "_OTHER",
+    ProviderIndeterminate: FALLBACK,
     # We chose not to call. Our breaker, not a failure of the peer.
     CircuitOpen: "circuit_open",
     # The provider answered and the answer was not a completion. An adapter bug, and
