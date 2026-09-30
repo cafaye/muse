@@ -492,7 +492,9 @@ def _validator():
     return Draft202012Validator(json.loads(Path(SCHEMA_PATH).read_text(encoding="utf-8")))
 
 
-async def test_an_unmapped_class_is_reported_as_other_and_named_in_the_log() -> None:
+async def test_an_unmapped_class_is_reported_as_other_and_named_in_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The safety net, through the real app.
 
     `muse.errortype.error_type` refuses a class it does not know; this is what happens
@@ -533,6 +535,14 @@ async def test_an_unmapped_class_is_reported_as_other_and_named_in_the_log() -> 
     assert provider_span["attributes"]["error.type"] == "_OTHER"
     assert provider_span["status"] == "error"
     assert "the vendor said something" not in rendered(exporter)
+
+    # Named, not swallowed — and named by class only. Asserted on the record rather
+    # than inferred from the span, because the span now says `_OTHER` either way and
+    # the warning is the only thing that says *which* class was missed.
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1, warnings
+    assert "AProviderErrorNobodyClassified" in warnings[0]
+    assert "the vendor said something" not in warnings[0]
 
 
 async def test_the_breaker_state_is_recorded_on_the_provider_span() -> None:
