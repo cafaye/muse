@@ -1,0 +1,336 @@
+---
+# muse's CI: kit's shared workflow, plus the half kit cannot own.
+#
+# Two things are true about this file, and the second is the reason it is not
+# the six lines kit's README shows.
+#
+# 1. The shared half is a `uses:` and nothing else. kit owns install, lint, test
+#    and the coverage gate for seven languages, so a fix to how the fleet builds
+#    lands once and reaches the next service without a per-repo PR. Nothing in
+#    the `python` job below is a copy of kit's file.
+# 2. The service-specific half is here, and it is the half that decides whether
+#    a green badge means anything. Three of muse's tests are gated on
+#    `MUSE_CORE_SCHEMAS` pointing at a core checkout, because they are the three
+#    that catch cross-repo drift with core — core-03 changed billing payload
+#    schemas, core-04 added seven telemetry schemas underneath them, and core-05
+#    closed `error.type` into an enum that muse now vendors and compiles against.
+#    A caller
+#    cannot inject `env:` into a called reusable workflow, so kit's python job
+#    runs those three as SKIPPED: 776 passed, 3 skipped, exit 0. That is the shape
+#    this file exists to make impossible. The `gate` job runs the same gate with
+#    the tier forced on and fails if anything at all skipped.
+#
+# Read the job names as the claims this workflow makes. A reader who sees
+# `python (kit)`, `gate + core parity` and `pins` all green knows three different
+# things, which is the point: one green tick over three unnamed steps is one
+# green tick over an unknown amount of work.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The core revision the two cross-repo drift guards run against.
+  #
+  # A full SHA, not `master`, for the same reason the runtime is a full version
+  # and not "whatever 3.1x the runner had cached": a parity test that is green
+  # against an unpinned core is a statement about a revision nobody chose. The
+  # cost is that a change in core does not reach muse on its own, so bumping
+  # this is a deliberate one-line act in a PR that says which core release it
+  # is chasing. Bump it with:
+  #   gh api repos/cafaye/core/commits/master --jq .sha
+  # core master as of 2026-09-30 (core-05, "error.type is a closed 13-value
+  # vocabulary"). Bumped by muse-05: muse now vendors core's traces schema and
+  # asserts it is byte-identical, and at the previous pin (ad086fb, core-04) that
+  # file still carried the `pattern` rather than the `enum`, so the guard would go
+  # red in this job on merge — correctly, and for a pin rather than for code.
+  CORE_REF: 15e541cd9988fbb4cec34a11aab0d793d78e2e33
+
+jobs:
+  # -------------------------------------------------------------- shared half
+  python:
+    name: python (kit)
+    # The `uses:` is the whole job. `.github/workflows/` in that path is not
+    # decoration: GitHub resolves a reusable workflow at
+    # `{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
+    # subdirectories of the workflows directory are not supported. kit-02
+    # shipped the file at `workflows/ci.reusable.yml`, so this line resolved to
+    # nothing; kit-04 moves it. A `uses:` that does not resolve is a red build on
+    # the first push, which is why the path is written out rather than aliased.
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
+    with:
+      language: python
+      working-dir: .
+      # Pinned from this repo's own `[tools]` pin — `mise.toml` says
+      # python = "3.14" and `.python-version` says 3.14 — because kit's default
+      # is 3.13 and this repo's `requires-python` is >=3.14. Written as a literal
+      # because GitHub does not expose the `env` context to a reusable workflow
+      # call's `with:`; the `pins` job below fails the build if this string and
+      # `.python-version` ever disagree, so the duplication cannot rot.
+      versions: '{"python":"3.14"}'
+      # Not decorative and not aspirational: `pyproject.toml` already fails the
+      # suite below 100 (`--cov-fail-under=100`), and a threshold left at kit's
+      # `0` default would be a gate that can never fail.
+      coverage-fail-under: '100'
+      # `false` on purpose, and the reason is worth stating because "we
+      # propagate traces" is exactly the kind of claim that should be a red
+      # build. kit's telemetry job runs a *language matrix* of the W3C
+      # conformance suite copied from `templates/otel/<lang>/`, and falls back to
+      # kit's own copy of the suite when the repo has not adopted that template.
+      # muse did not adopt the template — `src/muse/telemetry.py` implements
+      # propagation for muse's own spans, and `tests/test_trace_propagation.py`
+      # is its 14-test contract module, including the fleet's canary redaction
+      # pattern. Turning the input on would run six stdlib suites for languages
+      # muse does not contain, against code that is not in this repository, and
+      # produce a green tick that says nothing about muse at all. That is a
+      # worse outcome than not turning it on, because it would be read as
+      # coverage. What actually covers propagation here is the python job and
+      # the gate job, both of which execute that module on every push.
+      telemetry: 'false'
+
+  # ---------------------------------------------------------- service half
+  gate:
+    name: gate + core parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: check out core's schemas
+        # Cross-repository, and therefore deliberately outside the worktree: the
+        # lockfile guard below is a `git diff`, and a second checkout inside the
+        # repository would put a foreign tree in the way of that assertion (and
+        # inside `ruff`'s scan path). `$RUNNER_TEMP/core` keeps the repository
+        # exactly as muse shipped it.
+        #
+        # `schemas` only, sparse. Both gated tests read files under
+        # `core/schemas/`, and `test_openapi.py` locates core by walking *up* to
+        # the directory that contains `schemas/`, so the checkout must keep that
+        # shape: MUSE_CORE_SCHEMAS is `<checkout>/schemas` and its parent is the
+        # core root.
+        #
+        # No `token:`. cafaye/core is public, so the default GITHUB_TOKEN reads
+        # it. If core ever becomes private this step fails loudly on the auth
+        # error, which is the correct outcome — never a silent skip of the tier
+        # that exists to catch drift.
+        uses: actions/checkout@v7
+        with:
+          repository: cafaye/core
+          ref: ${{ env.CORE_REF }}
+          path: ${{ runner.temp }}/core
+          sparse-checkout: schemas
+          persist-credentials: false
+
+      # The same setup action, the same version default, and the same working
+      # directory kit's python job uses, so the two paths cannot drift apart.
+      # uv is pinned to the version in `mise.toml` here because kit's shared job
+      # exposes no input for it; the action ref is pinned to an exact tag for the
+      # same reason kit pins astral-sh refs exactly.
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          working-directory: .
+          version: '0.12.20'
+          enable-cache: true
+      - uses: actions/setup-python@v7
+        with:
+          # From the repository's own pin file rather than a second literal, so
+          # the interpreter CI runs is the interpreter the repo declares.
+          python-version-file: .python-version
+
+      - name: the gate, with the core tier forced on
+        # `bin/prime`, not a CI-only variant of it. The same command a developer
+        # runs, which is the only way the two can be known to agree: a gate that
+        # exists in CI and nowhere else is a second gate, and a second gate is a
+        # second thing to keep true. `bin/prime` is `uv sync --locked` + ruff +
+        # `uv run --locked pytest`, and this is the run that asserts the lockfile
+        # did not move.
+        #
+        # `-q -rs` so the log carries pytest's own skip report; the next step
+        # reads it. `tee` keeps the whole log, and `pipefail` (from `shell: bash`)
+        # keeps a red suite red through the pipe.
+        shell: bash
+        env:
+          MUSE_CORE_SCHEMAS: ${{ runner.temp }}/core/schemas
+        run: |
+          set -euo pipefail
+          bin/prime -q -rs 2>&1 | tee "$RUNNER_TEMP/prime.log"
+
+      - name: no test may skip
+        # The load-bearing check in this file.
+        #
+        # With `MUSE_CORE_SCHEMAS` unset the gate is green and reports
+        # `776 passed, 3 skipped`; with it set it reports `779 passed` and no
+        # skips. The difference is the only thing in this repository that catches
+        # muse's copies of core's specs drifting, so a skip in CI is a claim
+        # that has quietly stopped being checked. PLAN §3 is explicit that a
+        # skipped test proves nothing, and a green badge is a claim.
+        #
+        # Blanket rather than "the two known tests must not skip", on purpose: a
+        # per-test allowlist is a list that grows, and the day a third tier is
+        # added nobody edits the list. Any skip at all is a red build, and the
+        # message says why.
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/prime.log"
+          if [ ! -s "$log" ]; then
+            echo "::error::no gate log at $log. The skip guard read nothing, which is not a pass." >&2
+            exit 1
+          fi
+          if grep -nE '^(SKIPPED )|[0-9]+ skipped' "$log"; then
+            echo "::error::a test skipped in CI. MUSE_CORE_SCHEMAS is set in this job," >&2
+            echo "  so a skip means a tier nobody can see ran nothing." >&2
+            exit 1
+          fi
+          echo "::notice::$(tail -1 "$log")"
+
+      - name: uv.lock did not move
+        # The gate must leave the lockfile byte-identical. `bin/prime` uses
+        # `--locked` on every `uv sync` *and* every `uv run`, because `uv run`
+        # re-resolves by default and one bare `uv run` undoes a guarded sync —
+        # muse-03b's green-over-an-uncommitted-lock defect. This is the assertion
+        # that would have caught it, and it is cheap.
+        #
+        # Note the gap it does not cover: kit's shared python job installs with
+        # `uv sync --frozen` and then runs a bare `uv run pytest`, so that job
+        # can still rewrite `uv.lock` on a runner whose checkout is then thrown
+        # away unexamined. kit owns that step and muse cannot reach inside it;
+        # the fix belongs in kit (see the muse-04 report). What muse can do is
+        # own the assertion on the run that is its actual gate.
+        run: git diff --exit-code -- uv.lock
+
+      - name: the parity guard can go red
+        # A gate nobody has watched fail is a gate nobody knows is a gate — the
+        # "0 passed, 0 failed, 14 ignored" shape, one level up. So the drift
+        # guard is proved able to fail here, on a throwaway copy of core's
+        # schemas, in the same job and on the same venv so it costs one test
+        # rather than another sync.
+        #
+        # The mutation is a plausible wrong pattern rather than a broken file: it
+        # still matches real event types, so the only thing that can catch it is
+        # the equality assertion this test exists to make. And the failure has to
+        # be an AssertionError on that comparison — a proof that went red for an
+        # incidental reason (a malformed JSON file, or the coverage gate firing
+        # on a single-test run) is not a proof, hence `--no-cov` and the two
+        # greps.
+        shell: bash
+        run: |
+          set -euo pipefail
+          broken="$RUNNER_TEMP/core-mutated"
+          mkdir -p "$broken"
+          cp -R "$RUNNER_TEMP/core/schemas" "$broken/schemas"
+          python3 - "$broken/schemas/event-envelope.schema.json" <<'PY'
+          import json
+          import sys
+
+          path = sys.argv[1]
+          with open(path, encoding="utf-8") as handle:
+              schema = json.load(handle)
+          schema["$defs"]["eventType"]["pattern"] = "^muse\\.[a-z0-9_]+\\.[a-z0-9_.]+$"
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(schema, handle, indent=2)
+          PY
+          if MUSE_CORE_SCHEMAS="$broken/schemas" uv run --locked pytest \
+            -p no:cacheprovider --no-cov -q -rf \
+            tests/test_contracts.py::test_patterns_are_byte_identical_to_core \
+            > "$RUNNER_TEMP/mutation.log" 2>&1; then
+            echo "::error::the parity guard passed against mutated core schemas, so it is not a guard." >&2
+            exit 1
+          fi
+          for needle in AssertionError eventType; do
+            if ! grep -q "$needle" "$RUNNER_TEMP/mutation.log"; then
+              echo "::error::the parity test went red, but not on the comparison it exists to make (no '$needle')." >&2
+              cat "$RUNNER_TEMP/mutation.log" >&2
+              exit 1
+            fi
+          done
+          grep -E '^(E  |FAILED)' "$RUNNER_TEMP/mutation.log" | head -8 || true
+          echo "::notice::the core-parity guard fails on drift, as it must."
+
+  # ------------------------------------------------------------------- pins
+  pins:
+    name: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      # The pinned interpreter, read from the repository's own file, so this job
+      # is held to the same pin it is checking. Cheap: no sync, no suite.
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - name: every pin in this file is the pin the repository declares
+        # kit's `versions:` input cannot read a file — GitHub exposes neither the
+        # `env` nor a `file` context to a reusable workflow call's `with:` — so
+        # this repository's runtime pin is written twice, and so is uv's. That is
+        # duplication, and duplication without a check is drift: a
+        # `.python-version` bump that missed the `versions:` line would run 765
+        # tests on an interpreter the repository does not claim, and pass.
+        #
+        # Three files, one number. `.python-version` and `mise.toml`'s `[tools]`
+        # are the repository's declaration — AGENTS.md already says they are
+        # bumped together, and this is that instruction as a build failure rather
+        # than as a sentence nobody reads. The `versions:` line is the copy CI
+        # hands kit.
+        #
+        # Its own job rather than a step in `gate` because it needs no toolchain
+        # and no sync: it fails in seconds, and a red tick that says `pins` names
+        # the claim that broke instead of burying a config error under a
+        # 779-test run.
+        #
+        # A guard that cannot find its target is not a guard, so an unmatched
+        # line is an error, not a pass. The first version of this check had a
+        # regex that could not span the quotes inside `'{"python":"3.14"}'`; it
+        # reported "matched nothing" rather than quietly agreeing, which is the
+        # only reason the bug was found before a merge.
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          workflow = pathlib.Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+          version_file = pathlib.Path(".python-version").read_text(encoding="utf-8").strip()
+          tools = tomllib.loads(pathlib.Path("mise.toml").read_text(encoding="utf-8"))["tools"]
+
+          def fail(message):
+              sys.exit(f"::error::{message}")
+
+          def pinned(key):
+              """Every `key: '...'` value in the workflow, as a list.
+
+              Anchored to the whole line and single-quoted on purpose: the input
+              is written that way, and a reformatting that stops matching should
+              be a loud failure, not a guard that has quietly stopped guarding.
+              """
+              found = re.findall(rf"^\s*{key}:\s*'([^']*)'\s*$", workflow, re.MULTILINE)
+              if not found:
+                  fail(f"no {key}: '...' line in this workflow; the pin guard matched nothing.")
+              return found
+
+          kit = {json.loads(v).get("python", "") for v in pinned("versions")}
+          if kit != {version_file}:
+              fail(f"versions: pins python to {sorted(kit)}; .python-version says {version_file!r}.")
+          if tools["python"] != version_file:
+              fail(f".python-version says {version_file!r}; mise.toml says {tools['python']!r}.")
+          uv = pinned("version")
+          if uv != [tools["uv"]]:
+              fail(f"setup-uv installs uv {uv}; mise.toml pins {tools['uv']!r}.")
+          print(
+              f"::notice::python {version_file} and uv {tools['uv']} agree across "
+              ".python-version, mise.toml and this workflow."
+          )
+          PY
