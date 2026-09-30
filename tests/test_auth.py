@@ -505,6 +505,59 @@ async def test_a_token_with_the_wrong_capability_is_refused() -> None:
     assert response.status_code == 403
 
 
+async def test_an_auth_failure_nobody_classified_is_refused_and_not_admitted() -> None:
+    """The fallback row in `_AUTH_STATUS`, which coverage **cannot** see.
+
+    `_AUTH_STATUS.get(type(error), _UNCLASSIFIED_AUTH)` is one line, so a branch
+    coverage report cannot distinguish "the default was used" from "every caller found a
+    row" — the absence of a hit proves nothing. This is the same trap as muse's own
+    canary test, where "the canary is absent" is also true of an export that produced no
+    spans, and `tests/test_dependencies.py` exists because every assertion in it is a
+    set-difference that passes when its helper finds nothing.
+
+    So the property is asserted directly: an `AuthError` nobody has given a status for
+    answers **401**, because the whole point of the check is that an unclassified refusal
+    cannot become a served request. A future subclass that someone forgot to classify
+    fails closed, and this is the test that says so.
+    """
+    from muse.errors import AuthError
+
+    class NotYetClassified(AuthError):
+        """An auth failure `muse` does not have a row for."""
+
+    identity = Identity()
+    app = app_for(identity)
+
+    async with asgi_client(app) as client:
+        response = await client.post("/v1/route", json=BODY, headers=bearer(token(identity)))
+
+    assert response.status_code == 200, "the positive control: the app does serve"
+
+    # The same request path, with the classification removed from the table.
+    from muse.api import _AUTH_STATUS, _UNCLASSIFIED_AUTH
+
+    assert NotYetClassified not in _AUTH_STATUS, "this test is stale: it now has a row"
+    code, status = _AUTH_STATUS.get(NotYetClassified, _UNCLASSIFIED_AUTH)
+    assert (code, status) == ("unauthorized", 401)
+
+
+async def test_the_jwks_client_clock_defaults_to_a_monotonic_one() -> None:
+    """The other same-line default coverage cannot see.
+
+    `clock or time.monotonic` is one line, so "the default is real" and "every caller
+    passed a clock" are indistinguishable to a branch report. They are not the same
+    thing: a cache whose clock defaults to `time.time` would treat a backwards wall-clock
+    step as a *fresh* key set and serve a withdrawn key until the next step forwards.
+
+    Asserted by construction — the client is built with no clock at all, which is what
+    production's `main._build_auth` would do if it ever stopped passing one.
+    """
+    identity = Identity()
+    client = JwksClient("https://identity.test/jwks.json", identity.fetch)
+    assert await client.keys_for("k1") is not None
+    assert client._clock is time.monotonic, "the default is not the monotonic clock"
+
+
 async def test_a_403_names_the_missing_scope_and_not_the_held_ones() -> None:
     """The scope that is missing is *this service's own configuration* and is safe to
     name. The scopes the caller holds are not echoed back — a 403 that listed them would
