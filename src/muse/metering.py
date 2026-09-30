@@ -17,11 +17,20 @@ decisions are worth stating, and each has a test that would fail if it changed:
   and lose the spend, which is the exact failure this module exists to prevent. So the
   error propagates: the caller sees a 503, support sees an alert, and the tokens are a
   known loss rather than an invisible one.
-- **The subject is core's reserved `platform` literal.** A routed call belongs to one
-  request, and muse does not know the account in v1 — the auth stub does not read a
-  token. core requires `subject`, and the reserved literal says "no single entity yet"
-  rather than inventing an id that means nothing. This is a placeholder, and the
-  catalog row and the test both say so.
+- **The subject is core's reserved `platform` literal — and muse now knows better.**
+  Since muse-06 the verified token carries an `account_id`, so the account this
+  completion belongs to *is* known at the point the event is built. It is still not
+  written, and that is deliberate rather than an oversight: core owns
+  `schemas/events/muse/tokens/consumed.schema.json`, which closes `data` at exactly
+  five fields and documents `subject: platform` as the state until D9. Putting the
+  account on the envelope from a service would be a service publishing a contract core
+  has not agreed to, and `billing` aggregates against the shape core published.
+
+  So the gap is real and named: **every served completion is metered without the
+  tenant it was spent by.** A consumer cannot attribute this spend to a customer from
+  the event alone. The fix is a core change — D9, plus `account_id` in the payload
+  schema — and it is recorded there and in this packet's report rather than driven
+  through here. Changing the envelope is not this packet's decision to make.
 """
 
 from __future__ import annotations
@@ -42,8 +51,13 @@ from muse.router import RoutedCompletion
 #: from the one the event claims.
 _RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
-#: The subject for a token-consumption event while the account is unknown. core's
-#: reserved literal for an event with no single entity.
+#: The subject for a token-consumption event while core's payload schema still says so.
+#: core's reserved literal for an event with no single entity.
+#:
+#: muse *knows* the account since muse-06 — `require_bearer` refuses a token without
+#: one — and still cannot put it here. See the module docstring: core owns the payload
+#: schema, it closes `data` at five fields, and a service publishing an account on the
+#: envelope would be publishing a contract core has not agreed to.
 SUBJECT = "platform"
 
 _INSERT = """

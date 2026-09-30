@@ -15,10 +15,12 @@ the only record that a token was ever spent. So the properties that matter are:
   from a price table that may have moved since the call was priced.
 - **Every completion produces exactly one event.** Zero is unbilled spend; two is
   double-billing. Both are asserted.
-- **The subject is the call, not the account.** A routed call belongs to one request,
-  and `muse` does not know the account in v1 — the auth stub does not read a token.
-  `platform` is core's reserved literal for an event with no single entity, and using
-  it keeps the envelope honest about what is not yet known.
+- **The subject is the call, not the account — and the account *is* known.** Since
+  muse-06 the verified token carries an `account_id`, so muse learns the tenant on every
+  request. The event still says `platform`, because core owns the payload schema and it
+  closes `data` at exactly five fields. So every served completion is metered without
+  the tenant it was spent by. That is a real gap, recorded rather than quietly fixed,
+  and the test below asserts it precisely so it cannot be forgotten.
 """
 
 from __future__ import annotations
@@ -177,15 +179,24 @@ def test_the_envelope_time_is_the_time_it_was_given() -> None:
     assert event.time == "2026-01-02T03:04:05Z"
 
 
-def test_the_envelope_subject_is_cores_reserved_literal() -> None:
-    """`platform`, because a token consumption is about the call and muse does not
-    know the account in v1.
+def test_the_envelope_subject_is_cores_reserved_literal_even_though_the_account_is_known() -> None:
+    """**A recorded gap, asserted so it cannot be forgotten.**
 
-    This is a deliberate placeholder, not an oversight: core requires `subject`, and
-    using the reserved literal says "no single entity yet" rather than inventing an id
-    that means nothing. It is a required field with a reserved value, not an absent
-    one. When the auth contract lands and the account is known, this becomes the
-    account id and the catalog row says so.
+    Since muse-06 the verified token carries an `account_id` and `require_bearer`
+    refuses a token without one — so the account is known at the moment this envelope
+    is built. It is still not written, and this test is here to make that a *decision
+    someone made* rather than an oversight: core owns
+    `schemas/events/muse/tokens/consumed.schema.json`, which closes `data` at exactly
+    five fields and documents `subject: platform` as the state until D9.
+
+    The consequence, stated plainly: **every served completion is metered without the
+    tenant it was spent by**, so `billing` cannot attribute this spend to a customer
+    from the event alone. Fixing it is a core change — D9 plus `account_id` in the
+    payload schema — not a service-side edit, and driving it through here would publish
+    an envelope core has not agreed to.
+
+    When core does change it, this test is what should fail: it names the exact change
+    that is being waited on.
     """
     assert envelope_for(routed(), now="2026-09-30T04:19:00Z").subject == "platform"
 
@@ -259,6 +270,55 @@ async def test_the_row_carries_the_envelope_fields() -> None:
     assert row["source"] == SERVICE_NAME
     assert row["subject"] == "platform"
     assert UUID.match(row["id"])
+
+
+async def test_a_verified_tenant_is_still_absent_from_the_event() -> None:
+    """The gap, end to end, through a real authenticated request.
+
+    A token carrying a real `account_id` is verified, the call is served, the money is
+    spent — and the emitted event cannot say whose it was. Every assertion here is one
+    a reader would want to be true and is not:
+
+    * the request **succeeded**, so this is not a refusal being mistaken for a gap;
+    * the token **did** carry a tenant, so muse is not failing to learn it;
+    * the event **does** not carry it, so `billing` cannot attribute the spend.
+
+    This is a core change (D9, plus `account_id` in the payload schema) and not a
+    service-side edit. Asserting it is how the gap stays visible until it is closed.
+    """
+    from muse.providers import Price, ProviderRegistry
+    from muse.providers.fake import FakeProvider
+    from muse.routes import routes_from_yaml
+
+    from .conftest import asgi_client
+    from .support.jwks import ACCOUNT, Identity, token
+    from .support.test_app import auth_for, build_test_app
+
+    identity = Identity()
+    database = FakeDatabase()
+    app = build_test_app(
+        registry=ProviderRegistry().register(FakeProvider(name="openai", price=Price(1, 1))),
+        database=database,
+        table=routes_from_yaml(
+            "version: 1\nroutes:\n  - model: fast\n    candidates:\n      - provider: openai\n"
+        ),
+        auth=auth_for(identity),
+    )
+
+    async with asgi_client(app) as client:
+        response = await client.post(
+            "/v1/route",
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": f"Bearer {token(identity, account_id=ACCOUNT)}"},
+        )
+
+    assert response.status_code == 200, "the gap only counts if the call was served"
+    assert len(database.outbox) == 1
+
+    row = database.outbox[0]
+    assert row["subject"] == "platform"
+    assert ACCOUNT not in json.dumps(row), "the tenant is on the row, so this test is stale"
+    assert "account" not in row["data"].lower()
 
 
 async def test_the_row_stores_the_payload_as_json() -> None:
