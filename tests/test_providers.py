@@ -508,11 +508,14 @@ async def test_a_static_resolver_raises_for_an_unconfigured_provider() -> None:
         await StaticCredentials({}).credential_for(OPENAI)
 
 
-async def test_a_static_resolver_rejects_an_empty_key() -> None:
-    """An empty key in an env file is a real deploy mistake, and forwarding it to a
-    provider produces a 401 that reads like a *wrong* key rather than a missing one."""
+@pytest.mark.parametrize("empty", ["", Secret("")], ids=["bare-string", "secret"])
+async def test_a_static_resolver_rejects_an_empty_key(empty) -> None:
+    """Both spellings, because both are reachable: an env file yields a bare string
+    and a vault yields a `Secret`. An empty key in configuration is a real deploy
+    mistake, and forwarding it produces a 401 that reads like a *wrong* key rather
+    than a missing one."""
     with pytest.raises(CredentialUnavailable, match="is empty"):
-        await StaticCredentials({OPENAI: Secret("")}).credential_for(OPENAI)
+        await StaticCredentials({OPENAI: empty}).credential_for(OPENAI)
 
 
 # --- the litellm adapter: pricing -----------------------------------------

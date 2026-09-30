@@ -40,10 +40,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from muse.errors import (
     AllCandidatesFailed,
     MuseError,
-    RouteNotFound,
     RouteConfigError,
+    RouteNotFound,
 )
-from muse.redaction import Secret
 
 #: core's error type URIs. Stable, machine-readable, and the last segment is the same
 #: slug as `code`.
@@ -70,6 +69,7 @@ TITLES = {
 TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 TRACE_HEADER = "X-Trace-Id"
+
 
 #: The request body. `extra="forbid"` because core closes request bodies like it
 #: closes schemas: a typo'd `max_token` that is silently ignored leaves a caller
@@ -108,7 +108,12 @@ class Problem(BaseModel):
 
 
 def problem(
-    request: Request, code: str, status: int, detail: str, *, fields: list[dict[str, str]] | None = None
+    request: Request,
+    code: str,
+    status: int,
+    detail: str,
+    *,
+    fields: list[dict[str, str]] | None = None,
 ) -> JSONResponse:
     """A `problem+json` response.
 
@@ -228,7 +233,9 @@ def build_router() -> APIRouter:
         try:
             body = RouteRequestBody.model_validate(await request.json())
         except ValidationError as error:
-            return problem(request, "validation_failed", 422, _describe(error), fields=_fields(error))
+            return problem(
+                request, "validation_failed", 422, _describe(error), fields=_fields(error)
+            )
         except ValueError:
             return problem(request, "validation_failed", 422, "the request body is not valid JSON")
 

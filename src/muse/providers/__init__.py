@@ -39,6 +39,17 @@ from muse.errors import (
 )
 from muse.redaction import Secret, redact
 
+#: The credentials surface, re-exported. Defined in `muse.providers.credentials` and
+#: named here so a caller that only wants to hand a provider a dict of keys does not
+#: have to know which module the protocol lives in. Re-exported rather than redefined:
+#: a second copy of either class is a second thing for a test to cover and production
+#: never calls.
+from muse.providers.credentials import (
+    CredentialResolver,
+    StaticCredentials,
+    VaultCredentials,
+)
+
 #: The roles a message may have. OpenAI's set, which is a superset of what the
 #: other vendors need; the adapter maps them if a vendor disagrees.
 ROLES = ("system", "user", "assistant")
@@ -278,52 +289,6 @@ class ProviderRegistry:
         return tuple(sorted(self._providers))
 
 
-@runtime_checkable
-class CredentialResolver(Protocol):
-    """Where a provider's API key comes from.
-
-    Defined in `muse.providers.credentials` and re-exported here, because a caller that
-    only wants to hand a provider a dict of keys should not have to know which module
-    the protocol lives in.
-    """
-
-    async def credential_for(self, provider: str) -> Secret:
-        """The key for `provider`, or raise `CredentialUnavailable`.
-
-        Async because the production implementation reads the vault. A sync interface
-        would force that read onto a thread, or force a cache, and both are worse than
-        awaiting.
-        """
-        ...
-
-
-class StaticCredentials:
-    """Keys from a mapping. For configuration files and tests.
-
-    The production resolver is the vault; this exists so a route can be exercised
-    without a database, and so the interface the router depends on is stated
-    explicitly rather than implied by the vault's own signature.
-    """
-
-    def __init__(self, keys: dict[str, Secret | str]) -> None:
-        self._keys = dict(keys)
-
-    async def credential_for(self, provider: str) -> Secret:
-        try:
-            secret = self._keys[provider]
-        except KeyError:
-            raise CredentialUnavailable(
-                f"no credential is configured for provider {provider!r}"
-            ) from None
-        secret = secret if isinstance(secret, Secret) else Secret(secret)
-        if not secret:
-            # An empty key in an env file is a real deploy mistake, and forwarding it
-            # to a provider produces a 401 that reads like a *wrong* key rather than a
-            # missing one.
-            raise CredentialUnavailable(f"the credential for provider {provider!r} is empty")
-        return secret
-
-
 class LiteLLMProvider:
     """openai and anthropic through litellm's Python API.
 
@@ -375,11 +340,16 @@ class LiteLLMProvider:
         """
         if self._static_key is not None:
             return self._static_key
-        if self._credentials is None:
-            return None
+        # No `if self._credentials is None` guard: the constructor refuses a provider
+        # with neither a key nor a resolver, so a resolver is always present here and a
+        # guard for it would be a branch nothing can reach.
         try:
             return await self._credentials.credential_for(self.name)
         except CredentialUnavailable:
+            # "No key for this vendor" is a state, not an error, as far as the adapter
+            # is concerned: `complete` and `health` each turn it into the error their
+            # caller needs, and a provider that cannot serve a request should not
+            # raise on the way to saying so.
             return None
 
     @property

@@ -24,22 +24,22 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 
-from muse.api import TRACE_HEADER, new_trace_id, problem, register_error_handlers, build_router
+from muse.api import TRACE_HEADER, build_router, new_trace_id, register_error_handlers
 from muse.db import Database, PsycopgDatabase
 from muse.metering import Meter
 from muse.providers import LiteLLMProvider, ProviderRegistry
 from muse.providers.credentials import CredentialResolver, VaultCredentials
 from muse.redaction import Secret
-from muse.routes import RouteTable, routes_from_yaml
 from muse.router import Router
-from muse.vault import VAULT_KEY_ENV, Vault, load_vault_key
+from muse.routes import RouteTable, routes_from_yaml
+from muse.vault import Vault, load_vault_key
 
 APP_TITLE = "muse"
 APP_VERSION = "0.2.0"
@@ -150,9 +150,14 @@ async def build_container(settings: Settings) -> Container:
             max_size=settings.pool_max_size,
         )
         if settings.database_url
-        else _UnavailableDatabase(settings)
+        else _UnavailableDatabase()
     )
     vault = Vault(database, key)
+    # One resolver, shared by the adapters and by `Container.credentials`. Building the
+    # adapters against a *different* vault — even one that is otherwise equivalent — is
+    # how a container ends up validating its routes file against one registry and
+    # serving requests through another, and the only symptom is a 503 on every call
+    # from a service that booted cleanly.
     credentials = VaultCredentials(vault)
     registry = ProviderRegistry()
     for vendor in VENDORS:
@@ -177,6 +182,9 @@ class _UnavailableDatabase:
     running the service to poke at the probes should not have to stand up postgres
     first, and a container that silently had no database would be a service that
     answers `/readyz: ok` and then 500s on its first real request.
+
+    Takes no arguments. It has nothing to configure — the absence of a database *is*
+    its configuration — and an argument it never reads would be a lie about its shape.
     """
 
     async def execute(self, sql: str, params: object = ()) -> None:
@@ -189,9 +197,7 @@ class _UnavailableDatabase:
         raise RuntimeError("no MUSE_DATABASE_URL is configured, so there is nothing to transact")
 
 
-def create_app(
-    settings: Settings | None = None, container: Container | None = None
-) -> FastAPI:
+def create_app(settings: Settings | None = None, container: Container | None = None) -> FastAPI:
     """Build a muse application.
 
     Returns a new instance on every call — callers own it, nothing is shared. Pass
@@ -252,11 +258,10 @@ def create_app(
             return Readiness(status="degraded", checks=ReadinessChecks(db="error"))
         try:
             await state.database.fetchone("select 1 as ok")
-        except Exception:  # noqa: BLE001 - a probe reports, it does not raise
+        except Exception:
             return Readiness(status="degraded", checks=ReadinessChecks(db="error"))
         return Readiness(status="ok", checks=ReadinessChecks(db="ok"))
 
     app.include_router(build_router())
     register_error_handlers(app)
     return app
-

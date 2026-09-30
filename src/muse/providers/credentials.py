@@ -69,15 +69,13 @@ class VaultCredentials:
     deploy to rotate — which is the failure this whole module exists to prevent.
     """
 
-    def __init__(self, vault) -> None:  # noqa: ANN001 - Vault, avoiding an import cycle
+    def __init__(self, vault) -> None:
         self._vault = vault
 
     async def credential_for(self, provider: str) -> Secret:
         secret = await self._vault.get(provider)
         if secret is None:
-            raise CredentialUnavailable(
-                f"no credential is stored for provider {provider!r}"
-            )
+            raise CredentialUnavailable(f"no credential is stored for provider {provider!r}")
         return secret
 
     def __repr__(self) -> str:

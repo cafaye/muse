@@ -25,15 +25,11 @@ from __future__ import annotations
 
 import pytest
 
-from muse.errors import AllCandidatesFailed, RouteNotFound
-from muse.metering import Meter
-from muse.providers import Price
+from muse.providers import Price, ProviderRegistry
+from muse.providers.credentials import StaticCredentials
 from muse.providers.fake import ScriptedProvider
 from muse.redaction import Secret
-from muse.providers import ProviderRegistry
-from muse.providers.credentials import StaticCredentials
-from muse.routes import RouteTable, RetryPolicy, Candidate, Route, routes_from_yaml
-from muse.router import Router
+from muse.routes import routes_from_yaml
 
 from .conftest import AUTH_HEADERS, asgi_client, write_routes
 from .support.fake_database import FakeDatabase
@@ -81,9 +77,7 @@ def app_for(*providers, database: FakeDatabase | None = None, **route_fields):
                     "routes": [
                         {
                             "model": "fast",
-                            "candidates": [
-                                {"provider": p.name, "model": MODEL} for p in providers
-                            ],
+                            "candidates": [{"provider": p.name, "model": MODEL} for p in providers],
                             **route_fields,
                         }
                     ],
@@ -137,7 +131,11 @@ async def test_the_choice_carries_the_content_and_the_finish_reason() -> None:
         body = (await client.post("/v1/route", json=BODY, headers=AUTH_HEADERS)).json()
 
     assert body["choices"] == [
-        {"index": 0, "message": {"role": "assistant", "content": "hello there"}, "finish_reason": "stop"}
+        {
+            "index": 0,
+            "message": {"role": "assistant", "content": "hello there"},
+            "finish_reason": "stop",
+        }
     ]
 
 
@@ -366,7 +364,8 @@ async def test_an_empty_message_list_is_a_validation_failure() -> None:
 async def test_a_missing_model_field_is_a_validation_failure() -> None:
     async with asgi_client(app_for(serving())) as client:
         response = await client.post(
-            "/v1/route", json={"messages": [{"role": "user", "content": "hi"}]},
+            "/v1/route",
+            json={"messages": [{"role": "user", "content": "hi"}]},
             headers=AUTH_HEADERS,
         )
     assert response.status_code == 422
@@ -385,7 +384,7 @@ async def test_every_candidate_failing_is_unavailable() -> None:
 
 
 async def test_the_unavailable_detail_names_the_providers_that_were_tried() -> None:
-    """"it failed" is not actionable. "openai timed out" is the first line of the
+    """ "it failed" is not actionable. "openai timed out" is the first line of the
     investigation, and the router already knows it."""
     from muse.errors import ProviderTimeout
 
