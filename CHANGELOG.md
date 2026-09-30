@@ -33,6 +33,16 @@ conventional-compat (0.x, so anything may change while pre-1.0).
     publisher's claim query needs.
   - `migrations/00002_vault_secrets.sql` — one encrypted key per provider. No
     plaintext column, by design.
+  - `muse/providers/` — the `Provider` protocol (`complete`, `health`,
+    `cost_per_1k_tokens`), a registry that refuses to register a name twice, the
+    LiteLLM adapter for openai and anthropic, and `FakeProvider` /
+    `ScriptedProvider`. Prices are integer micro-dollars per 1k tokens; the single
+    place a float touches money is the adapter's conversion from litellm's
+    per-token table, which rounds up so a sub-micro price is never zero.
+    The adapter scrubs the credential out of provider error text and health
+    details, and maps litellm's exception taxonomy onto muse's — with
+    `ContextWindowExceededError` checked before `BadRequestError`, which it
+    subclasses upstream.
 
 ## [0.1.0] — 2026-09-30
 
