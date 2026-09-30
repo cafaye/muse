@@ -9,12 +9,14 @@
 #    lands once and reaches the next service without a per-repo PR. Nothing in
 #    the `python` job below is a copy of kit's file.
 # 2. The service-specific half is here, and it is the half that decides whether
-#    a green badge means anything. Two of muse's tests are gated on
-#    `MUSE_CORE_SCHEMAS` pointing at a core checkout, because they are the two
-#    that catch cross-repo drift with core — and core-03 changed billing payload
-#    schemas and core-04 added seven telemetry schemas underneath them. A caller
+#    a green badge means anything. Three of muse's tests are gated on
+#    `MUSE_CORE_SCHEMAS` pointing at a core checkout, because they are the three
+#    that catch cross-repo drift with core — core-03 changed billing payload
+#    schemas, core-04 added seven telemetry schemas underneath them, and core-05
+#    closed `error.type` into an enum that muse now vendors and compiles against.
+#    A caller
 #    cannot inject `env:` into a called reusable workflow, so kit's python job
-#    runs those two as SKIPPED: 763 passed, 2 skipped, exit 0. That is the shape
+#    runs those three as SKIPPED: 776 passed, 3 skipped, exit 0. That is the shape
 #    this file exists to make impossible. The `gate` job runs the same gate with
 #    the tier forced on and fails if anything at all skipped.
 #
@@ -47,8 +49,12 @@ env:
   # this is a deliberate one-line act in a PR that says which core release it
   # is chasing. Bump it with:
   #   gh api repos/cafaye/core/commits/master --jq .sha
-  # core master as of 2026-09-30 (core-04, "the observability spec").
-  CORE_REF: ad086fba8fe132b7406a9d77ab063e3d642cc14b
+  # core master as of 2026-09-30 (core-05, "error.type is a closed 13-value
+  # vocabulary"). Bumped by muse-05: muse now vendors core's traces schema and
+  # asserts it is byte-identical, and at the previous pin (ad086fb, core-04) that
+  # file still carried the `pattern` rather than the `enum`, so the guard would go
+  # red in this job on merge — correctly, and for a pin rather than for code.
+  CORE_REF: 15e541cd9988fbb4cec34a11aab0d793d78e2e33
 
 jobs:
   # -------------------------------------------------------------- shared half
@@ -163,9 +169,9 @@ jobs:
         # The load-bearing check in this file.
         #
         # With `MUSE_CORE_SCHEMAS` unset the gate is green and reports
-        # `763 passed, 2 skipped`; with it set it reports `765 passed` and no
+        # `776 passed, 3 skipped`; with it set it reports `779 passed` and no
         # skips. The difference is the only thing in this repository that catches
-        # muse's copy of core's patterns drifting, so a skip in CI is a claim
+        # muse's copies of core's specs drifting, so a skip in CI is a claim
         # that has quietly stopped being checked. PLAN §3 is explicit that a
         # skipped test proves nothing, and a green badge is a claim.
         #
@@ -280,7 +286,7 @@ jobs:
         # Its own job rather than a step in `gate` because it needs no toolchain
         # and no sync: it fails in seconds, and a red tick that says `pins` names
         # the claim that broke instead of burying a config error under a
-        # 765-test run.
+        # 779-test run.
         #
         # A guard that cannot find its target is not a guard, so an unmatched
         # line is an error, not a pass. The first version of this check had a

@@ -5,6 +5,255 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-05 — error.type is core's vocabulary, and a span cannot claim one thing while recording another
+
+Packet `muse-05`: `error.type` moves from muse's class names to core's fleet
+vocabulary, and a span's error class and its status become one thing recorded in
+one place.
+
+#### Changed
+
+- **`error.type` is core's vocabulary, not `type(error).__name__`.**
+  `ProviderAuthError` now goes on the wire as `provider_auth`, `CircuitOpen` as
+  `circuit_open`, and so on through all 27 classes in `muse.errors`. The old
+  spelling was a fine identifier and a useless one: every service spells the same
+  failure its own way, and PLAN §7b's fleet-wide error view — partition by
+  `service.name`, filter on span status `error`, drill down by `error.type` — is a
+  query only when every service draws from one list. muse is the only service that
+  emitted a class at all, which is the cheapest moment to fix it; after three more
+  services start copying the shape it is a migration rather than an edit.
+  **Breaking for anything that read the attribute**, which so far is
+  `tests/test_trace_propagation.py` (updated to assert `provider_auth`, the
+  specific value, in both places that asserted `ProviderAuthError`).
+- **The mapping table is exhaustive and the lookup is by exact type.**
+  `tests/test_error_vocabulary.py` walks `muse.errors` and fails on any class with
+  no entry, and `error_type` does not walk the hierarchy, so a new subclass of
+  `ProviderUnavailable` is refused rather than silently reported as
+  `dependency_unavailable`. Same discipline as `is_retryable`.
+- **`_OTHER` is reachable and is not a default.** It is mapped onto deliberately
+  for `ProviderIndeterminate` — the case core kept it for, so instrumentation is
+  never forced to invent a class. An unmapped class raises `UnclassifiedError`
+  rather than becoming `_OTHER`, because a default is how a vocabulary stops
+  being read. `record_error` catches that refusal, records `_OTHER` and logs the
+  class name, so telemetry that cannot classify a failure does not turn the
+  caller's 503 into a 500.
+
+#### Added
+
+- **`muse/errortype.py`** — the one table from muse's exception classes to the
+  thirteen classes, with the reasoning for the four that are a judgement rather
+  than a lookup (`ContentPolicyError` → `provider_rejected`,
+  `CredentialUnavailable`/`VaultDecryptError` → `internal_error`,
+  `AllCandidatesFailed` → `dependency_unavailable`, `ConfigError` →
+  `internal_error`) written next to the rows.
+- **The vocabulary is loaded from core's schema, not restated.** `error_types()`
+  reads the enum out of `traces.schema.json`, vendored byte-identically under
+  `src/muse/schemas/telemetry/`. `tests/test_error_vocabulary.py` asserts that copy
+  is byte-identical to core's whenever `MUSE_CORE_SCHEMAS` points at a checkout,
+  and the suite validates spans muse actually exported against the vendored
+  schema — including the three ways the error biconditional can be wrong — on
+  the default gate, with no core checkout needed.
+- **`telemetry.record_error(span, error)`** — the only path from an exception to a
+  span failure, setting `error.type` and the span's status together.
+
+#### Fixed
+
+- **A span recorded a class while claiming it had succeeded.** muse set
+  `error.type` and left the span status `unset`, which is one half of the
+  biconditional core-05 encoded as an `allOf`: a class without a failed status, so
+  the fleet view — which filters on status `error` and only then drills down —
+  never saw a failure muse had already classified. Both existing call sites (the
+  provider failure and the breaker refusal) now set both halves, and
+  `tests/test_trace_propagation.py` asserts the biconditional over *every* span
+  one exporter holds, after asserting the classes are present so an empty export
+  cannot make the absence vacuous.
+- `tests/support/tracing.py` reports span status and kind as well as attributes.
+  A payload without them cannot answer the question the biconditional asks.
+
+Packet `muse-03b`: the gate was red on a clean checkout. A regression found at merge,
+fixed at the declarations rather than at the test. While proving the fix, a second
+defect of the same class turned up in the gate itself.
+
+#### Fixed
+
+- **`bin/prime` could not pass on a fresh clone.** `muse-03` put
+  `opentelemetry-exporter-otlp` in the optional `otel` extra, but
+  `test_a_configured_endpoint_gets_a_batch_processor` exercises
+  `build_provider(endpoint=...)`, which imports that exporter — and `bin/prime` runs
+  `uv sync` with no extras. The worktree that developed `muse-03` was green
+  because its venv already carried the exporter from an `uv sync --extra otel`; every
+  clean clone got
+  `ConfigError: MUSE_OTEL_EXPORTER_OTLP_ENDPOINT is set but the OTLP exporter is not
+  installed`. The worst kind of green: true where it was written, false everywhere
+  else. **A test that needs a package makes it a test dependency**, so the dev group
+  now asks for the extra (`muse[otel]`) rather than repeating the exporter's floor in
+  a second place. The extra stays an extra for the image, where pulling grpcio and
+  protobuf into every install is still the wrong default.
+- **`bin/prime` asserted nothing about the lockfile.** Its own comment claimed
+  `uv sync --frozen` "refuses to re-resolve a stale lock", and the flag on line 12 was
+  `--frozen`. It does not: `--frozen` means *do not update the lock*, which is exactly
+  what lets a lock that disagrees with `pyproject.toml` install silently; the assertion
+  is `--locked`. Demonstrated against a stale lock: `uv sync --frozen` exited 0 with 77
+  packages and no exporter, `uv run pytest` exited 0 with 760 passed, and `uv run`
+  quietly **rewrote `uv.lock` on the way there**. The gate passed over a lockfile nobody
+  had committed — the same "green in one worktree, false elsewhere" shape as the
+  exporter defect, and the one a clean-checkout proof cannot catch, because a clean
+  checkout has a correct lock. Every `uv sync`/`uv run` in `bin/prime` now carries
+  `--locked`, including the `uv run` lines: `uv run` re-resolves by default, so a
+  guarded sync followed by a bare `uv run` reopened the hole. The Dockerfile's syncs
+  carried the same false comment and are now `--locked` too.
+- **`pydantic` and `starlette` are now declared.** `api.py` and `main.py` import both
+  at module scope, and both were reaching the venv only as `fastapi`'s transitive
+  dependencies — the same accident one fastapi repin away from a broken build.
+
+#### Added
+
+- `tests/test_dependencies.py` — a recurrence guard for both halves, asserted from
+  the declarations rather than from the venv. Every module `src/` and `tests/` import
+  must be provided by the closure of `[project.dependencies]` plus the dependency
+  groups as `uv.lock` records it, resolved at **submodule** granularity, because
+  `opentelemetry` is declared while `opentelemetry.exporter.otlp` is not. Every
+  third-party root must additionally be a *direct* declaration, since transitive
+  availability is not a declaration. Ownership is read from the installed RECORD
+  files, so the check fails both with the extra installed (the owner is outside the
+  closure) and with it absent (the module cannot be found) — which is what makes it
+  trustworthy in a dirty venv. A third test names the OTLP exporter specifically, so
+  the regression this packet fixes fails with a message that points at itself.
+- Four more assertions in that module, each of which closes a way the guard could have
+  been decorative:
+  - **the lock agrees with `pyproject.toml`** — the fact `--locked` checks, read from
+    two files on disk so it also holds in a dirty tree.
+  - **`bin/prime` passes `--locked` everywhere** — read from the script, so the gate
+    cannot quietly lose the assertion. The whole script is checked, not line 12,
+    because the exposure was the *combination* with an unguarded `uv run`.
+  - **the walk found something** — every assertion above is a set-difference over a
+    helper's result, so an empty result makes all of them pass. Breaking `_imports`,
+    `_declared`, `_gate_closure` or `_owners` one at a time left the two general
+    guards green every time; only the by-name OTLP test noticed. The floor is now
+    asserted before any absence is, which is the canary test's own discipline from
+    `test_trace_propagation.py` ("the canary is absent" is also true of an export that
+    produced no spans).
+  - **the exporter stays out of the image** — `[project.dependencies]` must not name
+    the expensive distributions and every Dockerfile `uv sync` must carry `--no-dev`,
+    so the fix cannot be "simplified" into shipping grpcio and protobuf everywhere.
+- `AGENTS.md` rule 19 and a README section: a green gate is a claim about a clean
+  machine, and `rm -rf .venv && bin/prime` is how you check it.
+
+#### Deliberately not done
+
+- `test_a_configured_endpoint_gets_a_batch_processor` is unchanged. It tests real
+  behavior — an endpoint configured means a batch processor is wired — so the
+  dependency moved instead of the test.
+- No `pytest.mark.skipif` on the exporter. Skipping would trade a broken gate for a
+  gate that quietly tests less, which is the failure mode this packet exists to end.
+- Coverage stays at 100%; the added tests are in `tests/`, so they do not dilute it.
+
+#### Proof
+
+The salvage was unverified, so it was verified before being trusted: reverting
+`pyproject.toml` and `uv.lock` to `f411eb5` and deleting `.venv` reproduces the
+merge-red gate (4 failed, 756 passed), with all three original dependency tests firing
+on it. With the fix applied, `rm -rf .venv && bin/prime` gives **763 passed, 2 skipped,
+coverage 100.00%, exit 0**. The salvage's shape was also checked against the objection
+that it makes the dev environment carry a production dependency: it does not. The
+Dockerfile's command sequence installs 69 distributions with no
+`opentelemetry-exporter-otlp`, no grpcio and no protobuf, against the gate's 85.
+
+Packet `muse-03`: OpenTelemetry, trace propagation, and bounded retry budgets. PLAN §7
+adopts W3C `traceparent` with traces in the platform collector, and bounded retry
+budgets with circuit breakers ("briefs forbid naive retries").
+
+#### Added
+
+- **Dependencies**, each justified in `README.md`:
+  - `opentelemetry-api`, `opentelemetry-sdk` — PLAN §7's "adopt from first deploy".
+    The SDK's own provider and span types rather than a hand-rolled span, so traces
+    are the shape every other OpenTelemetry tool expects.
+  - `opentelemetry-exporter-otlp` as the **optional `otel` extra**, imported only
+    when an endpoint is configured. As a hard dependency it would pull grpcio and
+    protobuf into every install to serve a path most deployments never reach.
+- `muse/telemetry.py` — `TraceParent` and `parse_traceparent`, plus
+  `ALLOWED_SPAN_ATTRIBUTES` and `record()`: the redaction boundary for telemetry.
+- `TraceMiddleware` in `muse/main.py` — continues a well-formed inbound
+  `traceparent`, starts a new trace when it is absent or malformed, and echoes both
+  `traceparent` and the existing `X-Trace-Id`. **Pure ASGI**, not
+  `@app.middleware("http")`: the decorator runs the downstream app in a separate
+  task, so the router would have seen no trace and every provider span would have
+  been orphaned.
+- Outbound propagation: `LiteLLMProvider` reads the ambient OpenTelemetry context
+  and sends `traceparent` as `extra_headers`, so the `Provider` protocol does not
+  grow an argument every future adapter would have to remember to honour.
+- Three spans: `muse.request`, `muse.route` (the routing decision), and
+  `muse.provider.call`.
+- `muse/breaker.py` — a circuit breaker per provider. Opens after N consecutive
+  *transient* failures, admits one half-open probe, closes on success. Consulted
+  before the provider is touched, so a held-back provider is never dialled.
+- `budget_seconds` and `backoff_jitter` in `config/routes.yaml`; a per-route
+  `retry_indeterminate` flag.
+- `MUSE_BREAKER_THRESHOLD`, `MUSE_BREAKER_RESET_SECONDS`,
+  `MUSE_OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`.
+- `traceparent` in `openapi/v1.yaml`, as an optional request parameter and on every
+  response, with a test that drives the running app and reads the real headers.
+- Tests: `test_telemetry.py`, `test_breaker.py`, `test_retry_budget.py`,
+  `test_trace_propagation.py`, `test_resilience_config.py`, plus a
+  `tests/support/tracing.py` that swaps the SDK's in-memory exporter in for the OTLP
+  one.
+
+#### Changed
+
+- **A read timeout is no longer retried by default.** litellm's `Timeout` with no
+  HTTP status behind it now maps to the new `ProviderIndeterminate` rather than a
+  retryable `ProviderTimeout`. The request was in flight when the deadline passed, so
+  the vendor may have completed and billed it, and without an idempotency key there
+  is no way to ask which happened — retrying can charge a customer twice for one
+  request. A route opts in with `retry_indeterminate: true`. A **408** stays
+  retryable: that is the server saying the request never arrived complete.
+  Two adapter tests changed with this and say why.
+- **The backoff is jittered.** Without it, every muse that failed at the same instant
+  retried at the same instant, so a provider recovering from an outage was hit by a
+  synchronised wave. The window is `[ceiling * (1 - jitter), ceiling]`, so the floor
+  rises with the exponential (the backoff cannot go backwards) and jitter can never
+  push a delay past the cap. `jitter: 0` restores the exact previous schedule.
+- The retry stop condition is now muse's own rather than tenacity's, so the clock is
+  injectable. A count alone did not bound time: six attempts against a 4s ceiling is
+  20s of waiting before the last attempt is sent. The deadline is checked before each
+  wait, so muse never begins a sleep that would carry the request past it.
+
+#### Security
+
+- **No span attribute may carry prompt, completion or credential text.** Enforced by
+  an allowlist at one choke point (`muse.telemetry.record`), not by discipline at each
+  call site: the realistic leak is a well-meaning `muse.prompt` added in six months,
+  not an attacker. A `Secret` is refused on its *type*, never compared by value.
+  `error.message` is deliberately **not** allowlisted — a vendor's content-policy
+  rejection quotes the offending content back, so the class name is recorded and the
+  message is not. The canary test drives a completion through the real app with a
+  unique string in both prompt and completion and asserts it appears nowhere in the
+  rendered span payload; mutation testing confirms it fails when a prompt is recorded.
+
+#### Notes
+
+- **muse has no `Idempotency-Key`.** PLAN §7 assigns one to muse and it is not built,
+  which is the direct reason `ProviderIndeterminate` defaults to un-retried. Flagged
+  for the manager: it is the one thing standing between muse and safely retrying
+  ambiguous timeouts, and it also matters for the caller-visible double-billing risk.
+- **`timeout_seconds` in `routes.yaml` is still not enforced.** It is declared and
+  documented but nothing applies it, so a single hung provider call is bounded only by
+  the caller's own timeout. Pre-existing from muse-02 and left alone deliberately: the
+  packet is about retry budgets, and the only way to test a real `asyncio.timeout`
+  expiry is a real sleep, which this repo's flake policy forbids. Follow-up packet.
+- A held-back provider does not fail the request — the fallback still serves it. A
+  breaker that failed the whole request would be strictly worse than none, since one
+  vendor being down would take out every route with a healthy fallback.
+- Only transient failures count against the breaker. A 400 or a 401 is muse sending
+  something the provider is right to refuse, and counting it would let one caller with
+  a malformed request take the route down for everybody.
+- `error.type` uses its OpenTelemetry dotted spelling (set through `record`'s mapping
+  form, since a dotted name is not a legal keyword argument); muse's own attributes
+  are underscored. Both conventions are documented on the allowlist.
+- 757 tests, 100% branch coverage. Dependency floors satisfy the machine-wide uv
+  `exclude-newer = "7 days"` quarantine and so may trail the true latest.
+
 ### muse-04 — CI, and the tier that would have skipped
 
 Packet `muse-04`: muse had no CI. It calls kit's reusable workflow, and adds the

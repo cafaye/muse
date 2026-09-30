@@ -36,14 +36,27 @@ def recording_telemetry() -> tuple[Telemetry, InMemorySpanExporter]:
 
 
 def payloads(exporter: InMemorySpanExporter) -> list[dict[str, Any]]:
-    """Every finished span as `{"name": ..., "attributes": {...}}`.
+    """Every finished span as `{"name": ..., "kind": ..., "status": ..., "attributes": ...}`.
 
     Deliberately not the SDK's own `to_json`: this is the minimum a security
     assertion needs, and hand-building it means the assertion reads as a list of
     facts rather than as a round trip through a serialiser.
+
+    `kind` and `status` are here because they are not attributes and a payload
+    without them cannot answer the question core's traces schema makes a biconditional
+    of them: a span's status is a claim, `error.type` is its classification, and
+    nothing in a span's *attributes* can say whether the two agree. `status` is the
+    lowercase spelling core's `status.code` enum uses (`unset`/`ok`/`error`), not the
+    SDK's `UNSET`/`OK`/`ERROR`, so a payload read here is the vocabulary the schema
+    is written in rather than a translation of it.
     """
     return [
-        {"name": span.name, "attributes": dict(span.attributes or {})}
+        {
+            "name": span.name,
+            "kind": span.kind.name.lower(),
+            "status": span.status.status_code.name.lower(),
+            "attributes": dict(span.attributes or {}),
+        }
         for span in exporter.get_finished_spans()
     ]
 

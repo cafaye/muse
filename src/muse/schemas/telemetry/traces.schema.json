@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cafaye.com/schemas/telemetry/traces.schema.json",
+  "title": "cafaye trace signal",
+  "description": "What a cafaye span is permitted to carry. The per-signal attribute allowlist for traces, and the shape of a span record that exports it. Three rules are encoded here rather than described in a README, because a rule that is not in schemas/ is not a cafaye rule (AGENTS.md): span names follow span-naming.schema.json, the attribute set is closed with additionalProperties: false so an attribute nobody thought about is a failure rather than a silent export, and no allowlisted name contains a word that names content. That last one is muse's canary promoted to a spec-level assertion — muse/tests/test_trace_propagation.py asserts the same property of muse's ALLOWED_SPAN_ATTRIBUTES end to end through a real request, and a real leak arrives as a well-meaning `muse.prompt` added in six months, not as an attacker. `error.message` is deliberately absent: a provider's content-policy rejection quotes the offending content back, so the message is a prompt by another route. `error.type` is the grouping key, and its vocabulary is a closed `enum` rather than a pattern — a pattern bounds the SHAPE of the value and not the set of values, so `user_42_email_invalid` used to validate, and on the metric side that is `tenant_id` on a measurement wearing a different name. Three semconv rules the attribute description alone cannot enforce are constraints here instead: span status `error` obliges an error class, an error class obliges a failed status (so the class is present exactly when the span failed, which is what makes its absence the load-bearing not-an-error marker), and `otel.status_code` may not contradict `status.code`. Handled and retried errors are not recorded at all — `SHOULD NOT` in semconv, and enforced here as unrepresentable: no signal allowlists an attribute a service could use to say 'this attempt failed and I recovered'. **Stability, honestly:** `error.type` and the span status rules are Stable in the OTel semantic conventions, but the document that defines the cross-signal coupling, `recording-errors.md`, is **Development**. Where this schema encodes that coupling it is encoding something not yet frozen; see D18. See docs/observability.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "kind", "attributes"],
+  "allOf": [
+    {
+      "title": "status error obliges an error class",
+      "description": "`status.code: \"error\"` is a claim, and a claim has to be classifiable. core-04 stated this in a description and nowhere else — with the attribute deleted, span.muse.json still validated — so it is a constraint now. The inverse is the same rule read from the other side: a span that records a class has claimed it failed, and the field of record for that claim is `status.code`. Together the two make the class present **if and only if** the span failed, which is what makes its ABSENCE the load-bearing 'not an error' marker rather than an omission: on a duration histogram the samples carrying the class are the errors and every other sample is a success, and a success that carried one would move the numerator and make the error rate a number nobody can trust.",
+      "if": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "object",
+            "required": ["code"],
+            "properties": { "code": { "const": "error" } }
+          }
+        }
+      },
+      "then": {
+        "properties": { "attributes": { "required": ["error.type"] } }
+      }
+    },
+    {
+      "title": "an error class obliges a failed status",
+      "description": "The other direction of the same biconditional, and the reason it is two rules rather than one. A span whose status is `unset` while it carries an error class is a span that two different queries read differently, and nothing reports the disagreement.",
+      "if": {
+        "type": "object",
+        "required": ["attributes"],
+        "properties": { "attributes": { "required": ["error.type"] } }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "type": "object",
+            "required": ["code"],
+            "properties": { "code": { "const": "error" } }
+          }
+        }
+      }
+    },
+    {
+      "title": "the status mirror may not overrule the status",
+      "description": "`otel.status_code` exists so a log-indexed query can filter on it, and `status.code` is the field of record. The moment the mirror can disagree with the field, a query that reads the mirror answers a different question from the predicate the fleet-wide view uses — and nothing anywhere reports that they differ. This is not a fifth rule: it is what makes the obligation above mean anything, because a span with two statuses has no status to be obliged.",
+      "if": {
+        "type": "object",
+        "required": ["attributes"],
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "required": ["otel.status_code"],
+            "properties": { "otel.status_code": { "const": "ERROR" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "type": "object",
+            "required": ["code"],
+            "properties": { "code": { "const": "error" } }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "name": {
+      "$ref": "#/$defs/spanName",
+      "description": "Byte-identical to the pattern in span-naming.schema.json, which tests/test_specs.py asserts. A span name the traces schema accepts and the naming schema does not is a name core contradicts itself about."
+    },
+    "kind": {
+      "enum": ["internal", "server", "client", "producer", "consumer"],
+      "description": "The OpenTelemetry span kind. A property of the span, never part of its name — a name that encodes the kind is a name that has to change when the relationship does."
+    },
+    "attributes": {
+      "$ref": "#/$defs/tracesAttributes",
+      "description": "The span's attributes, drawn from the trace allowlist. `additionalProperties: false` inside the allowlist itself, so a span carrying an attribute core has never heard of is rejected at the collector and in a service's own contract test rather than exported and stored."
+    },
+    "resource": {
+      "$ref": "#/$defs/resource",
+      "description": "Attributes attached once per process rather than per span — service identity, version, deployment, tenancy. They are exempt from the metric cardinality cap, which is why identity belongs here and not on a measurement. See metrics.schema.json. Note what is NOT here: a `service` field on the span itself. The emitting service is `service.name` on the resource, because it is the same for every span the process emits — and restating it as a span field would be the same one-fact-two-places duplication this spec forbids for tenant_id on a measurement."
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "description": "The OpenTelemetry span status. `code` is an enum rather than a string so a status cannot be invented per service; a service with a status core does not know about is a dashboard that silently misses it.",
+      "properties": {
+        "code": {
+          "enum": ["unset", "ok", "error"],
+          "description": "The OTel status code, and the field of record for whether this span failed — `otel.status_code` is a mirror of it for log-indexed queries and may not contradict it. `error` is a claim, and it obliges the span to carry `error.type`; that obligation is an `allOf` on this file's root, not this sentence."
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "A short static string for a human, such as `provider auth rejected`. Never an exception message, never a stack trace, never anything a caller or a vendor supplied: see the redaction boundary in redaction.schema.json."
+        }
+      }
+    },
+    "links": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Links to causally related spans, for the case a parent-child edge cannot express (a batch job whose items share no span). Bounded at 16, which is the OTel default link limit — an unbounded link list is a span whose size is a function of its data."
+    }
+  },
+  "$defs": {
+    "spanName": {
+      "type": "string",
+      "description": "Byte-identical to `$defs/spanName` in span-naming.schema.json. Duplicated rather than `$ref`d because a service's SDK setup reads this file alone; a cross-file ref would make the file un-loadable without a resolver, and core's whole premise is that a service compiles against these files by path.",
+      "minLength": 4,
+      "maxLength": 120,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\\.[a-z][a-z0-9]{0,14}(?:_[a-z0-9]{0,14}){0,2}){1,3}$"
+    },
+    "tracesAttributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The complete set of attribute names a cafaye span may carry. Anything not listed is not emitted — default-deny, so an attribute added in a hurry is dropped rather than shipped. The dotted OpenTelemetry semantic-convention names are used for facts the ecosystem already has a name for, so a span exported to a backend nobody at cafaye has heard of is still readable. Each entry's `description` says what the attribute is a fact ABOUT, because the test that keeps content out is a test about names.",
+      "properties": {
+        "http.request.method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"],
+          "description": "The HTTP method. Bounded by the enum, which is what makes it a legal measurement attribute too."
+        },
+        "http.response.status_code": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "description": "The response status. Bounded to 500 values. Note the metrics signal carries the *class* rather than the code — see metrics.schema.json."
+        },
+        "http.route": {
+          "type": "string",
+          "maxLength": 200,
+          "pattern": "^/[A-Za-z0-9/_{}.:-]*$",
+          "description": "The ROUTE TEMPLATE (`/v1/users/{id}`), never the concrete path. This is the distinction the whole attribute rule turns on: a template has one value per endpoint, a concrete path has one per request. `url.path` and `url.full` are not on the list for that reason, and neither is any query string — a query string is caller text by another name."
+        },
+        "db.system": {
+          "type": "string",
+          "enum": ["postgresql", "redis", "sqlite", "other"],
+          "description": "The database product. Four values; this is what a bounded dimension looks like."
+        },
+        "db.operation": {
+          "type": "string",
+          "enum": ["select", "insert", "update", "delete", "transaction", "other"],
+          "description": "The database operation. A closed vocabulary of verbs rather than the statement text, which is caller-influenced and would be a leak on the SQL-injection path."
+        },
+        "messaging.system": {
+          "type": "string",
+          "enum": ["nats", "postgres-outbox", "other"],
+          "description": "The transport. `postgres-outbox` is the fleet default (PLAN.md §7b: drain your own outbox, do not add a broker), so a span that crosses a service boundary says so by name."
+        },
+        "messaging.operation": {
+          "type": "string",
+          "enum": ["publish", "consume", "ack", "nack", "dead_letter"],
+          "description": "What the span did to the message. The delivery attempt count belongs here as a bounded integer, never the message body."
+        },
+        "otel.status_code": {
+          "type": "string",
+          "enum": ["OK", "ERROR"],
+          "description": "The OTel status, mirrored as an attribute so a log-indexed query can filter on it. The span's own `status.code` is the field of record."
+        },
+        "error.type": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^([a-z][a-z0-9]*(_[a-z0-9]+)*|_OTHER)$",
+          "enum": [
+            "_OTHER",
+            "cancelled",
+            "circuit_open",
+            "conflict",
+            "connection_failed",
+            "dependency_unavailable",
+            "internal_error",
+            "invalid_request",
+            "policy_denied",
+            "provider_auth",
+            "provider_rejected",
+            "rate_limited",
+            "timeout"
+          ],
+          "description": "The error CLASS — a grouping key, and the reason there is one place to see all errors rather than a wall of ungrouped text (PLAN.md §7b). **Closed vocabulary, not a shape.** A `pattern` here would constrain the value's shape and say nothing about the set of values, so `user_42_email_invalid` would validate — snake_case, twenty-two characters, and one series per value, which on the metric side is `tenant_id` on a measurement wearing a different name. Byte-identical on all three signals, because a class that means one thing on traces and another on metrics is three taxonomies wearing one name; `ProviderAuthError` in Python and `ErrProviderAuth` in Go are one failure in two spellings, and that is how 'one place to see all errors' becomes six places. The twelve classes and the fallback: see D18 for why each earns its place, and D14 for the call this implements. `pattern` and `maxLength` stay as the second line and cannot reject a value the `enum` accepts. `_OTHER` is the only member outside the snake_case shape and is the OTel well-known fallback, spelled as the ecosystem spells it (D19): it exists so instrumentation is NEVER FORCED TO INVENT A CLASS, because a closed enum with no escape hatch gets widened under pressure the first time a real failure does not fit, and a widened enum is how `_OTHER` becomes a permanent value nobody reads. **An alert on `_OTHER` is an alert that this service has not classified its own errors** — real, actionable, and the argument for carrying it rather than omitting it. `error.message` is deliberately absent and never added: a provider's content-policy rejection quotes the offending content back, so the message is a prompt by another route. Handled and retried errors are not recorded here at all — `SHOULD NOT` in semconv, enforced on this signal as unrepresentable, since no allowlisted name can say 'this attempt failed and I recovered'. **Stability, honestly:** `error.type` and the span status rules are Stable, but the document defining the cross-signal coupling, `recording-errors.md`, is **Development**, and the obligations in this file's `allOf` are that coupling."
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Attributes attached once per process. Exempt from the 2000-combination metric cap and preserved on the overflow point, which is the correct home for identity — see metrics.schema.json for why that matters, and for why the same value on a measurement is the failure this whole spec exists to prevent.",
+      "properties": {
+        "service.name": { "type": "string", "minLength": 2, "maxLength": 40, "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+        "service.version": { "type": "string", "maxLength": 64 },
+        "service.instance.id": { "type": "string", "maxLength": 128 },
+        "deployment.environment": { "type": "string", "enum": ["development", "test", "staging", "production"] },
+        "tenant_id": { "type": "string", "maxLength": 64, "description": "The tenant, here and never on a measurement. Unbounded as a dimension, exempt as a resource." },
+        "account_id": { "type": "string", "maxLength": 64, "description": "The account, same reasoning as tenant_id." }
+      }
+    }
+  }
+}

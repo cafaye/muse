@@ -36,18 +36,19 @@ src/muse/db.py        the Database protocol and the psycopg adapter
 src/muse/contracts.py core's patterns, copied and checked for parity
 src/muse/redaction.py Secret, and the scrubber for provider text
 src/muse/errors.py    the error taxonomy and the retry list
-src/muse/telemetry.py W3C traceparent, and the span-attribute allowlist
+src/muse/errortype.py the fleet's error classes, and the table onto them
+src/muse/telemetry.py W3C traceparent, the span allowlist, and `record_error`
 src/muse/breaker.py   the per-provider circuit breaker
+src/muse/schemas/     core's telemetry schemas, vendored byte-identically
 migrations/           00001_outbox_events, 00002_vault_secrets
 config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
 tests/                pytest; one module per concern, plus tests/support/
                      (test_dependencies.py checks the suite's imports against
                      the declared set, and bin/prime against --locked — see
-                     Dependencies)
+                     Dependencies; test_error_vocabulary.py checks every
+                     error class against core's vocabulary — see rule 19)
 bin/prime             the gate: uv sync --locked && ruff && pytest
-.github/workflows/    ci.yml: calls kit's reusable workflow, plus the two
-                      jobs kit cannot own (core parity, pins) — see CI
 ```
 
 ## Rules
@@ -68,8 +69,10 @@ bin/prime             the gate: uv sync --locked && ruff && pytest
    one so a test reads the payload a collector would really receive). The suite
    is fast, hermetic, and parallel-safe.
    `TestClient`/live-`uvicorn` is for the rare case that genuinely needs a real
-   server. Two tests skip unless `MUSE_CORE_SCHEMAS` points at a core checkout;
-   they say so rather than passing quietly.
+   server. Three tests skip unless `MUSE_CORE_SCHEMAS` points at a core checkout;
+   they say so rather than passing quietly. (The tests that validate a span
+   against core's telemetry schema are not among them: that schema ships inside
+   the package, so only its *byte-identity* with core needs a checkout.)
 4. **Assert exact JSON shapes, not field presence.** `assert body == {...}` for
    every response. `in` checks let a stray new key slip through and break the
    contract that `guard` and the generated SDKs depend on.
@@ -162,6 +165,36 @@ bin/prime             the gate: uv sync --locked && ruff && pytest
     an incident, whereas a vault key's default is *dangerous*, so there is no
     default to degrade to. A setting whose fallback is safe falls back; one
     whose fallback is not refuses to start.
+19. **An error's class and its name are not the same thing.** What goes on a
+    span as `error.type` is core's thirteen-value vocabulary, not
+    `type(error).__name__`: `ProviderAuthError` is reported as `provider_auth`.
+    The reason is the fleet-wide error view (PLAN §7b) — partition by
+    `service.name`, filter on span status `error`, drill down by `error.type` —
+    which is a query when every service draws from one list and a mapping table
+    somebody maintains by hand when they do not.
+    Three rules hold, and each has a test in
+    `tests/test_error_vocabulary.py`:
+    - **The vocabulary is loaded, not retyped.** `muse.errortype` reads the enum
+      out of core's `traces.schema.json`, vendored under `src/muse/schemas/`.
+      A Python list of thirteen strings is a second source of truth, and core
+      would change the enum while muse carried on emitting a value the schema
+      had stopped accepting. The vendored copy is asserted **byte-identical** to
+      core's when `MUSE_CORE_SCHEMAS` points at a checkout — a copy with no check
+      is a copy that rots, and that lesson has now cost this fleet three times.
+    - **`_OTHER` is reachable and is not a default.** `ProviderIndeterminate`
+      is mapped onto it deliberately, because it is the case that exists so
+      `_OTHER` is not a dumping ground. `dict.get(cls, "_OTHER")` is the wrong
+      shape: it makes a forgotten mapping silent. `error_type()` raises
+      `UnclassifiedError` instead.
+    - **A class and a failed status are one act.** `telemetry.record_error` is
+      the only way to put a failure on a span, and it sets both halves, because
+      core's schema makes them a biconditional. A span carrying a class while
+      claiming to have succeeded is a span two queries read differently, and
+      the fleet view filters on the status.
+    A class with no mapping must not take a request down with it, so
+    `record_error` catches the refusal, records `_OTHER` and logs the class
+    name — a symbol, never the message — while the gate is what actually stops
+    one shipping.
 
 ## Dependencies
 
@@ -225,40 +258,7 @@ quarantine*, which is often a version or two behind the true latest. So:
 
 `mise.toml` pins `python = "3.14"` and `uv = "0.12.20"`; `.python-version`
 pins 3.14. If a new interpreter release lands, bump `.python-version` and
-`mise.toml` together, update `versions:` in `.github/workflows/ci.yml`, and
-re-run the gate. The `pins` CI job fails until all four agree, so the bump
-cannot be done halfway and missed.
-
-## CI
-
-`.github/workflows/ci.yml` **calls**
-`cafaye/kit/.github/workflows/ci.reusable.yml@master` — it does not copy it.
-The `uses:` is the whole `python` job; everything kit shares lives in kit.
-
-Three rules, and they are the reason the file has three jobs rather than one:
-
-1. **`bin/prime` is the gate in CI too, not a CI-only variant of it.** The same
-   command, so the two cannot disagree — if they can, one of them is lying.
-   Anything CI needs that `bin/prime` does not do belongs *around* the call.
-2. **No test may skip in CI.** Two tests are gated on `MUSE_CORE_SCHEMAS`, and
-   a reusable workflow caller cannot inject `env:` into the workflow it calls,
-   so kit's python job runs them skipped (`763 passed, 2 skipped`) and is green.
-   That is the trap: the only two tests that catch drift with core would stop
-   running, and the badge would not move. So the `gate + core parity` job checks
-   out `cafaye/core`, sets the variable, runs `bin/prime`, and **fails on any
-   skip at all** — no allowlist, because an allowlist only ever grows. The run
-   must report `765 passed`.
-3. **A guard nobody has watched fail is not a guard.** So the same job asserts
-   `git diff --exit-code -- uv.lock` after the gate, and then proves the parity
-   guard can go red by mutating a throwaway copy of core's schemas and failing
-   if the test still passes. Both are the canary discipline from
-   `tests/test_trace_propagation.py`, applied to CI: assert the floor before
-   asserting the absence, and break it on purpose.
-
-Why the companion jobs cannot live in kit: they know muse's environment
-variable and its lockfile, and one of them reaches into another cafaye
-repository. kit is deliberately not allowed to own a step that needs any of
-those.
+`mise.toml` together and re-run the gate.
 
 ## Commands
 
@@ -272,11 +272,8 @@ uv run ruff check . && uv run ruff format .
 uv run uvicorn --factory muse.main:create_app --reload   # local dev
 docker compose up --build
 
-# The two contract tests that need a core checkout — what CI forces on:
+# The three contract tests that need a core checkout:
 MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
-
-# The local equivalent of the CI `gate` job, core checkout and all:
-MUSE_CORE_SCHEMAS=../core/schemas bin/prime
 ```
 
 Long commands get a `timeout`. Never push — the manager merges to `master`.

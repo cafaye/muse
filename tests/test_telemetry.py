@@ -193,7 +193,12 @@ def test_an_attribute_outside_the_allowlist_is_dropped() -> None:
         record(span, **{"muse.prompt": "the user's prompt", "muse_model": "gpt-4o-mini"})
 
     assert payloads(exporter) == [
-        {"name": "muse.test", "attributes": {"muse_model": "gpt-4o-mini"}}
+        {
+            "name": "muse.test",
+            "kind": "internal",
+            "status": "unset",
+            "attributes": {"muse_model": "gpt-4o-mini"},
+        }
     ]
 
 
@@ -209,7 +214,14 @@ def test_a_secret_is_never_converted_into_an_attribute() -> None:
     with telemetry.span("muse.test") as span:
         record(span, muse_model=Secret("sk-live-SECRET"), muse_route="fast")
 
-    assert payloads(exporter) == [{"name": "muse.test", "attributes": {"muse_route": "fast"}}]
+    assert payloads(exporter) == [
+        {
+            "name": "muse.test",
+            "kind": "internal",
+            "status": "unset",
+            "attributes": {"muse_route": "fast"},
+        }
+    ]
 
 
 def test_a_value_that_is_not_a_scalar_is_dropped() -> None:
@@ -227,6 +239,8 @@ def test_a_value_that_is_not_a_scalar_is_dropped() -> None:
     assert payloads(exporter) == [
         {
             "name": "muse.test",
+            "kind": "internal",
+            "status": "unset",
             "attributes": {"muse_attempts": 2, "muse_breaker_state": "closed"},
         }
     ]
@@ -256,7 +270,9 @@ def test_an_empty_attribute_mapping_is_not_an_error() -> None:
     with telemetry.span("muse.test") as span:
         record(span)
 
-    assert payloads(exporter) == [{"name": "muse.test", "attributes": {}}]
+    assert payloads(exporter) == [
+        {"name": "muse.test", "kind": "internal", "status": "unset", "attributes": {}}
+    ]
 
 
 # --- the no-op tracer ------------------------------------------------------
