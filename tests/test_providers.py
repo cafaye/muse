@@ -494,25 +494,25 @@ async def test_a_scripted_provider_prices_a_completion_from_its_table() -> None:
 # --- credential resolution -------------------------------------------------
 
 
-def test_a_static_resolver_returns_its_key() -> None:
+async def test_a_static_resolver_returns_its_key() -> None:
     resolver = StaticCredentials({OPENAI: Secret("sk-test")})
-    assert resolver.credential_for(OPENAI).reveal() == "sk-test"
+    assert (await resolver.credential_for(OPENAI)).reveal() == "sk-test"
 
 
-def test_a_static_resolver_wraps_a_bare_string() -> None:
-    assert StaticCredentials({OPENAI: "sk-test"}).credential_for(OPENAI) == Secret("sk-test")
+async def test_a_static_resolver_wraps_a_bare_string() -> None:
+    assert await StaticCredentials({OPENAI: "sk-test"}).credential_for(OPENAI) == Secret("sk-test")
 
 
-def test_a_static_resolver_raises_for_an_unconfigured_provider() -> None:
+async def test_a_static_resolver_raises_for_an_unconfigured_provider() -> None:
     with pytest.raises(CredentialUnavailable, match=OPENAI):
-        StaticCredentials({}).credential_for(OPENAI)
+        await StaticCredentials({}).credential_for(OPENAI)
 
 
-def test_a_static_resolver_rejects_an_empty_key() -> None:
+async def test_a_static_resolver_rejects_an_empty_key() -> None:
     """An empty key in an env file is a real deploy mistake, and forwarding it to a
     provider produces a 401 that reads like a *wrong* key rather than a missing one."""
     with pytest.raises(CredentialUnavailable, match="is empty"):
-        StaticCredentials({OPENAI: Secret("")}).credential_for(OPENAI)
+        await StaticCredentials({OPENAI: Secret("")}).credential_for(OPENAI)
 
 
 # --- the litellm adapter: pricing -----------------------------------------

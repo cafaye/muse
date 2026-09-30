@@ -46,7 +46,11 @@ async def asgi_client(app=None) -> AsyncIterator[httpx.AsyncClient]:
     several clients alive at once, which nested fixtures express badly.
     """
     target = app if app is not None else create_app()
-    transport = httpx.ASGITransport(app=target)
+    # `raise_app_exceptions=False` so an unhandled exception surfaces as the response
+    # the client would actually receive. httpx re-raises by default, which would make
+    # every error-handler test assert on a traceback instead of on the problem+json
+    # body a caller gets.
+    transport = httpx.ASGITransport(app=target, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url=BASE_URL) as c:
         yield c
 

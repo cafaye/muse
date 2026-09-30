@@ -280,10 +280,20 @@ class ProviderRegistry:
 
 @runtime_checkable
 class CredentialResolver(Protocol):
-    """Where a provider's API key comes from."""
+    """Where a provider's API key comes from.
 
-    def credential_for(self, provider: str) -> Secret:
-        """The key for `provider`, or raise `CredentialUnavailable`."""
+    Defined in `muse.providers.credentials` and re-exported here, because a caller that
+    only wants to hand a provider a dict of keys should not have to know which module
+    the protocol lives in.
+    """
+
+    async def credential_for(self, provider: str) -> Secret:
+        """The key for `provider`, or raise `CredentialUnavailable`.
+
+        Async because the production implementation reads the vault. A sync interface
+        would force that read onto a thread, or force a cache, and both are worse than
+        awaiting.
+        """
         ...
 
 
@@ -298,7 +308,7 @@ class StaticCredentials:
     def __init__(self, keys: dict[str, Secret | str]) -> None:
         self._keys = dict(keys)
 
-    def credential_for(self, provider: str) -> Secret:
+    async def credential_for(self, provider: str) -> Secret:
         try:
             secret = self._keys[provider]
         except KeyError:
@@ -307,9 +317,9 @@ class StaticCredentials:
             ) from None
         secret = secret if isinstance(secret, Secret) else Secret(secret)
         if not secret:
-            # An empty key in an env file is a real deploy mistake, and forwarding
-            # it to a provider produces a 401 that reads like a *wrong* key rather
-            # than a missing one.
+            # An empty key in an env file is a real deploy mistake, and forwarding it
+            # to a provider produces a 401 that reads like a *wrong* key rather than a
+            # missing one.
             raise CredentialUnavailable(f"the credential for provider {provider!r} is empty")
         return secret
 
@@ -330,15 +340,47 @@ class LiteLLMProvider:
       malformed request and sends an operator to look at the wrong thing.
     """
 
-    def __init__(self, name: str, api_key: str | Secret, litellm: Any = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        api_key: str | Secret | None = None,
+        litellm: Any = None,
+        *,
+        credentials: CredentialResolver | None = None,
+    ) -> None:
         if name not in VENDOR_PREFIXES:
             raise ValueError(
                 f"{name!r} is not a supported vendor; supported: "
                 f"{', '.join(sorted(VENDOR_PREFIXES))}"
             )
+        if api_key is None and credentials is None:
+            # Neither: a provider with no way to get a key would fail on its first
+            # call, in production, with a message about a missing constructor
+            # argument. Said here instead.
+            raise ValueError(
+                f"a provider for {name!r} needs either an api_key or a credentials resolver"
+            )
         self.name = name
-        self._api_key = Secret(api_key) if isinstance(api_key, str) else api_key
+        self._static_key = Secret(api_key) if isinstance(api_key, str) else api_key
+        self._credentials = credentials
         self._litellm = litellm
+
+    async def _key(self) -> Secret | None:
+        """This provider's key, or `None` when it has none configured.
+
+        Resolved per call rather than cached at construction, so a rotated key takes
+        effect on the next request. Caching would need invalidation, and a cache that
+        cannot be invalidated from outside the process is a credential that needs a
+        deploy to rotate.
+        """
+        if self._static_key is not None:
+            return self._static_key
+        if self._credentials is None:
+            return None
+        try:
+            return await self._credentials.credential_for(self.name)
+        except CredentialUnavailable:
+            return None
 
     @property
     def litellm(self) -> Any:
@@ -388,14 +430,15 @@ class LiteLLMProvider:
 
     async def complete(self, request: CompletionRequest) -> Completion:
         """One completion, or a `ProviderError` subclass describing why not."""
-        if not self._api_key:
+        key = await self._key()
+        if not key:
             # Checked before the call: no request, no spend, no rate-limit counter
             # spent on a credential that was never going to work.
             raise CredentialUnavailable(f"no credential is configured for provider {self.name!r}")
         kwargs: dict[str, Any] = {
             "model": self.qualified_model(request.model),
             "messages": [message.as_wire() for message in request.messages],
-            "api_key": self._api_key.reveal(),
+            "api_key": key.reveal(),
         }
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
@@ -404,7 +447,7 @@ class LiteLLMProvider:
         try:
             response = await self.litellm.acompletion(**kwargs)
         except Exception as error:  # a third-party exception taxonomy, mapped below
-            raise self._translate(error) from error
+            raise self._translate(error, key) from error
         return self._to_completion(request.model, response)
 
     def _to_completion(self, model: str, response: Any) -> Completion:
@@ -454,7 +497,7 @@ class LiteLLMProvider:
             finish_reason=choice.get("finish_reason"),
         )
 
-    def _translate(self, error: Exception) -> Exception:
+    def _translate(self, error: Exception, key: Secret) -> Exception:
         """Map a litellm exception onto a muse one.
 
         The credential is scrubbed out of the message on the way through: a provider
@@ -465,7 +508,7 @@ class LiteLLMProvider:
         copy returned here. That is the part that is easy to get wrong — see its
         docstring.
         """
-        detail = _sanitise(error, self._api_key)
+        detail = _sanitise(error, key)
         name = type(error).__name__
         module = self.litellm
         if name == "ContextWindowExceededError":
@@ -515,7 +558,8 @@ class LiteLLMProvider:
         negligible, and `health()` never raises — a raising health check takes down
         whoever asked, and readiness is where a dependency failure belongs.
         """
-        if not self._api_key:
+        key = await self._key()
+        if not key:
             return Health(
                 healthy=False,
                 detail=f"no credential is configured for provider {self.name!r}",
@@ -524,14 +568,14 @@ class LiteLLMProvider:
             await self.litellm.acompletion(
                 model=self.qualified_model(PROBE_MODELS[self.name]),
                 messages=[{"role": "user", "content": "ping"}],
-                api_key=self._api_key.reveal(),
+                api_key=key.reveal(),
                 max_tokens=1,
             )
         except Exception as error:  # a probe reports a failure, it does not raise
             # No in-place scrub here, unlike the error path: this detail is returned
             # as a string and nothing chains the original exception, so no second
             # copy of the message is left holding the key.
-            return Health(healthy=False, detail=redact(str(error), self._api_key))
+            return Health(healthy=False, detail=redact(str(error), key))
         return Health(healthy=True, detail="ok")
 
 
