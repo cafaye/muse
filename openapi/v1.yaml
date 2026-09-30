@@ -23,7 +23,7 @@ openapi: 3.1.0
 
 info:
   title: muse
-  version: 1.0.0
+  version: 1.1.0
   summary: LLM routing, credentials vault, and token metering for cafaye.
   description: |
     muse routes a chat completion to the first provider that can serve it, holds
@@ -41,8 +41,9 @@ info:
     * No tool calls. A provider response with null content is reported as an error
       rather than as empty text.
     * No embeddings, no images, no batches.
-    * Auth is a stub: the presence of a bearer credential is checked, and the token is
-      not verified. Real JWT verification arrives with the guard contract.
+    * **The bearer token is verified**, and a valid signature is not on its own an
+      authorization: the token must also carry the `completions:write` capability and
+      an `account_id`. See the `bearerAuth` scheme below for the full list.
 
     ## Errors
 
@@ -51,14 +52,16 @@ info:
 
     | Code | Status | When |
     | --- | --- | --- |
-    | `unauthorized` | 401 | No bearer credential was supplied. |
+    | `unauthorized` | 401 | The credential is absent, malformed, unverified, expired, or carries no `account_id`. |
+    | `forbidden` | 403 | The token verified and does not carry `completions:write`. |
     | `not_found` | 404 | No route is configured for the requested model. |
     | `validation_failed` | 422 | The request body is not a valid route request. |
-    | `unavailable` | 503 | Every candidate provider for the route failed. |
+    | `unavailable` | 503 | Every candidate provider for the route failed, **or** identity's signing keys could not be retrieved. |
     | `internal` | 500 | muse failed. The body says nothing further; `trace_id` is the handle. |
 
-    A 503 means this service is up and the models are not — a distinction a client
-    needs, because it is the one where retrying the *same* request is worthwhile.
+    A 503 means this service is up and something it depends on is not — the models, or
+    `identity`. A distinction a client needs, because it is the one where retrying the
+    *same* request is worthwhile.
 
     ## Cost and metering
 
@@ -180,7 +183,65 @@ paths:
                     cost_micros: 7
                     trace_id: 0af7651916cd43dd8448eb211c80319c
         '401':
-          description: No bearer credential was supplied.
+          description: |
+            The credential is absent, malformed, signed by a key `identity` does not
+            publish, expired, or missing a claim core requires — including
+            `account_id`.
+
+            The `detail` names *which* check failed and never a claim's value: a
+            `problem+json` body is among the most-read copies of anything this service
+            writes, and a token's contents are the caller's credential.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                absent:
+                  summary: No credential at all
+                  value:
+                    type: https://errors.cafaye.com/unauthorized
+                    title: Unauthorized
+                    status: 401
+                    detail: a bearer credential is required
+                    instance: /v1/route
+                    code: unauthorized
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                unverifiable:
+                  summary: A forged or expired token
+                  value:
+                    type: https://errors.cafaye.com/unauthorized
+                    title: Unauthorized
+                    status: 401
+                    detail: token has expired
+                    instance: /v1/route
+                    code: unauthorized
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                no-tenant:
+                  summary: A valid token with no account
+                  value:
+                    type: https://errors.cafaye.com/unauthorized
+                    title: Unauthorized
+                    status: 401
+                    detail: token carries no account_id; muse meters per tenant, so a
+                      request whose cost cannot be attributed is refused
+                    instance: /v1/route
+                    code: unauthorized
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+        '403':
+          description: |
+            The token verified and does not carry `completions:write`. **This is the
+            status that makes "a valid signature is not an authorization" observable** —
+            a correctly signed token with no scope lands here.
+
+            The `detail` names the scope this service requires, which is its own
+            configuration and safe to name. The scopes the caller *does* hold are not
+            echoed back: a 403 that listed them would tell an attacker which of a
+            guessed set is real.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
@@ -191,12 +252,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/unauthorized
-                title: Unauthorized
-                status: 401
-                detail: a bearer credential is required
+                type: https://errors.cafaye.com/forbidden
+                title: Forbidden
+                status: 403
+                detail: token is missing the completions:write scope
                 instance: /v1/route
-                code: unauthorized
+                code: forbidden
                 trace_id: 0af7651916cd43dd8448eb211c80319c
         '404':
           description: No route is configured for the requested model.
@@ -282,12 +343,16 @@ paths:
                 trace_id: 0af7651916cd43dd8448eb211c80319c
         '503':
           description: |
-            Every candidate for the route failed. `detail` names each provider, the
-            error class, and how many attempts it took.
+            muse is up and something it depends on is not. Two distinct causes, and a
+            client can tell them apart by whether the request reached the providers:
 
-            This is `unavailable` rather than `internal` because muse is up and the
-            models are not — the one case where retrying the same request is
-            reasonable.
+            * **Every candidate for the route failed.** `detail` names each provider,
+              the error class, and how many attempts it took.
+            * **`identity`'s signing keys could not be retrieved.** The request never
+              reached a provider, because muse could not check the credential. **muse
+              does not serve unauthenticated traffic when identity is down.** The
+              `detail` is a fixed string; the URL that failed, the status it answered
+              and the parser's complaint are in the log.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/TraceId'
@@ -297,31 +362,101 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
-              example:
-                type: https://errors.cafaye.com/unavailable
-                title: Service unavailable
-                status: 503
-                detail: >-
-                  every candidate for model 'fast' failed —
-                  openai/gpt-4o-mini: ProviderTimeout (after 3 attempts);
-                  anthropic/claude-haiku-4-5: ProviderAuthError
-                instance: /v1/route
-                code: unavailable
-                trace_id: 0af7651916cd43dd8448eb211c80319c
+              examples:
+                providers-down:
+                  summary: Every candidate failed
+                  value:
+                    type: https://errors.cafaye.com/unavailable
+                    title: Service unavailable
+                    status: 503
+                    detail: >-
+                      every candidate for model 'fast' failed —
+                      openai/gpt-4o-mini: ProviderTimeout (after 3 attempts);
+                      anthropic/claude-haiku-4-5: ProviderAuthError
+                    instance: /v1/route
+                    code: unavailable
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                identity-down:
+                  summary: The signing keys could not be retrieved
+                  value:
+                    type: https://errors.cafaye.com/unavailable
+                    title: Service unavailable
+                    status: 503
+                    detail: the signing keys at
+                      https://identity.cafaye.com/.well-known/jwks.json could not be
+                      retrieved
+                    instance: /v1/route
+                    code: unavailable
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
 
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+      bearerFormat: JWT
+      x-required-scopes:
+        route: [completions:write]
       description: |
-        A cafaye JWT, `Authorization: Bearer <jwt>`.
+        An RS256 JWT issued by `identity`, verified locally against its published
+        JWKS. Keys are cached by `kid` with a bounded TTL, so `identity` is never on
+        the hot path.
 
-        **This version does not verify the token.** It checks that the header is
-        present and carries a bearer credential, and nothing else — no signature, no
-        expiry, no scopes. Verification arrives with the guard contract, and a
-        half-implemented check that looks like a real one is worse than a stub that
-        says it is one.
+        **RS256 only**, pinned in one constant and passed to the verifier rather than
+        read from the token. `alg: none`, HS256 and ES256 are refused on the
+        *protected header*, before any key is fetched — so a forged token costs no
+        network call and never aims traffic at `identity`. core's conventions also
+        allow ES256; widening is a one-line change and belongs with the moment
+        `identity` publishes ES256 keys.
+
+        Required claims: `iss` (this service's configured issuer), `aud` (muse's own
+        client id), `sub`, `exp`, `iat`, `jti`, and `account_id`. `jti` is required
+        because it is the claim that makes a token individually revocable: a service
+        that ignores it is accepting a class of token the issuer believes it can
+        withdraw.
+
+        ### The capability this operation requires
+
+        **`completions:write`**, and a valid signature is not on its own an
+        authorization. A correctly signed token that carries no scope is `403`. The
+        check is exact-match, never prefix-match.
+
+        The claim's *shape* is a space-separated string — the one shape both core's
+        conventions and RFC 8693 agree on. The claim's *name* is an **open platform
+        decision** and this service accepts either, because `identity` currently mints
+        both and nobody has ruled: core's `docs/openapi-conventions.md` requires
+        `scopes`, and `guard` reads `scope`. **A token carrying both names where they
+        disagree is refused** rather than merged, preferred or unioned — a token whose
+        two authorisation claims contradict each other is a token this service does not
+        understand, and guessing which one the issuer meant is how an escalation about a
+        claim name becomes a cross-tenant read. An absent claim is the empty set, never
+        everything.
+
+        The string `completions:write` is likewise provisional. It follows the
+        `resource:action` shape core documents and names this service's own surface,
+        and it lives in one constant. This document does not add a scope namespace to
+        core's conventions; that is a decision for the platform, not for one service.
+
+        ### Tenancy
+
+        `account_id` is required and is the tenancy boundary, read from the verified
+        token and from nowhere else. A token without one is refused, because muse
+        bills and meters per tenant and a request whose cost cannot be attributed is a
+        request nobody can charge for. The safe behaviour is the strict one while the
+        fleet-wide question is open: the alternative — defaulting to `sub` — makes a
+        user id a tenancy key.
+
+        ### When identity is unavailable
+
+        **`503`, not `401`, and never `200`.** A 401 tells the caller their credential
+        is bad, and the problem is that this service could not *check* it — which sends
+        a caller with a perfectly good token to re-authenticate against a healthy
+        identity and then retry forever.
+
+        **muse does not serve unauthenticated traffic when identity is down.** The
+        request is refused rather than admitted on an unverified credential: the
+        alternative is a service whose only protection against a forged token is
+        whether the token's issuer happened to be reachable at that moment.
 
         No cookies: core allows bearer JWTs only for API traffic.
 

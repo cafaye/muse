@@ -46,13 +46,62 @@ exposes:
 # omitted rather than left empty, per core's manifest conventions.
 consumes: []
 
-# Other cafaye services, not packages. Both are listed as soft dependencies because
-# muse serves requests without either: guard is the public edge, and the vault and
-# the outbox are this service's own postgres.
+# Other cafaye services, not packages.
+#
+# `identity` became a **required** dependency with muse-06, and the reason is not that
+# muse now needs more of it — it is that muse can no longer serve anything without it.
+# Every token is verified against the key set `identity` publishes, so a deployment
+# without `identity` answers `/v1/route` with 503 for every request. Calling that a soft
+# dependency would let `caf dev` and any topology tool start muse with no issuer and
+# report a service that cannot serve.
+#
+# It is a *service* dependency, not a package: the JWKS is fetched over the network at
+# runtime, so there is nothing to resolve at install time and nothing in `uv.lock`.
+#
+# > DECISION NEEDED (muse, muse-06): three open questions, none of which this packet
+# > could settle and all of which it implemented safely under. They are recorded here
+# > because the next reader is whoever decides, and a decision taken in a service
+# > rather than in core is how two contracts end up disagreeing.
+# >
+# >  1. **The capability claim's *name*.** `core/docs/openapi-conventions.md:134`
+# >     requires `scopes`; `guard/src/middleware/jwt.ts:32` reads a space-separated
+# >     `scope`. Nobody has ruled, and `identity` mints **both**, byte-identical, with
+# >     a test holding them equal — an interim that exists so the decision can land
+# >     without rotating a credential already in a customer's hand. muse accepts
+# >     either name and **refuses a token carrying both where they disagree**: not
+# >     merged, not preferred, not unioned. A token whose two authorisation claims
+# >     contradict each other is a token muse does not understand, and guessing which
+# >     one the issuer meant is how this escalation becomes a cross-tenant read.
+# >     Requested: a ruling, recorded in core so all three services read one file.
+# >
+# >  2. **The scope muse requires: `completions:write`.** The *shape* is core's
+# >     (`resource:action`, `openapi-conventions.md:137`) and the *resource* is muse's
+# >     own surface, read off its route table the way `darkroom` reads `assets:read`
+# >     and `identity` reads `accounts:write`. The exact string is provisional and
+# >     lives in one constant (`muse.auth.SCOPE`). This packet adds **no** scope
+# >     namespace to core's conventions document: the vocabulary is the platform's to
+# >     extend, not one service's.
+# >
+# >  3. **`account_id` is required here, and stricter than `guard`.** core requires it
+# >     for authenticated service traffic and every query is scoped by it. `guard`
+# >     treats a missing or non-string `account_id` as `undefined` and falls back to
+# >     `sub` for rate-limit keying; muse **refuses** the request, because muse bills
+# >     and meters per tenant and the lenient behaviour would make an unattributable
+# >     spend. The two answers are both defensible and they are *not* the same
+# >     question — a rate-limit key is a worse thing to lose than a tenancy claim is to
+# >     gain. Requested: a fleet-wide ruling on which, because the day a service is
+# >     written against `guard`'s answer and muse's, the discrepancy becomes a
+# >     cross-tenant read.
+# >
+# > Also recorded, and not a question: the accepted algorithm is RS256 only, where
+# > core's conventions allow RS256 and ES256. `guard` made the same choice and for the
+# > same reason — the algorithm is a property of the key set `identity` publishes, not
+# > a hint the token carries. Widening is a one-line change and belongs with the
+# > moment `identity` publishes ES256 keys.
 dependencies:
   - name: identity
     version: ^0.1.0
-    required: false
+    required: true
   - name: guard
     version: ^0.1.0
     required: false

@@ -28,8 +28,11 @@ import pytest
 import yaml
 
 from muse.api import RouteRequestBody, RouteResponseBody
+from muse.auth import SCOPE, SCOPE_CLAIM, SCOPES_CLAIM
 from muse.contracts import TOKENS_CONSUMED, validate_event_type
 from muse.main import create_app
+
+from .support.jwks import Identity, token
 
 #: `anyio` as well as `unit`: one test here drives the real app end to end to prove
 #: the running service emits the correlation headers the document promises, and
@@ -43,6 +46,17 @@ MANIFEST = REPO_ROOT / "cafaye.yml"
 
 def spec() -> dict:
     return yaml.safe_load(OPENAPI.read_text(encoding="utf-8"))
+
+
+def prose(document: str) -> str:
+    """A description with its line breaks collapsed.
+
+    The security scheme's description is a YAML block scalar written to be *read*, so it
+    wraps wherever the prose wraps. An assertion about a phrase across that wrap would
+    be testing the line width of a document rather than its content, and it would fail
+    the next time somebody rewraps a paragraph.
+    """
+    return " ".join(document.split())
 
 
 def manifest() -> dict:
@@ -251,9 +265,154 @@ def test_the_request_schema_names_exactly_the_request_models_fields() -> None:
 def test_every_documented_response_schema_is_actually_reachable() -> None:
     """Every status the document lists for the endpoint, except the two it marks as
     reserved or method-level. A documented status the app cannot produce is a promise
-    to a client that nothing keeps."""
+    to a client that nothing keeps.
+
+    `403` was added by muse-06 and `404` is listed here rather than reached by a
+    documented path: the document promises both, and the two tests below drive the real
+    app for each.
+    """
     documented = {int(status) for status in spec()["paths"]["/v1/route"]["post"]["responses"]}
-    assert documented == {200, 401, 404, 405, 422, 500, 503}
+    assert documented == {200, 401, 403, 404, 405, 422, 500, 503}
+
+
+def test_the_security_scheme_names_the_capability_the_operation_requires() -> None:
+    """core's checklist: "Auth: required scopes + `account_id` scoping stated in the
+    security scheme."
+
+    `x-required-scopes` is darkroom's spelling and it is checked here rather than
+    invented, because a second service inventing its own extension is how a generator
+    learns to read neither. The prose in the description is *also* asserted, since the
+    extension is machine-readable and the description is what a human reads.
+    """
+    scheme = spec()["components"]["securitySchemes"]["bearerAuth"]
+
+    assert scheme["scheme"] == "bearer"
+    assert scheme["bearerFormat"] == "JWT", "every other service states the format"
+    assert scheme["x-required-scopes"]["route"] == [SCOPE]
+
+    description = prose(scheme["description"])
+    for phrase in (
+        SCOPE,  # the capability, by name
+        "account_id",  # the tenancy claim
+        "RS256",  # the pinned algorithm
+        "identity",  # the only issuer
+        "open platform decision",  # the claim name is not settled
+        "503",
+    ):
+        assert phrase in description, f"the scheme never mentions {phrase!r}"
+
+
+def test_the_document_does_not_claim_the_token_is_unverified() -> None:
+    """The claim that became false the moment this landed.
+
+    Both the old phrases are named so that a future edit which reintroduces either —
+    as stale prose, or as a copy of an older document — fails here rather than telling
+    a caller that any non-empty bearer string will do.
+    """
+    document = spec()
+    scheme = prose(document["components"]["securitySchemes"]["bearerAuth"]["description"])
+    info = prose(document["info"]["description"])
+
+    for stale in (
+        "does not verify the token",
+        "no signature, no expiry, no scopes",
+        "the token is not verified",
+        "Auth is a stub",
+    ):
+        assert stale not in scheme, f"the scheme still says {stale!r}"
+        assert stale not in info
+
+
+def test_the_document_states_that_identity_being_down_refuses_the_request() -> None:
+    """The operational contract, in the place someone will read at 3am.
+
+    A generated SDK is not where an operator looks during an outage, so this has to be
+    in the document itself rather than only in the repository README.
+    """
+    scheme = prose(spec()["components"]["securitySchemes"]["bearerAuth"]["description"])
+    assert "does not serve unauthenticated traffic when identity is down" in scheme
+
+    unavailable = prose(spec()["paths"]["/v1/route"]["post"]["responses"]["503"]["description"])
+    assert "identity" in unavailable
+    assert "unauthenticated traffic when identity is down" in unavailable
+
+
+def test_the_document_records_that_the_scope_claim_name_is_open() -> None:
+    """Both names accepted, and the disagreement refused.
+
+    Stated in the document because the *next* reader is whoever decides it. Without
+    this, a reader sees one service accepting two claim names and reasonably concludes
+    the duality is a design rather than an unresolved platform question.
+    """
+    scheme = prose(spec()["components"]["securitySchemes"]["bearerAuth"]["description"])
+    assert SCOPES_CLAIM in scheme and SCOPE_CLAIM in scheme
+    assert "disagree" in scheme
+    assert "open platform decision" in scheme
+    assert "provisional" in scheme
+
+
+async def test_the_app_answers_403_for_a_verified_token_with_no_scope() -> None:
+    """The document's 403, reached through the real app.
+
+    Driven rather than asserted against a literal, because the point is that a client
+    reading this file is told about a status the service really produces. The policy
+    behind it lives in `tests/test_auth.py`; what is checked *here* is only that the
+    document and the code agree.
+    """
+    identity = Identity()
+    response = await _route(identity, token(identity, scopes=""))
+    assert response.status_code == 403
+    assert "403" in spec()["paths"]["/v1/route"]["post"]["responses"]
+    assert SCOPE in response.json()["detail"]
+
+
+async def test_the_app_answers_503_when_the_signing_keys_cannot_be_retrieved() -> None:
+    """The document's second 503 cause, reached through the real app.
+
+    The document distinguishes two reasons for one status — the providers are down, or
+    `identity` is — and a client branching on that difference is the whole reason the
+    503 is worth separating from a 401.
+    """
+    identity = Identity()
+    identity.fail_with(503)
+    response = await _route(identity, token(identity))
+    assert response.status_code == 503
+    assert response.json()["code"] == "unavailable"
+
+
+def bearer(value: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {value}"}
+
+
+async def _route(identity, token: str):
+    """One authenticated request against a real app.
+
+    Local rather than imported from `tests/test_auth.py`: two test modules reaching into
+    each other's helpers is a coupling that makes one of them unrunnable alone, and
+    these two need the fixture rather than the whole auth suite.
+    """
+    from muse.providers import Price, ProviderRegistry
+    from muse.providers.fake import FakeProvider
+    from muse.routes import routes_from_yaml
+
+    from .conftest import asgi_client
+    from .support.fake_database import FakeDatabase
+    from .support.test_app import auth_for, build_test_app
+
+    app = build_test_app(
+        registry=ProviderRegistry().register(FakeProvider(name="openai", price=Price(1, 1))),
+        database=FakeDatabase(),
+        table=routes_from_yaml(
+            "version: 1\nroutes:\n  - model: fast\n    candidates:\n      - provider: openai\n"
+        ),
+        auth=auth_for(identity),
+    )
+    async with asgi_client(app) as client:
+        return await client.post(
+            "/v1/route",
+            json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+            headers=bearer(token),
+        )
 
 
 def test_every_error_response_is_problem_json() -> None:
@@ -386,18 +545,24 @@ def test_cost_micros_is_an_integer_and_never_negative() -> None:
 
 def test_every_example_in_the_document_is_well_formed() -> None:
     """Walked rather than trusted. An example with a stale field name is the part of a
-    document a reader trusts most and checks least."""
+    document a reader trusts most and checks least.
+
+    Both OpenAPI spellings are handled, because the document uses both: a single
+    unnamed `example`, and the `examples` map that carries a `summary` per entry. muse-06
+    added the second form to the 401 and the 503 so each cause gets a name, and this
+    walk is what keeps a *named* example from being the one nobody checks.
+    """
     document = spec()
     for status, operation in document["paths"]["/v1/route"]["post"]["responses"].items():
         for media_type, payload in operation["content"].items():
             for name, example in payload.get("examples", {}).items():
                 assert isinstance(example, dict), f"{status}/{name} is not an object"
-                if media_type == "application/problem+json":
-                    assert example["code"] in TITLES, f"{status}/{name} has a non-reserved code"
-                    assert example["status"] == int(status), (
-                        f"{status}/{name} disagrees with status"
-                    )
-                    assert example["type"].endswith(f"/{example['code']}")
+                if media_type != "application/problem+json":
+                    continue
+                body = example.get("value", example)
+                assert body["code"] in TITLES, f"{status}/{name} has a non-reserved code"
+                assert body["status"] == int(status), f"{status}/{name} disagrees with status"
+                assert body["type"].endswith(f"/{body['code']}")
 
 
 #: The reserved codes this service documents, for the example check above.
@@ -463,7 +628,43 @@ def test_every_declared_dependency_is_a_service_and_not_a_package() -> None:
     listed here is a dependency nothing can resolve."""
     for dependency in manifest()["dependencies"]:
         assert dependency["name"] in {"identity", "guard"}
-        assert dependency["required"] is False
+
+
+def test_identity_is_a_required_dependency_and_guard_is_not() -> None:
+    """muse-06, and the reason is a serving fact rather than a preference.
+
+    `identity` was `required: false` while the token was an unchecked header. Every
+    token is now verified against the key set it publishes, so a deployment without it
+    answers `/v1/route` with 503 for every request — and a soft dependency is how
+    `caf dev` and a topology tool start a service that cannot serve.
+
+    `guard` stays soft: it is the public edge, and a service is reachable without an
+    edge in front of it. Asserted as the *pair* because the two are the same field with
+    two meanings, and a test that checks one without the other cannot tell which is
+    which.
+    """
+    required = {d["name"]: d["required"] for d in manifest()["dependencies"]}
+    assert required == {"identity": True, "guard": False}
+
+
+def test_the_manifest_records_the_open_auth_decisions() -> None:
+    """The three questions this packet implemented safely under.
+
+    A comment is not documentation — it is a note. What matters is that a reader who
+    finds the code in six months learns from the *manifest* that the claim name is
+    open, and that a decision taken here is provisional. This fails if the DECISION
+    NEEDED block is deleted, which is the failure mode that matters: the questions get
+    silently closed by nobody answering them.
+    """
+    text = MANIFEST.read_text(encoding="utf-8")
+
+    for question in (
+        "The capability claim's *name*",  # `scopes` vs `scope`
+        "completions:write",  # the required scope
+        "account_id` is required here",  # the tenancy answer
+    ):
+        assert question in text, f"cafaye.yml no longer records: {question}"
+    assert "DECISION NEEDED" in text
 
 
 def test_the_manifest_validates_against_core() -> None:
