@@ -1,0 +1,57 @@
+[project]
+name = "muse"
+version = "0.1.0"
+description = "muse — LLM routing, credentials vault, token metering for cafaye"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.14"
+dependencies = [
+    # Floors are the newest releases that satisfy the machine-wide uv
+    # `exclude-newer = "7 days"` supply-chain quarantine (see AGENTS.md).
+    "fastapi>=0.141.1",
+    "uvicorn>=0.53.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "anyio>=4.15.1",
+    "ruff>=0.14.4",
+]
+
+[build-system]
+requires = ["hatchling>=1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/muse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config --cov=muse --cov-report=term-missing --cov-fail-under=100"
+markers = [
+    "unit: fast, isolated unit test",
+    "integration: exercises more than one component",
+]
+
+[tool.coverage.run]
+source = ["muse"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -1,0 +1,6 @@
+[tools]
+python = "3.14"
+uv = "0.12.20"
+
+[env]
+_.path = [".venv/bin"]

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# bin/prime — the gate. Sync the environment, then run the suite.
+#
+# This is what CI runs and what a reviewer runs before believing a change. It
+# fails loudly: `uv sync --frozen` refuses to re-resolve a stale lock, and
+# pytest enforces the 100% coverage gate.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==> syncing (frozen lock)"
+uv sync --frozen
+
+echo "==> lint"
+uv run ruff check .
+uv run ruff format --check .
+
+echo "==> tests"
+uv run pytest "$@"

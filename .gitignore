@@ -1,0 +1,30 @@
+# --- python / uv ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- tooling caches -------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- local env / secrets -------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- editors / os --------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- local scratch (never committed) -------------------------------------
+tmp/
+*.log
