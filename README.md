@@ -504,4 +504,11 @@ nobody knows is a gate.
 
 ## License
 
-AGPL-3.0-only — see the cafaye org for the platform's licensing rationale.
+MIT. See [LICENSE](LICENSE). `pyproject.toml` declares the same thing.
+
+This was AGPL-3.0-only and is MIT now. The reason is the registry model: muse is
+consumed as one node in a dependency graph looked up through pantry, and
+copyleft would attach an obligation to every downstream consumer of every node
+that reached it. A dependency you can add without your own licensing situation
+changing is the thing the registry is for, and copyleft is the one choice that
+makes it not that.

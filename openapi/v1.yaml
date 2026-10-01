@@ -73,8 +73,9 @@ info:
     If that event cannot be written, the request fails. The completion has already
     been paid for, and returning it without its record would lose the spend silently.
   license:
-    name: AGPL-3.0-only
-    identifier: AGPL-3.0-only
+    name: MIT
+    identifier: MIT
+    url: https://opensource.org/license/mit
   contact:
     name: muse
     email: muse@cafaye.com

@@ -3,7 +3,14 @@ name = "muse"
 version = "0.2.0"
 description = "muse — LLM routing, credentials vault, token metering for cafaye"
 readme = "README.md"
-license = { text = "AGPL-3.0-only" }
+# MIT, fleet-wide and without exception. This was AGPL-3.0-only until the
+# licence packet: the platforms are consumed as a dependency graph through a
+# service registry, and copyleft would make every downstream consumer inherit
+# an obligation, which defeats the registry model. The LICENSE file at the
+# repository root is the grant; this line is the metadata that travels with the
+# package. They agree, deliberately, and `license-files` below is what carries
+# the file into the wheel.
+license = { file = "LICENSE" }
 requires-python = ">=3.14"
 dependencies = [
     # Floors are the newest releases that satisfy the machine-wide uv

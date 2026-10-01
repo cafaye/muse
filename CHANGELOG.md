@@ -5,6 +5,31 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### Licence: muse is MIT, and it was AGPL-3.0-only
+
+The one licence change in this packet, and the only deliberate departure from
+the fleet decision, so the reasoning is here rather than only in the diff.
+
+**`pyproject.toml` declared `AGPL-3.0-only` and `README.md` said so too.** The
+declaration has been reviewed and is not deliberate: it is replaced with MIT, and
+`openapi/v1.yaml`'s `info.license` block — a third statement of the same fact
+that no reader would have known to look for — moves with it.
+
+The reason is the registry model. muse is consumed as one node in a dependency
+graph looked up through pantry, and copyleft attaches an obligation to every
+downstream consumer of every node that reaches it. That defeats the thing the
+registry exists to do: a consumer adds a platform dependency **without their own
+licensing situation changing**. MIT is what makes that true; AGPL-3.0-only is
+what would have made it false, and would have made adding muse a decision about
+obligations rather than about dependencies.
+
+`license = { file = "LICENSE" }` rather than a bare `license = "MIT"`, matching
+`cafaye-py`, so the metadata points at the grant instead of restating it. The
+`LICENSE` file at the repository root is canonical MIT text — verified verbatim
+against SPDX `license-list-data`, not paraphrased — carrying
+`Copyright (c) 2026 cafaye`, the same line the three repositories that already
+shipped a licence use.
+
 ### muse-09 — tenant isolation: 12 account-scoped entry points, negatively tested
 
 Packet `muse-09`. D18 measured cross-tenant negative tests at **identity 7, courier
