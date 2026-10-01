@@ -83,25 +83,31 @@ gate:
     # developer and a tool can both see it.
     - id: core-parity
       match: '^=+ (?!.*skipped)([0-9]+) passed'
-      # 907 exactly, and not a rounded number. 904 of the tests are
+      # 933 exactly, and not a rounded number. 930 of the tests are
       # self-contained; the three that are not are
       # tests/test_contracts.py::test_patterns_are_byte_identical_to_core,
       # the telemetry-vocabulary drift guard in test_error_vocabulary.py, and
-      # the manifest-drift guard in test_openapi.py. 907 - 904 is exactly
+      # the manifest-drift guard in test_openapi.py. 933 - 930 is exactly
       # those three, so this floor cannot be satisfied by a run in which the
       # cross-repo tier did not execute. It is also a ratchet in the other
       # direction: delete one of the three and the parity gate goes red.
       #
-      # RAISED 898 -> 907 by muse-08, and the reason is the ratchet clause
-      # above rather than the number. This floor is only "exact" relative to
-      # the suite's size: muse-08 added 9 hermetic compose tests, and a floor
-      # left at 898 would have meant a run with one of the three drift guards
-      # deleted still reported 906 and still cleared it. Adding a test can
-      # therefore never leave this floor stale *in the safe direction* — a
-      # reviewer adding tests must raise it here in the same commit, and the
-      # alternative (leave the floor, lose the ratchet) is the failure this
-      # note exists to prevent.
-      minimum: 907
+      # RAISED 898 -> 907 by muse-08, then 907 -> 931 by muse-09, and the
+      # second raise is the ratchet clause above catching a real defect rather
+      # than a hypothetical one. muse-09 added 26 tenant-isolation tests, and
+      # while checking them in, the packet found that all 24 of its first draft
+      # were named `tests/tenant_scoping.py` -- pytest's default `python_files`
+      # is `test_*.py`, so the file was never collected and the gate read
+      # `904 passed, 3 skipped` before and after the commit that added it. A
+      # floor of 907 left at 907 would have cleared that commit happily: the
+      # count never moved, so a floor nobody re-read cannot notice that the
+      # suite it describes got 26 tests bigger and did not run them.
+      #
+      # Adding a test therefore never leaves this floor stale *in the safe
+      # direction* -- a reviewer adding tests must raise it here in the same
+      # commit, and the alternative (leave the floor, lose the ratchet) is the
+      # failure this note exists to prevent.
+      minimum: 933
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

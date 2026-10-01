@@ -5,6 +5,134 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-09 — tenant isolation: 12 account-scoped entry points, negatively tested
+
+Packet `muse-09`. D18 measured cross-tenant negative tests at **identity 7, courier
+19, muse 0**. This is muse's contribution: the enumeration, one negative test per entry
+point, and the guards that keep the enumeration true.
+
+#### The count, and why it is small
+
+**12 account-scoped entry points. 7 read, 2 list, 2 update, 1 delete.** Of those twelve,
+**three carry a tenant axis at all**:
+
+| Entry point | Layer | Op | Tenant axis |
+| --- | --- | --- | --- |
+| `api.require_bearer` | auth | read | **account** |
+| `auth.require_scope` | auth | read | platform |
+| `POST /v1/route` | http | read | **account** |
+| `GET /healthz` | http | read | platform |
+| `GET /readyz` | http | read | platform |
+| `metering.Meter.record` | service | update | **account** |
+| `vault.Vault.get` | service | read | platform |
+| `vault.Vault.has` | service | read | platform |
+| `vault.Vault.providers` | service | list | platform |
+| `vault.Vault.put` | service | update | platform |
+| `vault.Vault.delete` | service | delete | platform |
+| `outbox.OutboxPublisher.claim` | service | list | none |
+
+The ratio is the measurement, and it is deliberately not inflated. muse stores **no
+tenant-owned rows**: `vault_secrets` is keyed by `provider` (one platform credential
+per vendor, by design) and `outbox_events` has no tenant column, because core's payload
+schema still pins `subject: platform` until D9. So the tenant surface is the auth gate,
+the one route, and the one write that meters the route — and the other nine entries are
+load-bearing *because* they cannot see a tenant. A suite that claimed a surface muse
+does not have would make a reader believe the gap was closed.
+
+#### Absence, never 403
+
+A 403 on the tenant axis is an **enumeration oracle**: it says "this exists and is not
+yours", which is strictly more information than a 404 for a resource that never existed.
+
+- **No account-scoped entry point answers 403.** muse's one 403 is on the *capability*
+  axis (`InsufficientScope`), and `test_a_forbidden_body_does_not_vary_by_account`
+  asserts three accounts receive a byte-identical body — so it cannot probe tenancy.
+- **A path that does not exist answers 404 for every account**, asserted over five paths
+  and three accounts.
+- **`MissingAccount` is a 401, not a 403.** A 403 there would tell a caller holding a
+  valid signature that the token is real and only its tenant is wrong.
+
+#### The enumeration is checked, not asserted
+
+Three guards make it load-bearing, because an enumeration nobody checks against the code
+is a comment that ages badly:
+
+- every route the running app serves (read off its generated OpenAPI document) must be
+  in the table, **and the table must not claim a route the app does not serve**;
+- every SQL statement in `src/muse/` must be attributed to an enumerated entry point,
+  **count included** — nine of them;
+- no query may mention a tenant column, no migration may add one, and no function may
+  take an account argument.
+
+A packet that grows a tenant surface has to move `TENANT_SCOPED_COUNT` on purpose, next
+to the negative test for whatever it added.
+
+#### Two guards that were wrong before they were right
+
+Both were found by breaking them on purpose, not by reading them.
+
+1. **The SQL guard could pass on a file holding two queries while naming one.** It
+   checked that every enumerated query was present and every file with SQL was
+   accounted for, but never that a file held no *more* than the enumeration named. A
+   canary appending a tenant-free `select count(*)` to `metering.py` went green. The
+   per-file count is now asserted, and the failure names the unnamed statements.
+
+2. **24 of the 26 tests were never collected.** The file was first written as
+   `tests/tenant_scoping.py`, mirroring `darkroom-09`'s Rust layout. `pyproject.toml`
+   sets `testpaths` but not `python_files`, so pytest's default `test_*.py` applies and
+   the whole file was skipped — the gate read `904 passed, 3 skipped` **before and after**
+   the commit that added it. Renamed to `test_tenant_scoping.py`, and
+   `test_no_test_file_is_left_uncollected` now walks `tests/` and fails on any module
+   that defines a test without matching the collection pattern, because a guard that can
+   pass because *it* is not running is the worst version of this failure.
+
+#### The gap that is named and not closed
+
+`Meter` knows the caller's `account_id` and cannot write it: core owns
+`schemas/events/muse/tokens/consumed.schema.json`, which closes `data` at five fields
+and documents `subject: platform` until D9. `test_a_metered_event_names_no_account`
+asserts the absence is real *and* named — the payload is exactly core's five fields and
+the subject is core's reserved literal. A test implying this was closed would be the
+defect, not the coverage. Adding the tenant column to `outbox_events`, to a vault query,
+or to a function signature is now a red suite rather than a review comment.
+
+#### Canary evidence
+
+10 breakages applied and reverted, 10 caught:
+
+| Breakage | Guard that fired |
+| --- | --- |
+| a new route mounted | `test_every_http_route_is_enumerated` |
+| a new tenant-free SQL statement | `test_every_sql_statement_in_the_source_is_enumerated` (was green) |
+| a query grows `where account_id` | `test_no_query_filters_or_writes_by_a_tenant` |
+| a function takes `account_id` | `test_no_function_takes_a_tenant_parameter` |
+| a migration adds `account_id` | `test_no_migration_carries_a_tenant_column` |
+| a row deleted from the table | the count ratchet + operation counts |
+| a negative test renamed | `test_every_entry_point_names_a_test_that_actually_exists` |
+| the 403 body leaks the tenant | `test_a_forbidden_body_does_not_vary_by_account` |
+| `/readyz` grows an `account_id` field | `test_readyz_names_no_account` |
+| a missing path answers 403 | `test_a_path_that_does_not_exist_is_404_for_every_account` |
+
+Plus an 11th: a stray `tests/tenant_canary.py` is caught by
+`test_no_test_file_is_left_uncollected`.
+
+No 403 was found on the tenant axis, so nothing needed changing in `src/`. The
+production tree is unchanged by this packet.
+
+#### Numbers
+
+- **26 new tests** in `tests/test_tenant_scoping.py`; suite **904 → 930** self-contained.
+- `gate.yml` `core-parity` floor **907 → 933**, raised in the same commit as the tests,
+  per the ratchet clause — and this time the clause caught a real defect rather than
+  guarding a hypothetical one, since a floor left at 907 would have cleared a commit
+  that added 26 tests and ran none of them.
+- Gate: **933 passed** with `MUSE_CORE_SCHEMAS=../core/schemas`, **930 passed / 3
+  skipped** without it. `gate-check --prove` is OK with the core tier and still fails
+  `gate.proof-missing` without it. 100% branch coverage held.
+- 3 skips are the pre-existing core-parity tests: `test_contracts.py::test_patterns_are_byte_identical_to_core`,
+  the telemetry-vocabulary drift guard in `test_error_vocabulary.py`, and the
+  manifest-drift guard in `test_openapi.py`.
+
 ### muse-08 — muse is on the fleet's Postgres 17, and the stack was never booted
 
 Packet `muse-08`: the local stack moves from `postgres:18-alpine` to

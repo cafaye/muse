@@ -60,7 +60,10 @@ tests/                pytest; one module per concern, plus tests/support/
                      Dependencies; test_error_vocabulary.py checks every
                      error class against core's vocabulary — see rule 19;
                      test_auth.py is the bearer contract and test_jwks.py the
-                     key-set cache — see rule 20)
+                     key-set cache — see rule 20;
+                     test_tenant_scoping.py enumerates the 12 account-scoped
+                     entry points and holds 3 of them to a tenant axis — see
+                     rule 24, and note the `test_*.py` naming it depends on)
 bin/prime             the gate: uv sync --locked && ruff && pytest
 gate.yml              the gate, declared: the command, the mise task, what it
                       needs from the machine, and the lines it must print
@@ -302,6 +305,59 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
    outside the suite — `bin/prime` (asserted by `test_dependencies.py`), `gate.yml`
    (asserted by `gate-check` and `gate_self_test.sh`) — is guarded for the same
    reason, and `muse-08` is the argument for why that pattern exists.
+24. **An isolation suite that claims a surface the service does not have is worse than
+    none.** Rule 20 established that muse refuses a token with no `account_id`, and it
+    is tempting to read that as "muse is tenant-safe". It is not, and the difference is
+    the whole of `muse-09`: muse stores **no tenant-owned rows**, so most of its surface
+    has no tenant axis to get wrong. `vault_secrets` is keyed by `provider` (one
+    platform credential per vendor, by design) and `outbox_events` has no tenant column
+    at all, because core's payload schema still pins `subject: platform` until D9.
+    `tests/test_tenant_scoping.py` therefore enumerates **12 account-scoped entry
+    points of which exactly three carry a tenant axis**, and asserts the *absence* of one
+    for the other nine — which is the only thing assertable about a discriminator that
+    does not exist. The count is deliberately not inflated; a reader who believes 12
+    surfaces are tenant-checked when 3 are is worse off than one who knows.
+    Three properties hold, and each has a test named after the failure it prevents:
+    - **Absence, never 403, on the tenant axis.** A 403 says "this exists and is not
+      yours", which is strictly more information than a 404 for a resource that never
+      existed — it is an enumeration oracle, and it is the difference between a caller
+      who learns nothing and one who can walk a namespace. muse's single 403 is
+      `InsufficientScope`, on the **capability** axis, and it is safe only because its
+      body cannot vary by tenant; that is asserted, not assumed. `MissingAccount` is a
+      401, because a 403 there would tell a caller holding a valid signature that the
+      token is real and only its tenant is wrong.
+    - **The enumeration is checked against the code, in both directions.** Every route
+      the running app serves (read off its generated OpenAPI document) must be in the
+      table, *and* the table must not claim a route the app does not serve; every SQL
+      string literal in `src/muse/` must be attributed to an entry point, **count
+      included**. `TENANT_SCOPED_COUNT` is pinned, so a packet that grows a fourth tenant
+      surface changes that number on purpose next to the negative test for whatever it
+      added. Read the HTTP surface off `app.openapi()["paths"]`, not `app.routes` — this
+      FastAPI version represents an included router as an opaque `_IncludedRouter` with
+      no `.routes`, so a route walk finds none of `POST /v1/route` and passes.
+    - **A tenant surface cannot grow quietly.** No query may mention a tenant column, no
+      migration may add one, and no function may take an account argument. Each is a
+      commit that would require rewriting the `PLATFORM` rows, because from that commit
+      a 404 is no longer the only correct answer to another account's data.
+    Two of these guards were wrong before they were right, and both were found by
+    breaking them rather than reading them (rule 23's discipline, unchanged):
+    - The SQL guard checked that every *enumerated* query was present but never that a
+      file held no *more* than the enumeration named, so a second tenant-free `select`
+      appended to `metering.py` went green. A set-difference guard is only as good as the
+      assertion saying which side is meant to be bigger.
+    - **24 of the 26 tests in this packet were never collected.** The file was first
+      written as `tests/tenant_scoping.py`, mirroring `darkroom-09`'s Rust layout where
+      every `.rs` under `tests/` is a target by convention. `pyproject.toml` sets
+      `testpaths` and **not** `python_files`, so pytest's default applies and the file
+      was skipped — the gate read `904 passed, 3 skipped` *before and after* the commit
+      that added it. Hence `test_no_test_file_is_left_uncollected`, which walks `tests/`
+      for a module defining `def test_` without matching the collection pattern, plus
+      `test_this_file_is_itself_collected`, because a guard that can pass because *it* is
+      not running is the worst version of this failure.
+    The D9 gap is **asserted, not papered over**: `Meter` knows the caller's `account_id`
+    and cannot write it, so the test checks the metered payload is exactly core's five
+    fields and the subject is core's reserved literal. A test implying the gap was closed
+    would be the defect, not the coverage.
 
 ## Dependencies
 
