@@ -423,6 +423,13 @@ def test_every_sql_statement_in_the_source_is_enumerated():
     Nine statements, all attributed to an enumerated entry point. A query is a tenant
     surface the moment it touches tenant data, so an unaccounted one is a surface with
     no negative test — the exact defect D18 measured at zero.
+
+    The **count** is asserted per file, not merely that every expected statement is
+    present, and that is the half this guard was missing the first time it ran. Asking
+    "does the file contain the query the table names?" passes just as happily when the
+    file holds *two* queries and the table names one of them: a canary that appended a
+    second, tenant-free `select count(*)` to `metering.py` went green. A set-difference
+    guard is only as good as the assertion saying which side is meant to be bigger.
     """
     found = {
         path.name: _string_literals(path)
@@ -437,10 +444,18 @@ def test_every_sql_statement_in_the_source_is_enumerated():
     )
     for name, expected in SQL_SITES.items():
         haystack = "\n".join(found[name]).lower()
+        named = {statement.lower() for statement in expected}
         for statement in expected:
             assert statement.lower() in haystack, (
                 f"{name}: enumerated query {statement!r} is not in the file"
             )
+        unnamed = [
+            literal.strip()[:60] for literal in found[name] if literal.strip().lower() not in named
+        ]
+        assert len(found[name]) == len(expected), (
+            f"{name} holds {len(found[name])} SQL statements and the enumeration names "
+            f"{len(expected)}; the unnamed ones are {unnamed}"
+        )
     assert sum(len(v) for v in SQL_SITES.values()) == QUERY_COUNT
 
 
