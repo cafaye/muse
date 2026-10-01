@@ -516,6 +516,48 @@ def _all_arguments(node) -> list[ast.arg]:
     return found
 
 
+def test_no_test_file_is_left_uncollected():
+    """A test file that pytest cannot collect is a file of tests that never run.
+
+    This is not hypothetical: this packet's own file was first written as
+    `tests/tenant_scoping.py`, mirroring `darkroom-09`'s Rust layout, where every
+    `.rs` under `tests/` is a target by convention. Python has no such convention —
+    `pyproject.toml` sets `testpaths` but not `python_files`, so pytest collects
+    `test_*.py` and `*_test.py` and nothing else. The 24 tests below ran green, were
+    reported green, and were **not in the gate**: `904 passed, 3 skipped` both before
+    and after the commit that added them.
+
+    So the guard is the one thing that would have caught it, and it is here for every
+    worker who writes a file rather than naming it right. A file that defines a `def
+    test_` and does not match the pattern is a suite that reports green while doing
+    nothing, which is the same defect as the SQL guard that passed on a file holding
+    two queries while naming one.
+    """
+    uncollected = [
+        path.name
+        for path in sorted((REPO_ROOT / "tests").rglob("*.py"))
+        if "def test_" in path.read_text()
+        and not path.name.startswith("test_")
+        and not path.name.endswith("_test.py")
+    ]
+    assert not uncollected, (
+        f"these files define tests but pytest does not collect them (pyproject sets "
+        f"`testpaths` and not `python_files`, so the default pattern applies): {uncollected}"
+    )
+
+
+def test_this_file_is_itself_collected(request):
+    """The guard above, applied to the file it lives in.
+
+    A guard that can pass because *it* is not running is the worst version of the
+    failure, so this one is deliberately trivial and deliberately here: it asserts its
+    own module is in the collected set. It costs a line and it is the difference
+    between a guard and a comment.
+    """
+    collected = {str(item.fspath) for item in request.session.items}
+    assert f"{Path(__file__).name}" in {Path(f).name for f in collected}
+
+
 # ---------------------------------------------------------------------------
 # Negative tests, one per entry point.
 # ---------------------------------------------------------------------------
