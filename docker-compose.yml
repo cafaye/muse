@@ -1,129 +1,366 @@
-# muse — local development stack.
+# muse's own compose file — an OVERRIDE, not a copy.
 #
-# The service, plus the postgres it now needs. v0 had no dependencies to stand up;
-# the vault and the outbox are this service's own database, so compose carries it.
+# It is passed SECOND, beside the compose file fetched from the kit ref named in
+# `kit.ref`:
 #
-# Migrations are a deploy step, not a startup step, so they are applied by hand:
+#   KIT_COMPOSE_DIR=<dir holding that ref>/templates/compose
+#   export KIT_COMPOSE_DIR
 #
-#   docker compose up -d db
-#   docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
-#   docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
+#   docker compose --project-directory . \
+#     -f "$KIT_COMPOSE_DIR/docker-compose.yml" \
+#     -f ./docker-compose.yml up -d --wait
 #
-# UPGRADING FROM A PRE-17 STACK — read this before `docker compose up`.
+#   docker compose --project-directory . \
+#     -f "$KIT_COMPOSE_DIR/docker-compose.yml" \
+#     -f ./docker-compose.yml exec -T postgres \
+#       psql -U muse -d muse < migrations/00001_outbox_events.sql
 #
-# This stack was on postgres:18 and is now on postgres:17, the fleet standard.
+# `bin/dev` is what `billing`, `courier` and `identity` run, and it is kit's
+# `templates/bin/dev.sh` copied verbatim into each of them. **muse does not have
+# one yet.** Until it does, the two-file form above is the whole loop, and
+# `KIT_COMPOSE_DIR` is not optional tidiness — read the next block, because
+# dropping it is silent and produces a green cluster with none of the fleet's
+# databases in it.
 #
-# FIRST, THE GOOD NEWS, and it is measured rather than assumed: with THIS compose
-# file, a stack on 18 never started at all. The 18 image moved its data directory —
-# `PGDATA` is `/var/lib/postgresql/18/docker` in postgres:18 and
-# `/var/lib/postgresql/data` in postgres:17 — so the `muse-db:/var/lib/postgresql/data`
-# mount below is the pre-18 path, and the 18 image refuses to start when it finds data
-# there. Verified: the container exits 1, and the named volume holds 0 files. So if
-# your only ever attempt was `docker compose up -d db` on this repository, you have no
-# 18 data to carry across and option 1 is the whole of what you need to do.
+# `KIT_COMPOSE_DIR` IS NOT OPTIONAL, AND OMITTING IT IS SILENT.
 #
-# If you DID get a working 18 database — by correcting the mount to
-# `/var/lib/postgresql`, or from a `docker run` of your own — then you have a real
-# cluster, and Postgres major versions have incompatible on-disk formats. 17 refuses
-# such a directory rather than corrupting it, verbatim:
+#   kit's compose file resolves its OWN build context and its initdb bind mount
+#   through `${KIT_COMPOSE_DIR:-.}`. Compose resolves a relative path against the
+#   PROJECT DIRECTORY, and `--project-directory .` above sets that to muse's
+#   root. So with the variable unset, kit's build context resolves to
+#   `<muse>/postgres` and its initdb mount to `<muse>/postgres/initdb`.
+#
+#   Neither directory exists here. Docker does not fail a missing bind source —
+#   it CREATES it as an empty directory — so the mount succeeds, the cluster
+#   comes up HEALTHY, and `/docker-entrypoint-initdb.d` is empty. No role, no
+#   database, no `REVOKE CONNECT`. The entire provisioning contract, absent
+#   behind a green health check, and the first symptom is a `psql` that says
+#   `FATAL: database "muse" does not exist` against a container that has been up
+#   for a minute.
+#
+# WHY THERE IS NO `db:` CONTAINER HERE ANY MORE, and it is the first thing a
+# reader will look for. kit's stack already ships one — `postgres`, built as
+# `kit-postgres:${KIT_POSTGRES_TAG:-17}` — and a second copy is two postgres
+# majors to upgrade and a port collision for the second developer on the machine.
+# Adopting kit's is an ENVIRONMENT override, which is the one kind of compose
+# merge that is correct key by key.
+#
+# `db:` WAS NAMED `db`, NOT `postgres`, and that is not a detail. A check that
+# looked for the NAME would have found nothing here and reported the fleet clean
+# while every copy of the platform stood right there. What is duplicated is the
+# container, and the container names itself in its `image:` line — so muse's was
+# `postgres:17-alpine`, the image kit's stack is built FROM, and that is what
+# made it a copy.
+#
+# THIS FILE OWNS FOUR THINGS AND NOTHING ELSE
+#
+#   1. `KIT_POSTGRES_DATABASES` — muse's database AND its role, which is the
+#      whole of what it says about postgres (kit ships the CLUSTER)
+#   2. the `muse` service: its image, its port, its environment
+#   3. `networks: [platform]` — see the note on it below
+#   4. nothing at all about the collector
+#
+# POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD ARE NOT HERE, and muse is the
+# repository whose history is the receipt. All three were on this file until the
+# adoption, and each is wrong now in a way that does not merely fail:
+#
+#   POSTGRES_USER     the official image creates this role as a SUPERUSER, and
+#                     `10-cluster.sh`'s closing sweep grants CONNECT on every
+#                     database in the cluster to `current_user`. So
+#                     `POSTGRES_USER: muse` did not give muse its own database;
+#                     it made muse a role that can open every other service's
+#                     database. Isolation by privilege is what makes one shared
+#                     cluster safe; isolation by superuser is the absence of it,
+#                     wearing the same green health check.
+#
+#                     And on a shared cluster it never even gets that far. The
+#                     image creates that role before any init script is sourced,
+#                     so the script's own
+#
+#                         CREATE ROLE "muse" LOGIN NOSUPERUSER NOCREATEDB
+#                             NOCREATEROLE NOREPLICATION PASSWORD '…'
+#
+#                     collides with it, `ON_ERROR_STOP=1` turns the collision into
+#                     a cluster that will not finish initdb, and the container
+#                     exits 3. That is a laptop that will not boot the stack,
+#                     discovered from advice a service's own compose file
+#                     published.
+#
+#   POSTGRES_DB       the cluster's ADMINISTRATION database. Created by the
+#                     image before any init script runs, for the same reason as
+#                     the role above, so the script's `CREATE DATABASE muse`
+#                     would find it already there. muse set this to `muse` too.
+#
+#   POSTGRES_PASSWORD the credential of EVERY role `10-cluster.sh` creates — it
+#                     hands each one `$POSTGRES_PASSWORD`. muse set it to `muse`,
+#                     which on its own container was a local throwaway and on a
+#                     shared one is a claim about nine databases at once. It is
+#                     kit's `${KIT_POSTGRES_PASSWORD:-cafaye}`, declared in kit's
+#                     compose file and set in `.env`, and the `MUSE_DATABASE_URL`
+#                     below INTERPOLATES that same variable rather than
+#                     hard-coding the pair it used to.
+#
+# kit's `tests/fleet_check.py` fails this repository over any of the three the
+# moment `kit.ref` exists below, and that failure has no discretion left in it.
+#
+# WHAT THE REMOVAL BUYS, in the only terms that matter here: muse becomes a role
+# that owns one database and is refused at the door of the others.
+#
+#     $ psql "postgres://muse:<pw>@localhost:15500/muse" \
+#         -tAc "select rolname, rolsuper, rolcreatedb from pg_roles
+#                where rolname = 'muse'"
+#      rolname | rolsuper | rolcreatedb
+#     ---------+----------+-------------
+#      muse    | f        | f
+#
+#     $ psql "postgres://muse:<pw>@localhost:15500/billing" -tAc "select 1"
+#     psql: error: connection to server … failed: FATAL:  permission denied
+#           for database "billing"
+#     DETAIL:  User does not have CONNECT privilege.
+#
+# Migrations are a deploy step, not a startup step, so they are still applied by
+# hand — the `exec -T postgres psql` line at the top of this file. They are not
+# optional: kit creates the DATABASE and the ROLE, and it creates no TABLES. A
+# first `up` against a fresh volume gives you an empty `muse` database and a
+# service whose first query is `relation "vault_secrets" does not exist`.
+#
+# WHAT BECAME OF THE `muse-db` VOLUME, AND OF THE 18 → 17 NOTE. Read this once if
+# you have run this stack before; it is the only migration this change costs.
+#
+# The old `db:` service mounted a NAMED volume, `muse-db`, at
+# `/var/lib/postgresql/data`. That volume is still on your machine and this file
+# no longer mentions it, so nothing will ever mount it again and nothing will
+# ever delete it. The rows in it are every provider credential you have stored,
+# and they are not reproducible from this repository.
+#
+#   1. Carry the rows across, if you have any worth carrying. The new cluster is
+#      a different volume in a different container, so a LOGICAL dump is the
+#      thing that crosses:
+#
+#        # against the OLD volume, from a throwaway container:
+#        docker run --rm -v muse-db:/data -v "$PWD":/out postgres:17-alpine \
+#          pg_dump -U muse -d muse -f /out/muse-17.dump
+#
+#        # then, against the merged stack, with the migrations applied FIRST:
+#        docker compose … exec -T postgres psql -U muse -d muse < migrations/00001_outbox_events.sql
+#        docker compose … exec -T postgres psql -U muse -d muse < migrations/00002_vault_secrets.sql
+#        docker compose … exec -T postgres \
+#          pg_restore -U muse -d muse --clean --if-exists < muse-17.dump
+#
+#      `pg_dump` defaults to a LOGICAL dump (plain SQL), and that is the point: a
+#      physical copy of the data directory is what cannot cross a volume or a
+#      major-version boundary, and a logical dump is exactly the thing that can.
+#      Restore into a database that already has the migrations applied.
+#
+#   2. Or throw it away, which is the right answer for a development database:
+#
+#        docker volume rm muse-db
+#
+#      Correct for everyone whose only ever attempt was `docker compose up -d db`
+#      on THIS file — see below for why that never worked on 18 — and the right
+#      answer for anyone who never stored a real provider key.
+#
+# THERE IS NO THIRD OPTION, and `docker compose down -v` IS NOT ONE. `down`
+# without `-v` leaves a named volume in place, and `down -v` removes the volumes
+# of the COMPOSE PROJECT it is run against. After this change that project is
+# kit's, and `muse-db` is not one of its volumes — so `down -v` no longer
+# reaches the volume this note is about, and the command above is the one that
+# does. That is a change in behaviour rather than of intent, and it is stated
+# here because a command that used to do the job and now silently does not is
+# the worst kind of note to leave out of a file.
+#
+# THE 18 → 17 HISTORY, because a developer who got a working 18 database out of
+# this repository still has one. Postgres major versions have incompatible
+# on-disk formats and 17 refuses such a directory rather than corrupting it:
 #
 #   FATAL:  database files are incompatible with server
 #   DETAIL:  The data directory was initialized by PostgreSQL version 18, which is
-#            not compatible with this version 17.11.
+#            not compatible with this version 17.
 #
-# (`17` may refuse slightly earlier, on a configuration parameter that only 18 writes —
-# `autovacuum_worker_slots` is new in 18 — but it refuses either way, and never
-# against a half-migrated directory.) So the fix is one of two:
+# The first, and better, news is that a stack built from THIS file never started
+# on 18 at all: the 18 image moved its `PGDATA` to `/var/lib/postgresql/18/docker`
+# while this file mounted `/var/lib/postgresql/data`, so the container exited 1
+# and the named volume was left holding 0 files. If your only ever attempt was
+# `docker compose up -d db` here, you have no 18 data to carry across and
+# option 1 above is the whole of what there is to do.
 #
-#   1. Delete the volume and re-migrate. Correct for a development stack, and the
-#      right answer for anyone whose 18 database never started:
+# NONE OF THAT IS A KIT REF PROBLEM ANY MORE. The major is kit's to choose —
+# `kit-postgres:${KIT_POSTGRES_TAG:-17}`, Debian rather than alpine because
+# pgvector cannot load on musl — and nothing in this repository pins one. That is
+# the point of adopting the stack rather than copying it: the pin is raised in
+# kit and picked up here.
 #
-#         docker compose down -v
-#         docker compose up -d db
-#         docker compose exec -T db psql -U muse -d muse < migrations/00001_outbox_events.sql
-#         docker compose exec -T db psql -U muse -d muse < migrations/00002_vault_secrets.sql
+# WHAT THIS FILE MAY NOT DO, and the collector is the reason
 #
-#      This loses every stored provider credential. If you have a real key in there,
-#      re-enter it after re-migrating rather than assuming the vault still has it.
+#   It may not touch `otel-collector`. Not its image, not its command, and above
+#   all not the `volumes:` entry that mounts `otel-collector.yml`. That file
+#   carries the redaction allowlist, which kit DERIVES from core's schemas; a
+#   service that owned it would be shipping a telemetry boundary nobody derived,
+#   and a provider's prompt or a customer's stored credential would leave the
+#   process inside it. kit's `tests/fleet_check.py` fails this repository over
+#   any of the three, and the moment `kit.ref` exists, that failure has no
+#   discretion left in it.
 #
-#   2. Dump on 18, restore on 17, if you need the rows:
+# WHY THERE IS NO `depends_on: otel-collector`, and it is load-bearing
 #
-#         docker compose exec -T db pg_dump -U muse -d muse > muse-18.dump
-#         docker compose down -v && docker compose up -d db   # now on 17
-#         # then apply migrations/00001 and 00002, and
-#         docker compose exec -T db pg_restore -U muse -d muse --clean --if-exists < muse-18.dump
-#
-#      `pg_dump` defaults to a *logical* dump (plain SQL), which is the point: a
-#      physical copy of the data directory is what cannot cross the version boundary,
-#      and a logical dump is exactly the thing that can. Restore the dump into a 17
-#      database that already has the migrations applied.
-#
-# There is no third option. `docker compose down` without `-v` leaves the volume in
-# place — the volume is named, so it survives the container, and that is the whole
-# reason this note exists.
-#
-# MUSE_VAULT_KEY has no default anywhere in this file. Generate one with
-# `uv run python -m muse.vault` and export it, or the service refuses to start — which
-# is the point: a vault that boots with a default key is a vault whose keys are
-# readable by anyone who can read this repository.
-#
-# There is no `identity` service here, so nothing in this stack can mint a token muse
-# will accept and `/v1/route` answers 503 for everything. That is the honest local
-# state rather than a gap: muse verifies tokens against a JWKS it fetches over the
-# network, and pointing it at the production issuer would be worse than useless. To
-# exercise the endpoint locally, run `identity` alongside this stack and set
-# MUSE_IDENTITY_ISSUER to its origin — the same value `guard` uses in the compose
-# network. The probes (/healthz, /readyz) do not consult an issuer and answer either
-# way.
+#   Nothing but the collector may be in a readiness path. A service that waits
+#   for the collector serves no traffic while the collector is down, which is
+#   strictly worse than serving traffic with no traces — and it teaches people
+#   to switch telemetry off, which is the opposite of what this file is for.
+#   kit's gate fails on a `depends_on` naming the collector, and its
+#   `tests/no_telemetry_in_readiness.sh` proves the property against a real
+#   collector by killing it and showing the service still serving.
 
 services:
-  db:
-    # 17-alpine, the fleet's majority image and the platform standard — muse was the
-    # only service on 18, and a one-deploy-many-services platform that carries two
-    # major versions carries two upgrade paths and a dump from muse that will not
-    # restore into any other service's database. The `alpine` variant is deliberate:
-    # it is the smallest image and three of the six services already pin it, so this
-    # is the exact tag darkroom, identity and parlor/e2e use.
-    #
-    # It is a downgrade, so read the header above before you bring it up: a
-    # developer with a real 18 data directory needs `pg_dump`/`pg_restore` or
-    # `down -v` first, and a developer whose 18 stack never started (most of
-    # them — see the header) just needs the volume recreated.
-    image: postgres:17-alpine
-    container_name: muse-db
+  # THE ONLY THING THIS FILE SAYS ABOUT POSTGRES, and it is one variable.
+  #
+  # kit ships the postgres CLUSTER: one database and one NOSUPERUSER role per
+  # service, created by `initdb/10-cluster.sh` on a fresh volume, with
+  # `REVOKE ALL ON DATABASE … FROM PUBLIC` applied to every database in it. muse's
+  # entire share of that is this line. Everything else about the cluster — the
+  # image, the major, the volume, the healthcheck, the connection budget — belongs
+  # to kit and is deliberately not restated here.
+  #
+  # There is no `image:`, no `build:`, no `ports:`, no `volumes:` and no
+  # `healthcheck:` in this block, and each of those five is load-bearing by its
+  # ABSENCE:
+  #
+  #   image / build   a service cannot bring its own container. `ports:` is a
+  #                   LIST and compose APPENDS a second file's list rather than
+  #                   substituting for it, so a `ports:` line here would leave
+  #                   postgres listening on kit's `${KIT_POSTGRES_PORT:-15500}`
+  #                   AND on this repository's old 5433 — and 5433 is a port
+  #                   another developer's stack may already want. The only way to
+  #                   MOVE a published port is its variable, in `.env`:
+  #                   `KIT_POSTGRES_PORT=…`, which replaces rather than appends.
+  #                   kit's gate fails this file over a `ports:` on the cluster.
+  #   volumes         kit owns `postgres-data`. A second `muse-db` mount here
+  #                   would be a volume nothing ever provisions, which is how a
+  #                   service ends up with a database the init script never made.
+  #   healthcheck     kit's is a real query (`psql … -tAc 'select 1'`), not a
+  #                   `pg_isready` decoration, and `depends_on: service_healthy`
+  #                   below is only worth anything because of it.
+  postgres:
     environment:
-      POSTGRES_USER: muse
-      POSTGRES_PASSWORD: muse
-      POSTGRES_DB: muse
-    ports:
-      # Published so `psql` on the host can apply migrations and store a credential.
-      - "5433:5432"
-    volumes:
-      - muse-db:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD
-        - pg_isready
-        - -U
-        - muse
-        - -d
-        - muse
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      # `KIT_POSTGRES_DATABASES` is the declaration, and each comma-separated name
+      # becomes BOTH a database and a NOSUPERUSER role that owns it. It is the
+      # single place muse's database and role come from — no second container, no
+      # second port, no second volume, which is the whole point of sharing one
+      # cluster.
+      #
+      # WHY IT IS `${…:-muse}` AND NOT A LITERAL `muse`. This is kit's variable,
+      # not muse's own port: the value an operator wants is the WHOLE FLEET's
+      # list, because one cluster serves every service, and that list does not
+      # fit in a service's repository. So it stays overridable from `.env`, and a
+      # single-service checkout still works with no configuration at all.
+      #
+      # The consequence is stated rather than hidden: whoever declares the list
+      # LAST against a shared volume decides what the next `up` sees, so a
+      # genuinely shared local cluster wants ONE operator-owned `.env` and not
+      # nine checkouts each contributing one name. `muse` is what a developer
+      # gets when they are the only one running, which is the common case here —
+      # this repository has no `.env` and nothing writes one for it.
+      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-muse}
+
+      # AND WHAT IS NOT HERE, IN ONE PLACE, because the first version of this
+      # block had all three: `POSTGRES_USER`, `POSTGRES_DB` and
+      # `POSTGRES_PASSWORD` were `muse` on this file until the adoption, and the
+      # reasons they had to go are written out at the top of this file where there
+      # is room for the measurements.
+      #
+      # `KIT_POSTGRES_ROLE_CONNECTIONS` is not raised either, and that is a
+      # measured decision rather than an omission. kit's default is 10 and muse's
+      # own pool default is 8 — `PsycopgDatabase.open(..., max_size=8)` in
+      # `src/muse/db.py` — so the running service fits inside 10 with room for the
+      # readiness probe. (`identity` raised its share to 50 because `go test ./…`
+      # runs several package binaries at once, each with its own pool, against ONE
+      # per-role budget; muse's suite opens no socket at all — AGENTS.md rule 3 —
+      # so the situation that forced identity's raise cannot arise here.)
+      #
+      # If a future muse fans out into N pool-holding workers, THIS is the line
+      # that moves, and the arithmetic to check it against is kit's:
+      # `KIT_POSTGRES_MAX_CONNECTIONS` is validated as a FLOOR of
+      # (role limit x declared databases) + reserved connections. The whole fleet
+      # declared at 50 would be 453 against a default of 200 and would fail that
+      # check, so a genuinely shared local cluster raises the budget ALONGSIDE
+      # this line, in `.env`, rather than here.
 
   muse:
     build:
       context: .
       dockerfile: Dockerfile
     image: cafaye/muse:dev
-    container_name: muse
+    # ON KIT'S `platform` NETWORK, and this line is not optional tidiness.
+    #
+    # kit puts every service it ships on a network called `platform`. A service
+    # in the SECOND compose file that declares no `networks:` lands on the
+    # project's `default` network instead, and `default` and `platform` are two
+    # different networks in two different DNS domains — so every hostname this
+    # service uses stops resolving the moment it starts. The symptom is not a DNS
+    # error at all:
+    #
+    #     Failed to connect to postgres:5432 after 0ms … Connection refused
+    #
+    # `MUSE_DATABASE_URL`'s `postgres` and muse's OTLP endpoint's
+    # `otel-collector` are the same lookup, and both are over the compose network
+    # by service name. `courier` found this the hard way and wrote it out on its
+    # own file; `identity` and `billing` do not declare it and are relying on the
+    # merged project's default network happening to line up.
+    networks:
+      - platform
+
+    # Published, because a developer runs `curl localhost:8000/healthz` and
+    # because the README's host-side instructions point at it.
+    #
+    # A literal, and NOT a `${KIT_*:default}` — this is muse's OWN port, not one
+    # of kit's. kit's port block is a statement about the shared infrastructure
+    # and claims 15000-15999 for itself; 8000 is muse's own historical port and
+    # moving it is a change to a published contract, not a compose edit.
+    #
+    # This port is safe where the old `db:` block's `5433:5432` was not, and the
+    # difference is the whole point of the section at the top of this file:
+    # `muse` is not a service kit ships, so nothing in the fetched stack already
+    # publishes 8000 and there is nothing for this list to APPEND itself to.
     ports:
       - "8000:8000"
     environment:
       MUSE_ENV: development
-      MUSE_DATABASE_URL: postgres://muse:muse@db:5432/muse
+      # Over the compose network, by service name. The host mapping above is for
+      # the developer and the host-side suite, and is not how the service reaches
+      # its own database.
+      #
+      # `muse:…` is the ROLE that `KIT_POSTGRES_DATABASES` above provisioned, and
+      # the `muse` at the end is that role's own database. The password is
+      # INTERPOLATED, and it used to be the literal `muse` to match the
+      # `POSTGRES_PASSWORD: muse` this file no longer sets. Every role
+      # `10-cluster.sh` creates takes the cluster's `POSTGRES_PASSWORD`, so that
+      # role's password is now kit's `${KIT_POSTGRES_PASSWORD:-cafaye}` and the
+      # pair this used to carry would have been a credential no role holds — an
+      # authentication failure at boot, not a security improvement. A cluster
+      # password changed in `.env` cannot leave this file authenticating as a
+      # password that no longer exists. (A password containing `@` or `/` will not
+      # survive URL interpolation unescaped; that is the cost of a URL string, and
+      # it is not worth a percent-encoder to keep a development default out of a
+      # comment.)
+      #
+      # THE SCHEME IS `postgres://` AND NOT `postgresql://`, and that is muse's
+      # DRIVER rather than a preference. `psycopg` accepts both — they are the same
+      # libpq prefix — so this could be spelled either way and nothing breaks.
+      # `identity` writes `postgresql://…?sslmode=disable` because Go's `lib/pq`
+      # defaults `sslmode` to `require` and would fail against a cluster with no
+      # SSL configured. `psycopg` 3 defaults it to `prefer`, which tries TLS and
+      # falls back to plaintext, so muse needs no parameter, and carrying one
+      # would be a no-op wearing the credit of a decision.
+      #
+      # `application_name` is absent here too, and for the same reason courier's
+      # is: on a shared cluster nine services share one `pg_stat_activity`, and a
+      # connection with no `application_name` cannot be placed in it. psycopg takes
+      # it as a real startup parameter rather than as a URL query parameter, so
+      # this URL is the wrong place for it — it belongs in the `AsyncConnectionPool`
+      # kwargs in `src/muse/db.py`. That is a change to the adapter and it is
+      # deliberately NOT smuggled in here.
+      MUSE_DATABASE_URL: postgres://muse:${KIT_POSTGRES_PASSWORD:-cafaye}@postgres:5432/muse
+
       # No default, on purpose. An empty value is a missing value, and muse treats a
       # missing key as a boot failure rather than a first-request failure.
       #
@@ -139,8 +376,14 @@ services:
       # not exist here would fail every request at the key-set fetch, and a *wrong*
       # issuer that does exist is a worse failure. Set it when identity is running.
       # MUSE_IDENTITY_ISSUER: http://identity:8080
+
+    # The database, and ONLY the database. Not the collector, for the reason at the
+    # top of this file. `service_healthy` rather than `service_started` because
+    # kit's probe is a real query against the admin database, so `healthy` here
+    # means a cluster that has finished initdb and accepted a connection — which
+    # is the state in which muse's own database exists.
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
@@ -153,6 +396,3 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
-
-volumes:
-  muse-db:

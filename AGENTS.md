@@ -52,7 +52,10 @@ src/muse/schemas/     core's telemetry schemas, vendored byte-identically
 migrations/           00001_outbox_events, 00002_vault_secrets
 config/routes.yaml    the routing table
 openapi/v1.yaml       the committed HTTP contract
-docker-compose.yml    the local stack: the service, and postgres:17-alpine
+docker-compose.yml    an OVERRIDE of kit's stack: the `muse` service, and the
+                     shared cluster's `KIT_POSTGRES_DATABASES`. Passed second,
+                     beside the compose file fetched from the ref in kit.ref
+kit.ref               the kit commit this repository runs — origin/master only
 tests/                pytest; one module per concern, plus tests/support/
                      (test_compose.py reads the compose file — see rule 23;
                      test_dependencies.py checks the suite's imports against
@@ -293,18 +296,25 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
    "mapping values are not allowed in this context" before it looked at a container.
    `muse-08` booted the stack, which is the only reason either was found, and left
    `tests/test_compose.py` behind so neither can come back: the file is parsed, the
-   database is asserted to be the platform standard's exact tag, the downgrade note is
-   asserted to still name `pg_dump`/`pg_restore` and `down -v`, and the vault key is
-   asserted to be a `${…:?…}` refusal rather than a literal. Nine breakages were
-   applied by hand to confirm each assertion can go red — including the first version
-   of the credential regex, which passed a committed `sk-proj-…` because it stopped
-   at the hyphen. Rule 14's discipline and the canary's apply here unchanged: **break
-   the guard on purpose and watch it go red, because a guard that passes is
-   indistinguishable from a guard that was never looking.**
-   The lesson generalises past compose: *every* file in this repository that only runs
-   outside the suite — `bin/prime` (asserted by `test_dependencies.py`), `gate.yml`
-   (asserted by `gate-check` and `gate_self_test.sh`) — is guarded for the same
-   reason, and `muse-08` is the argument for why that pattern exists.
+   downgrade note is asserted to still name `pg_dump`/`pg_restore` and `down -v`, and
+   the vault key is asserted to be a `${…:?…}` refusal rather than a literal. Nine
+   breakages were applied by hand to confirm each assertion can go red — including the
+   first version of the credential regex, which passed a committed `sk-proj-…` because
+   it stopped at the hyphen. Rule 14's discipline and the canary's apply here
+   unchanged: **break the guard on purpose and watch it go red, because a guard that
+   passes is indistinguishable from a guard that was never looking.**
+   `m39` took the same principle one layer further. muse no longer *has* a database
+   container — it joined kit's shared cluster — so the assertions that were about a
+   tag being right became assertions that there is no tag here at all: no `db:`
+   service, no `image:`/`build:`/`ports:`/`volumes:` on the cluster override, none of
+   `POSTGRES_USER`/`POSTGRES_DB`/`POSTGRES_PASSWORD`, and a `kit.ref` that is one
+   full 40-character sha. A stale assertion is worse than a missing one: it goes green
+   over a shape the repository no longer has. Eight breakages were applied by hand to
+   confirm each of the new ones goes red too. The lesson generalises past compose:
+   *every* file in this repository that only runs outside the suite — `bin/prime`
+   (asserted by `test_dependencies.py`), `gate.yml` (asserted by `gate-check` and
+   `gate_self_test.sh`) — is guarded for the same reason, and `muse-08` is the argument
+   for why that pattern exists.
 24. **An isolation suite that claims a surface the service does not have is worse than
     none.** Rule 20 established that muse refuses a token with no `account_id`, and it
     is tempting to read that as "muse is tenant-safe". It is not, and the difference is
@@ -473,7 +483,13 @@ uv run pytest -m unit                  # only unit-marked
 uv run pytest -k vault -vv             # one concern
 uv run ruff check . && uv run ruff format .
 uv run uvicorn --factory muse.main:create_app --reload   # local dev
-docker compose up --build
+
+# The local stack. This repository has NO bin/dev yet — billing, courier and
+# identity run kit's templates/bin/dev.sh verbatim — so it is the two-file
+# form, and KIT_COMPOSE_DIR is not optional. See docker-compose.yml.
+KIT_COMPOSE_DIR=<dir holding $(cat kit.ref)>/templates/compose
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml up -d --wait
 
 # The three contract tests that need a core checkout:
 MUSE_CORE_SCHEMAS=../core/schemas uv run pytest

@@ -1,0 +1,25 @@
+# The kit ref this repository runs. One line: a 40-character commit
+# sha, or a v<semver> tag. NEVER a branch.
+# Move it with:  git -C ../kit rev-parse origin/master > kit.ref
+#
+# WHY `origin/master` AND NOT LOCAL HEAD, which is the one line in this file
+# that is easy to get wrong in a way nothing reports.
+#
+#   A kit checkout that is ahead of its remote pins bytes that exist on exactly
+#   one machine. `git clone` of the CAFAYE fleet does not fetch anyone's
+#   `../kit`, so every other developer — and every CI runner — resolves that sha
+#   against kit's remote, does not find it, and the stack cannot be fetched at
+#   all. The failure names a missing commit rather than the mistake that caused
+#   it, and it happens on THEIR laptop, not on the one that wrote the line.
+#
+#   `origin/master` is the newest ref that is provably fetchable everywhere, so
+#   the pin is a statement about bytes rather than about a developer's working
+#   state. Re-run the command after `git -C ../kit fetch`; `bin/dev pin <ref>`
+#   does the same thing and prints the stack diff first, once this repository
+#   has a `bin/dev` to run it.
+#
+# NOT IN `.env`, and that is not an oversight. `.env` is git-ignored, so a pin
+# kept there exists on one laptop and on no CI runner and no teammate — which is
+# precisely the property this file exists to have. See kit's `.env.example`, which
+# says the same thing about the same key.
+d3d56f7a2e781186d46cdd8fcf735712940dcc97

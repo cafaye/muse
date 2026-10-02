@@ -110,8 +110,11 @@ second check.
 ## Requirements
 
 Python 3.14 and [uv](https://docs.astral.sh/uv/), both pinned in this repo. Postgres
-for the vault and the outbox. An OpenAI and/or an Anthropic API key, if you want
-anything other than the probes to answer.
+for the vault and the outbox — which is `kit`'s SHARED cluster rather than a container
+of this repository's own, so the stack is brought up with the two-file form below and
+not with a bare `docker compose up`, which would start the service against no database
+at all. An OpenAI and/or an Anthropic API key, if you want anything other than the
+probes to answer.
 
 ```sh
 mise install          # reads mise.toml -> python 3.14, uv 0.12.20
@@ -122,9 +125,17 @@ JWKS it fetches over the network, so `/v1/route` answers 503 without an issuer. 
 probes consult nothing and answer either way.
 
 ```sh
+# The local stack. This file is an OVERRIDE, passed second beside the compose file
+# fetched from the kit ref named in `kit.ref` — so there are two of them, and
+# KIT_COMPOSE_DIR is not optional. Get it wrong and the cluster comes up HEALTHY
+# having run no init script: no role, no database, no boundary. The header of
+# docker-compose.yml has the whole story; this is the shape of it.
+KIT_COMPOSE_DIR=<dir holding $(cat kit.ref)>/templates/compose
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml up -d --wait
+
 # If identity is not running on the compose network, the probes still work and the
 # endpoint 503s. This is the honest local state, not a gap.
-docker compose up --build
 ```
 
 ## Quick start
@@ -135,10 +146,14 @@ docker compose up --build
 #    keys are readable by anyone who has read this repository.
 uv run python -m muse.vault
 
-# 2. Point it at a database and apply the migrations.
-createdb muse
-psql muse -f migrations/00001_outbox_events.sql
-psql muse -f migrations/00002_vault_secrets.sql
+# 2. Apply the migrations. The DATABASE and the ROLE are provisioned by kit's init
+#    script on a fresh volume; it creates no TABLES, so this is not optional.
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml \
+  exec -T postgres psql -U muse -d muse < migrations/00001_outbox_events.sql
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml \
+  exec -T postgres psql -U muse -d muse < migrations/00002_vault_secrets.sql
 
 # 3. Store a credential. `muse` has no admin API in v1; this is a psql session.
 MUSE_VAULT_KEY=<the key from step 1> uv run python - <<'PY'
@@ -156,16 +171,26 @@ async def main():
 asyncio.run(main())
 PY
 
-# 4. Run it.
-MUSE_VAULT_KEY=<key> MUSE_DATABASE_URL=postgres://localhost/muse \
+# 4. Run it outside compose. The port is kit's, not the 5433 this file used to
+#    publish, and the password is the CLUSTER's — `muse` is a NOSUPERUSER role that
+#    owns one database on a cluster the rest of the fleet shares, and is refused at
+#    the door of every other one.
+MUSE_VAULT_KEY=<key> \
+  MUSE_DATABASE_URL=postgres://muse:cafaye@localhost:15500/muse \
   uv run uvicorn --factory muse.main:create_app --reload
 ```
 
-Or with compose, which does all of the above except the API key:
+Or with the stack above already up, which does all of this except the API key:
 
 ```sh
-MUSE_VAULT_KEY=<key> docker compose up --build
+MUSE_VAULT_KEY=<key> docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml up -d --wait
 ```
+
+Coming from the stack this file used to own? The old `db:` service mounted a named
+volume, `muse-db`, and nothing mounts or deletes it any more. `docker-compose.yml`
+says what to do with it, and the short version is `docker volume rm muse-db` once you
+have decided the stored provider credentials in it are not worth a `pg_dump`.
 
 ## Endpoints
 
