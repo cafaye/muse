@@ -5,6 +5,44 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### The local stack: kit's shared cluster, and a `bin/dev` that does not exist yet
+
+**`docker-compose.yml` is now an OVERRIDE passed second beside kit's fetched
+stack**, in the shape `billing`, `courier` and `identity` already have. This
+changes the local loop, so it is here rather than only in the diff.
+
+**What a developer has to do differently.** `docker compose up --build` no
+longer brings up a database — this file no longer carries one. The stack is two
+files:
+
+```sh
+KIT_COMPOSE_DIR=<dir holding $(cat kit.ref)>/templates/compose
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml up -d --wait
+```
+
+`KIT_COMPOSE_DIR` is not optional and the failure is silent: kit's compose file
+resolves its own initdb bind mount through `${KIT_COMPOSE_DIR:-.}`, compose
+resolves a relative path against the project directory, and Docker *creates* a
+missing bind source as an empty directory. Drop the variable and the cluster
+comes up **healthy having run no init script at all** — no role, no database,
+no `REVOKE CONNECT`. `docker-compose.yml`'s header has the measurement.
+
+**The port moved.** The old `db:` service published `5433:5432`. Host-side
+`psql` now goes to kit's `${KIT_POSTGRES_PORT:-15500}`, and it needs the
+cluster password (`cafaye` by default) rather than none. A `ports:` under the
+`postgres` override would have bought BOTH ports, because compose appends a
+second file's `ports:` list rather than substituting it.
+
+**`muse-db` is now nobody's volume.** It is still on your machine and nothing
+mounts or deletes it. `docker compose down -v` no longer reaches it either —
+that removes the volumes of the compose *project*, and the project is now kit's.
+`docker-compose.yml` names both recoveries: `pg_dump`/`pg_restore` across, or
+`docker volume rm muse-db`.
+
+**Migrations are still a manual step**, unchanged in kind: kit creates the
+database and the role, and creates no tables.
+
 ### Licence: muse is MIT, and it was AGPL-3.0-only
 
 The one licence change in this packet, and the only deliberate departure from
