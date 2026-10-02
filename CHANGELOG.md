@@ -5,6 +5,70 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### `RouteRequest.temperature` is a decimal string, and a JSON number is a 422
+
+**BREAKING, on one field, with no deprecation window.** `temperature` was
+`type: number` and is now `type: string` carrying a plain decimal in [0, 2].
+`caf contract breaking --tiers all` reports it at all three tiers and all three
+are honest:
+
+```
+property-same-type [SOURCE+JSON+WIRE] #/components/schemas/RouteRequest/temperature:
+  Property "temperature" on schema "RouteRequest" changed type from "number" to "string".
+```
+
+**What a caller has to do.** Send the value as a string.
+
+```diff
+- {"model": "fast", "messages": [...], "temperature": 0.3}
++ {"model": "fast", "messages": [...], "temperature": "0.3"}
+```
+
+A JSON number is refused with a **422 naming `temperature`**, not coerced.
+
+**Why a float could not stay.** Kubernetes' API conventions refuse them at
+`api-conventions.md:603`: they "cannot be reliably round-tripped and have
+varying precision across languages and architectures". The concrete cost is on
+the write path and it is not theoretical — `cafaye-ts` had already generated
+`temperature?: number` from the old document:
+
+```ts
+// a TypeScript caller computing a temperature
+temperature: 0.1 + 0.2     // -> wire: 0.30000000000000004
+```
+
+JavaScript stringifies every number through `float64`, so all seventeen of
+those digits reach LiteLLM as a sampling parameter. `0.1 + 0.2` is
+`0.30000000000000004` in Python for the same reason, and a Ruby caller doing
+the same arithmetic has it too. A decimal string has no `float64` anywhere on
+the path: the caller writes the digits they mean.
+
+**Why a string and not an integer with a scale.** An integer (milli-degrees,
+`700` meaning 0.7) was the other option and it is not what the provider takes:
+LiteLLM declares `temperature: float | None`, so a scale would have to be divided
+back out on the way to the provider anyway, and every caller would have to know
+the scale. A decimal string is Kubernetes' own advice for a
+provider-passthrough parameter where exact bytes matter, and the conversion to a
+float happens exactly once — in `RouteRequestBody.sampling_temperature()`, at the
+same seam `cost_per_1k_tokens` converts money on, and for the same reason (rule 9).
+
+**Why no deprecation window.** Accepting a number for one version and coercing it
+would keep the `float64` round-trip alive on purpose, and would make the code
+accept a shape the document does not describe — the "OpenAPI says one thing and
+the service does another" defect, in a contract system. The break lands whole and
+a caller gets a 422 naming the field, which is a one-line fix.
+
+**Accepted forms.** `0`, `0.0`, `0.7`, `1`, `1.0`, `1.25`, `2`, `2.0`, `0.250`.
+Refused with a 422: `2.5`, `3`, `-1`, `1e-3`, `NaN`, `""`, `.5`, `+1`, `01`,
+`1.`, `1.5.5`, `0x1`, `" 1"`, `"1 "`. The range is enforced in
+`TEMPERATURE_PATTERN` rather than in prose, because a pattern is what a generated
+client can actually check, and `tests/test_openapi.py` asserts the document and
+that constant are the same string. Absent still means the provider's own default,
+and absent is still never sent to the provider.
+
+**`gate.yml`'s `core-parity` floor is raised 933 → 964 in this commit**, measured
+rather than counted: 937 passed before this change, 964 after.
+
 ### The local stack: kit's shared cluster, and a `bin/dev` that does not exist yet
 
 **`docker-compose.yml` is now an OVERRIDE passed second beside kit's fetched

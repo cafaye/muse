@@ -128,6 +128,13 @@ class CompletionRequest:
     model: str
     messages: tuple[Message, ...]
     max_tokens: int | None = None
+    #: A float, and the LAST float. `temperature` is a decimal string on the wire
+    #: (`openapi/v1.yaml`, because Kubernetes' API conventions refuse floats at
+    #: `api-conventions.md:603`) and becomes a float exactly once, in
+    #: `api.RouteRequestBody.sampling_temperature()`. Everything downstream of
+    #: here is the provider seam, and this type is vendor-neutral rather than a
+    #: wire type, so it carries the value the way LiteLLM wants it. See
+    #: `complete()` below for the one call that hands it over.
     temperature: float | None = None
 
     def __post_init__(self) -> None:
@@ -416,6 +423,12 @@ class LiteLLMProvider:
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         if request.temperature is not None:
+            # THE ONLY PLACE a caller-supplied temperature is a float. It arrives
+            # from the wire as a decimal string and is converted once, in
+            # `api.RouteRequestBody.sampling_temperature()`, because this is the
+            # seam where a float is unavoidable: LiteLLM declares
+            # `temperature: float | None`. Omitted rather than sent as `None`
+            # because some vendors reject an explicit null.
             kwargs["temperature"] = request.temperature
         try:
             response = await self.litellm.acompletion(**kwargs)

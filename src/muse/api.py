@@ -33,6 +33,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request, Response
@@ -79,6 +80,25 @@ TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 TRACE_HEADER = "X-Trace-Id"
 
+#: `temperature` on the wire, and the one place that grammar is written down.
+#:
+#: Plain decimal in [0, 2]: no exponent, no leading `+`, no `NaN`, and no `.5`
+#: without the zero. The range lives in the pattern rather than only in the
+#: description because a pattern is what a generated client can enforce, and a
+#: bound written only in prose is a sentence rather than a check. It is the same
+#: string the OpenAPI document publishes on `RouteRequest.temperature`, which is
+#: what makes the two a contract instead of two statements that agree today —
+#: `tests/test_openapi.py` asserts the document and this constant are the same
+#: pattern.
+#:
+#: The alternative was an integer with a scale (milli-degrees, so `700` means
+#: 0.7), which keeps the wire integral without a string. It is not what the
+#: provider takes: LiteLLM declares `temperature: float | None`, so a scale would
+#: have to be divided back out on the way to the provider anyway, and every
+#: caller would have to know the scale. A decimal string is the Kubernetes advice
+#: for a provider-passthrough parameter where exact bytes matter.
+TEMPERATURE_PATTERN = r"^(?:0(?:\.[0-9]+)?|1(?:\.[0-9]+)?|2(?:\.0+)?)$"
+
 
 #: The request body. `extra="forbid"` because core closes request bodies like it
 #: closes schemas: a typo'd `max_token` that is silently ignored leaves a caller
@@ -91,7 +111,46 @@ class RouteRequestBody(BaseModel):
         min_length=1, description="The conversation, oldest message first."
     )
     max_tokens: int | None = Field(default=None, gt=0)
-    temperature: float | None = None
+    # A decimal STRING, because a float on the wire is a value the caller cannot
+    # round-trip. It was `float | None` and openapi/v1.yaml said `type: number`;
+    # Kubernetes' API conventions refuse that at `api-conventions.md:603` because
+    # floats "cannot be reliably round-tripped and have varying precision across
+    # languages and architectures". The concrete failure is a JavaScript caller
+    # sending `0.1 + 0.2`, which `float64` puts on the wire as
+    # `0.30000000000000004` — real digits, all of them forwarded to the provider.
+    #
+    # `sampling_temperature()` converts, and it is the ONLY place in this
+    # repository where this value becomes a float: LiteLLM takes
+    # `temperature: float | None`, so a float is unavoidable at that seam and
+    # unavoidable exactly once. That is the same single-conversion seam
+    # `cost_per_1k_tokens` converts money on, for the same reason.
+    temperature: str | None = Field(default=None, pattern=TEMPERATURE_PATTERN)
+
+    def sampling_temperature(self) -> float | None:
+        """The caller's decimal string as the float LiteLLM wants, or None.
+
+        The two `ValueError` arms are a BACKSTOP, not the check: pydantic has
+        already validated `temperature` against `TEMPERATURE_PATTERN`, which is the
+        same grammar the OpenAPI document publishes, so nothing that reaches here
+        from the endpoint can trip either arm.
+
+        They exist because this method is also reachable directly — a test, or a
+        future caller building the model itself — and because a `Decimal` that
+        raises is an unhandled 500 rather than the 422 the contract promises for a
+        malformed temperature. Unreachable from `/v1/route` and covered as a unit
+        test is the honest way to hold that line: a `pragma: no cover` here would
+        hide the day the pattern and this method stopped agreeing, which is the one
+        thing that must not happen silently.
+        """
+        if self.temperature is None:
+            return None
+        try:
+            value = Decimal(self.temperature)
+        except InvalidOperation as error:
+            raise ValueError(f"temperature {self.temperature!r} is not a decimal number") from error
+        if not Decimal(0) <= value <= Decimal(2):
+            raise ValueError("temperature must be between 0 and 2 inclusive")
+        return float(value)
 
 
 class RouteMessage(BaseModel):
@@ -275,7 +334,7 @@ def build_router() -> APIRouter:
                 body.model,
                 [(message.role, message.content) for message in body.messages],
                 max_tokens=body.max_tokens,
-                temperature=body.temperature,
+                temperature=body.sampling_temperature(),
                 secrets=container.credentials_held(),
             )
         except RouteNotFound as error:

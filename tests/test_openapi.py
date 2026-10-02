@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from muse.api import RouteRequestBody, RouteResponseBody
+from muse.api import TEMPERATURE_PATTERN, RouteRequestBody, RouteResponseBody
 from muse.auth import SCOPE, SCOPE_CLAIM, SCOPES_CLAIM
 from muse.contracts import TOKENS_CONSUMED, validate_event_type
 from muse.main import create_app
@@ -525,6 +525,45 @@ def test_the_document_closes_its_request_schema() -> None:
     """A typo'd `max_token` is rejected rather than ignored, so a caller who
     misspells it finds out instead of believing they capped the response."""
     assert spec()["components"]["schemas"]["RouteRequest"]["additionalProperties"] is False
+
+
+def test_the_document_declares_temperature_as_a_string_and_the_code_agrees() -> None:
+    """The one field whose type changed, held from both sides.
+
+    `temperature` was `type: number`. Kubernetes' API conventions refuse floats at
+    `api-conventions.md:603` — they cannot be reliably round-tripped — and a
+    JavaScript caller sending `0.1 + 0.2` had the provider receive
+    `0.30000000000000004` as a sampling parameter. It is a decimal string on the wire
+    now.
+
+    Two assertions rather than one, because either alone is satisfiable by accident: the
+    document could say `string` while the model still took a float (a document that
+    describes a shape the service does not implement is worse than the original
+    violation, because it lies in a machine-readable way), and the model could take a
+    string while the document still said `number` (which is what generated
+    `temperature?: number` in `cafaye-ts`).
+    """
+    documented = spec()["components"]["schemas"]["RouteRequest"]["properties"]["temperature"]
+    assert documented["type"] == "string"
+
+    annotation = RouteRequestBody.model_fields["temperature"].annotation
+    assert annotation == (str | None), f"the model still declares {annotation!r}"
+
+
+def test_the_published_temperature_pattern_is_the_one_the_code_enforces() -> None:
+    """One grammar, written down once and checked against itself.
+
+    `TEMPERATURE_PATTERN` is the range check the service applies and the `pattern` in
+    the document is the range check a generated client applies. Two copies of that
+    grammar would drift, and the drift would be silent in the direction that matters:
+    a document that accepts `2.5` while the service refuses it, or a document that
+    refuses `2.0` while the service accepts it.
+
+    The negative control is in `test_a_temperature_the_pattern_refuses_is_a_422`, which
+    is what makes this a comparison rather than a tautology.
+    """
+    documented = spec()["components"]["schemas"]["RouteRequest"]["properties"]["temperature"]
+    assert documented["pattern"] == TEMPERATURE_PATTERN
 
 
 def test_the_choices_are_exactly_one() -> None:

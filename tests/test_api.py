@@ -23,8 +23,11 @@ The app is built per test with a container of fakes, so no test opens a socket
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from muse.api import RouteRequestBody
 from muse.providers import Price, ProviderRegistry
 from muse.providers.credentials import StaticCredentials
 from muse.providers.fake import ScriptedProvider
@@ -202,10 +205,146 @@ async def test_the_optional_parameters_reach_the_provider() -> None:
     provider = serving()
     async with asgi_client(app_for(provider)) as client:
         await client.post(
-            "/v1/route", json={**BODY, "max_tokens": 64, "temperature": 0.3}, headers=AUTH_HEADERS
+            "/v1/route", json={**BODY, "max_tokens": 64, "temperature": "0.3"}, headers=AUTH_HEADERS
         )
     assert provider.requests[0].max_tokens == 64
+    # A string on the wire, a float at the provider — the conversion happens once, in
+    # `sampling_temperature()`, because LiteLLM takes a float and nothing else does.
     assert provider.requests[0].temperature == 0.3
+
+
+@pytest.mark.parametrize("sent", ["0", "0.0", "0.7", "1", "1.0", "1.25", "2", "2.0", "0.250"])
+async def test_a_temperature_in_range_is_accepted_as_a_decimal_string(sent: str) -> None:
+    """Every spelling of a value in [0, 2] that a caller might reasonably write.
+
+    The set is the contract's, not this test's: `2.0` and `2` are the same temperature
+    and both are valid, and the range is enforced in `TEMPERATURE_PATTERN` rather than
+    in prose so a generated client can enforce it too.
+    """
+    provider = serving()
+    async with asgi_client(app_for(provider)) as client:
+        response = await client.post(
+            "/v1/route", json={**BODY, "temperature": sent}, headers=AUTH_HEADERS
+        )
+    assert response.status_code == 200
+    assert provider.requests[0].temperature == float(sent)
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [
+        "2.5",  # out of range, high
+        "3",
+        "-1",  # out of range, low
+        "1e-3",  # an exponent is not plain decimal
+        "NaN",
+        "",
+        ".5",  # no leading zero
+        "+1",
+        "01",  # no leading zeros
+        "1.",
+        "1.5.5",
+        "0x1",
+        " 1",  # whitespace is not trimmed
+        "1 ",
+    ],
+)
+async def test_a_temperature_the_pattern_refuses_is_a_422(sent: str) -> None:
+    """A refused value never reaches a provider.
+
+    Asserted through the response rather than by calling the validator, because the
+    contract is a 422 with no provider call and a unit test on a pydantic model cannot
+    see either half. A value that got past this would be billed.
+    """
+    provider = serving()
+    async with asgi_client(app_for(provider)) as client:
+        response = await client.post(
+            "/v1/route", json={**BODY, "temperature": sent}, headers=AUTH_HEADERS
+        )
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert provider.requests == []
+
+
+async def test_a_numeric_temperature_is_a_422_and_the_body_says_why() -> None:
+    """The breaking half of the string change, asserted as the failure it is.
+
+    `temperature` was `type: number`. A caller still sending a JSON number gets a 422
+    naming the field rather than a silent coercion: coercing it would put the float
+    back on the wire that this change exists to take off it, and a 422 that names the
+    field is a fix a caller can make in one edit.
+    """
+    provider = serving()
+    async with asgi_client(app_for(provider)) as client:
+        response = await client.post(
+            "/v1/route", json={**BODY, "temperature": 0.3}, headers=AUTH_HEADERS
+        )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "validation_failed"
+    assert "temperature" in json.dumps(body)
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    ("stored", "message"),
+    [
+        ("hot", "is not a decimal number"),
+        ("2.5", "must be between 0 and 2 inclusive"),
+        ("-1", "must be between 0 and 2 inclusive"),
+    ],
+)
+def test_sampling_temperature_refuses_what_the_pattern_already_refused(
+    stored: str, message: str
+) -> None:
+    """The backstop, exercised directly.
+
+    These three cannot arrive over HTTP — pydantic refuses them against
+    `TEMPERATURE_PATTERN` first, which is what the endpoint-level table in
+    `test_a_temperature_the_pattern_refuses_is_a_422` proves. They are reachable by
+    building the model directly, and a `Decimal` that raised here would be an
+    unhandled 500 rather than the 422 the contract promises, so both arms raise
+    `ValueError` naming what was wrong.
+
+    The point of the test is the seam, not the arithmetic: `TEMPERATURE_PATTERN` is
+    the contract and this is the method that assumes it, so if a future edit relaxes
+    the pattern these three cases are the ones that notice.
+    """
+    body = RouteRequestBody.model_construct(
+        model="fast", messages=[{"role": "user", "content": "hello"}], temperature=stored
+    )
+    with pytest.raises(ValueError, match=message):
+        body.sampling_temperature()
+
+
+def test_sampling_temperature_of_none_is_none() -> None:
+    """Absent stays absent all the way to the provider seam: some vendors reject an
+    explicit null, so `None` means "send nothing" rather than "send nothing"."""
+    body = RouteRequestBody.model_construct(
+        model="fast", messages=[{"role": "user", "content": "hello"}], temperature=None
+    )
+    assert body.sampling_temperature() is None
+
+
+async def test_a_temperature_written_by_arithmetic_is_not_widened_on_the_wire() -> None:
+    """The hazard the string exists to remove, asserted on the value that arrives.
+
+    `0.1 + 0.2` is `0.30000000000000004` in IEEE-754 and in JavaScript, where every
+    number is a `float64` on its way to JSON. A number-typed field would forward all
+    seventeen digits to the provider as a sampling parameter. A caller who writes the
+    digits they mean gets exactly those digits converted, once.
+    """
+    widened = repr(0.1 + 0.2)
+    assert widened == "0.30000000000000004", "IEEE-754 changed under this test"
+
+    provider = serving()
+    async with asgi_client(app_for(provider)) as client:
+        response = await client.post(
+            "/v1/route", json={**BODY, "temperature": "0.3"}, headers=AUTH_HEADERS
+        )
+    assert response.status_code == 200
+    assert provider.requests[0].temperature == 0.3
+    assert provider.requests[0].temperature != 0.1 + 0.2
 
 
 async def test_a_multi_turn_conversation_reaches_the_provider_in_order() -> None:

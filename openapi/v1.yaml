@@ -23,7 +23,35 @@ openapi: 3.1.0
 
 info:
   title: muse
-  version: 1.1.0
+  # 1.1.1 IS A BREAKING CHANGE TO ONE FIELD, and the minor bump is deliberate
+  # rather than an oversight — muse is 0.x, so this document's own scheme is
+  # conventional-compat and a field whose type changed does not earn a major.
+  #
+  # `RouteRequest.temperature` was `type: number` and is now `type: string`
+  # carrying a decimal. Kubernetes' API conventions refuse floats at
+  # `api-conventions.md:603` because they "cannot be reliably round-tripped and
+  # have varying precision across languages and architectures", and the concrete
+  # cost lands on the caller: a TypeScript client sends `0.1 + 0.2`, JavaScript
+  # stringifies every number through `float64`, and the provider receives
+  # `0.30000000000000004` as a sampling parameter. `cafaye-ts` had already
+  # generated `temperature?: number` from the old document, so this was not
+  # theoretical.
+  #
+  # `caf contract breaking` reports it at all three tiers — SOURCE, JSON and WIRE —
+  # and all three are honest: a TypeScript caller stops compiling, a Ruby caller
+  # stops round-tripping, and the bytes on the wire are different.
+  #
+  # **There is no deprecation window, and that is a decision rather than an
+  # omission.** A window here would mean accepting a JSON number for at least one
+  # version and coercing it — which is precisely the `float64` round-trip this
+  # change exists to remove, kept alive on purpose for a version. It would also make
+  # the document the thing that decides: this file says `type: string`, so a
+  # generated client sends a string, and a code path that accepts something the
+  # document does not describe is the "OpenAPI describes one shape while the service
+  # implements another" defect, in a contract system. So the break lands whole. A
+  # caller sending a number gets a **422 naming `temperature`**, which is a one-line
+  # fix, rather than a silent coercion that hides the change from everybody.
+  version: 1.1.1
   summary: LLM routing, credentials vault, and token metering for cafaye.
   description: |
     muse routes a chat completion to the first provider that can serve it, holds
@@ -526,6 +554,8 @@ components:
             service's decision, and letting a caller name one would defeat the
             fallback chain.
           examples: [fast, smart]
+          # 1.1.1 changes `temperature` from `type: number` to `type: string`. A
+          # numeric sample is a 422, and it is a 422 that names the field.
         messages:
           type: array
           minItems: 1
@@ -539,10 +569,39 @@ components:
             A cap on the response. Omitted means the provider's default. A null is
             not sent to the provider at all — some vendors reject it.
         temperature:
-          type: number
-          minimum: 0
-          maximum: 2
-          description: Sampling temperature, passed through unchanged.
+          type: string
+          pattern: '^(?:0(?:\.[0-9]+)?|1(?:\.[0-9]+)?|2(?:\.0+)?)$'
+          description: |
+            Sampling temperature, as a **decimal string**. A number is a 422.
+
+            This was `type: number` and it is now a string, which is a BREAKING
+            change and the reason is Kubernetes' API conventions at
+            `api-conventions.md:603`: floats "cannot be reliably round-tripped and
+            have varying precision across languages and architectures". The
+            concrete cost is on the write path. A TypeScript caller writes
+            `temperature: 0.1 + 0.2`; JavaScript stringifies every number through
+            `float64`, so `0.1 + 0.2` goes on the wire as `0.30000000000000004`.
+            Every one of those digits is a real provider parameter, and the
+            provider does not round it the way the caller meant. A Ruby caller
+            building the value arithmetically has the same problem in the other
+            direction, and `cafaye-ts` generated `temperature?: number` straight
+            from the old document — the hazard was already in a shipped client.
+
+            A decimal string has no `float64` anywhere on the path: the caller
+            writes the digits they mean, this service validates them, and the
+            conversion to a float happens once, at the seam where LiteLLM requires
+            one (`temperature: float | None`). That single conversion is the only
+            place the value is ever not-exact, and it is the last thing that
+            happens before a third-party library takes it — the same seam
+            `cost_per_1k_tokens` converts money on, and for the same reason.
+
+            The accepted form is plain decimal, no exponent and no leading `+`, so
+            `0`, `0.7`, `1`, `1.25`, `2` and `2.0` are all valid and `2.5`, `-1`,
+            `1e-3` and `NaN` are all a 422. The range check is in the pattern
+            rather than in prose because a pattern is what a generated client can
+            actually enforce, and a bound written only in a description is a
+            sentence rather than a check. Absent means the provider's own default,
+            which is never sent to the provider at all.
 
     Choice:
       type: object

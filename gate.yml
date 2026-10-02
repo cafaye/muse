@@ -107,7 +107,19 @@ gate:
       # direction* -- a reviewer adding tests must raise it here in the same
       # commit, and the alternative (leave the floor, lose the ratchet) is the
       # failure this note exists to prevent.
-      minimum: 933
+      # RAISED 933 -> 968 by the polyglot-numeric packet, measured rather than
+      # counted by hand: the suite read 937 passed, 3 skipped on the tree before
+      # this commit and 968 passed, 3 skipped after, so the exact delta is +31.
+      # Those are the tests for `RouteRequest.temperature` becoming a decimal
+      # string — 9 accepted spellings, 14 refused ones, the JSON-number break,
+      # the float64 widening the change exists to remove, 4 reaching
+      # `sampling_temperature()`'s two backstop arms and its absent case, and 2
+      # document-against-code guards. Same ratchet clause as the two raises above:
+      # the count moves because the suite got bigger, and the floor moves with it
+      # or it describes a suite that no longer exists. Measured with `git stash`
+      # over the six changed files rather than arithmetic, because the number in
+      # this comment is the one a reader will trust.
+      minimum: 968
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

@@ -224,6 +224,13 @@ class Router:
     ) -> RoutedCompletion:
         """Serve `model`, or raise.
 
+        `temperature` is a float HERE, at the provider boundary, and a decimal
+        string on the wire. `api.RouteRequestBody.sampling_temperature()` makes
+        that conversion, once, and this is the last signature before it reaches
+        LiteLLM — which is why the float never appears in a contract, a log line
+        or a span. The router's own callers in tests pass a float directly and
+        are not going through the wire at all.
+
         Raises `RouteNotFound` for a model nothing routes, `AllCandidatesFailed`
         carrying the per-candidate chain when every candidate was tried, and
         `ValueError` for a malformed request — the last raised before any provider
