@@ -34,11 +34,15 @@
 # four-line stub that prints the summary lines muse's real `bin/prime` prints,
 # captured verbatim from an actual run:
 #
-#     ============================= 907 passed in 102.01s ============================
+#     ============================= 973 passed in 102.01s ============================
+#
+# ...with the count READ OUT OF gate.yml by `parity_summary` below rather than
+# written here, because a literal in this file is a floor the next packet has to
+# remember to move, and the control case below fails the moment it does not.
 #     Required test coverage of 100% reached. Total coverage: 100.00%
 #
 # The stub exists so that thirteen breakages do not mean thirteen real gate
-# runs (each is a `uv sync --locked` plus a 907-test suite; the brief's own
+# runs (each is a `uv sync --locked` plus a ~970-test suite; the brief's own
 # rule is no sleeps, and a self-test whose runtime is thirteen suites is a
 # self-test nobody runs). It is NOT evidence that muse's gate works. That is
 # the other
@@ -203,6 +207,36 @@ STUB
   chmod +x "$dir/bin/prime"
 }
 
+# parity_floor — the `minimum:` belonging to the `core-parity` proof.
+#
+# THE CLEAN-RUN COUNT IS DERIVED, NOT WRITTEN DOWN, and that is a fix rather than
+# a tidy-up. Every clean-run stub in this file hardcoded `907 passed`, a figure
+# from the muse-08 era. So when gateway-rename-muse-01 raised the `core-parity`
+# floor from 968 to 973 — correctly, in the same commit as the suite that moved —
+# the CONTROL went red with `gate.floor: proof 'core-parity' reported 907 and the
+# declaration's floor is 973`, and 1 of 20 cases failed.
+#
+# A self-test whose control breaks every time the real floor moves is a self-test
+# that trains its reader to re-baseline the stub instead of reading the failure,
+# which is the opposite of what it is for. So the stub prints exactly the declared
+# floor: the control is green because the declaration and the gate agree, not
+# because two literals happen to match. The `floor` breakage further down still
+# goes red, and for the right reason — it raises the declaration to 999 while the
+# stub still prints the real floor, so `gate.floor` fires on a promise the gate
+# does not keep.
+#
+# `core-parity`'s own `minimum:` and not the first one in the file: `suite`
+# carries 890, and a stub printing 890 would be under the floor for a different
+# reason than the one each breakage is testing.
+parity_floor() {
+  awk '/- id: core-parity/{found=1} found && /minimum:/{print $2; exit}' gate.yml
+}
+
+parity_summary() {
+  printf '============================= %s passed in 102.01s ============================' \
+    "${1:-$(parity_floor)}"
+}
+
 # check <dir> [extra args...] — run the checker, capture output and code.
 # The exit code is the checker's own, read from the command substitution
 # rather than from `$?` of a pipeline: `$?` under `set -o pipefail` here is
@@ -328,7 +362,7 @@ expect_no_leak() {
 # refused everything would satisfy every expectation below.
 # --------------------------------------------------------------------------
 control="$(fresh_copy control)"
-install_stub "$control" '============================= 907 passed in 102.01s ============================'
+install_stub "$control" "$(parity_summary)"
 expect_green 'the control — an unmodified declaration, proved and static — is green in both phases' \
   "$control" --prove
 
@@ -399,15 +433,16 @@ expect_red 'a proof pattern that does not compile, which would otherwise read as
 # sits BEHIND a successful match, so the gate has to actually print the line
 # for the checker's floor-reading to be the thing that refuses.
 b="$(fresh_copy proof-unmeasurable)"
-install_stub "$b" '============================= 907 passed in 102.01s ============================'
+install_stub "$b" "$(parity_summary)"
 edit "$b/gate.yml" "match: '^=+ ([0-9]+) passed'" "match: '^=+ [0-9]+ passed'"
 expect_red 'a proof with a floor and no capture group to read the floor from' \
   "$b" 'gate.proof-invalid' --prove
 
 b="$(fresh_copy floor)"
-install_stub "$b" '============================= 907 passed in 102.01s ============================'
+install_stub "$b" "$(parity_summary)"
 edit "$b/gate.yml" 'minimum: 890' 'minimum: 999'
-expect_red 'a gate that proves 907 tests where the declaration promised 999' "$b" 'gate.floor' --prove
+expect_red "a gate that proves $(parity_floor) tests where the declaration promised 999" \
+  "$b" 'gate.floor' --prove
 
 # A gate that ran, printed its proof, and failed. `gate.proof-missing` on its
 # own would accept a gate that printed nothing AND exited zero; this is the
@@ -416,7 +451,7 @@ b="$(fresh_copy nonzero)"
 write "$b/bin/prime" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-echo '============================= 907 passed in 102.01s ============================'
+echo "$(parity_summary)"
 echo 'FAILED tests/test_vault.py::test_a_thing - AssertionError' >&2
 exit 1
 SH
@@ -498,7 +533,7 @@ write "$b/bin/prime" <<'SH'
 # way a failing assertion that formats a connection string does.
 set -uo pipefail
 echo "could not reach ${DATABASE_URL:-unset}"
-echo '============================= 907 passed in 102.01s ============================'
+echo "$(parity_summary)"
 exit 1
 SH
 chmod +x "$b/bin/prime"
