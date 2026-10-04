@@ -4,7 +4,7 @@
 process starts and dies with it. The brief for this packet said it outright, and the
 reason generalises: a test key that reaches a repository is a key every fork has, and
 the file that is supposed to be harmless becomes the one credential an attacker does
-not have to guess. `guard` pins a key under `test/` because TypeScript's signer needs a
+not have to guess. `gateway` pins a key under `test/` because TypeScript's signer needs a
 stable one; Python can mint an RSA-2048 pair in well under a second, so nothing is
 pinned and nothing can leak.
 

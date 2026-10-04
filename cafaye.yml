@@ -7,7 +7,7 @@
 # in the same commit.
 #
 # What each part is for is in core's docs/manifest-conventions.md. The short version:
-# `caf dev`, `caf gen`, `pantry` and `guard` all read this one file rather than six
+# `caf dev`, `caf gen`, `pantry` and `gateway` all read this one file rather than six
 # bespoke config files, which is how cross-repo drift starts.
 
 name: muse
@@ -42,7 +42,7 @@ exposes:
     - muse.tokens.consumed
 
 # muse subscribes to nothing in v0. It is a leaf service: a routed request comes from
-# guard or from a caller, and usage leaves on the bus. A consumer list would be
+# gateway or from a caller, and usage leaves on the bus. A consumer list would be
 # omitted rather than left empty, per core's manifest conventions.
 consumes: []
 
@@ -64,7 +64,7 @@ consumes: []
 # > rather than in core is how two contracts end up disagreeing.
 # >
 # >  1. **The capability claim's *name*.** `core/docs/openapi-conventions.md:134`
-# >     requires `scopes`; `guard/src/middleware/jwt.ts:32` reads a space-separated
+# >     requires `scopes`; `gateway/src/middleware/jwt.ts:32` reads a space-separated
 # >     `scope`. Nobody has ruled, and `identity` mints **both**, byte-identical, with
 # >     a test holding them equal — an interim that exists so the decision can land
 # >     without rotating a credential already in a customer's hand. muse accepts
@@ -82,27 +82,48 @@ consumes: []
 # >     namespace to core's conventions document: the vocabulary is the platform's to
 # >     extend, not one service's.
 # >
-# >  3. **`account_id` is required here, and stricter than `guard`.** core requires it
-# >     for authenticated service traffic and every query is scoped by it. `guard`
+# >  3. **`account_id` is required here, and stricter than `gateway`.** core requires it
+# >     for authenticated service traffic and every query is scoped by it. `gateway`
 # >     treats a missing or non-string `account_id` as `undefined` and falls back to
 # >     `sub` for rate-limit keying; muse **refuses** the request, because muse bills
 # >     and meters per tenant and the lenient behaviour would make an unattributable
 # >     spend. The two answers are both defensible and they are *not* the same
 # >     question — a rate-limit key is a worse thing to lose than a tenancy claim is to
 # >     gain. Requested: a fleet-wide ruling on which, because the day a service is
-# >     written against `guard`'s answer and muse's, the discrepancy becomes a
+# >     written against `gateway`'s answer and muse's, the discrepancy becomes a
 # >     cross-tenant read.
 # >
 # > Also recorded, and not a question: the accepted algorithm is RS256 only, where
-# > core's conventions allow RS256 and ES256. `guard` made the same choice and for the
+# > core's conventions allow RS256 and ES256. `gateway` made the same choice and for the
 # > same reason — the algorithm is a property of the key set `identity` publishes, not
 # > a hint the token carries. Widening is a one-line change and belongs with the
 # > moment `identity` publishes ES256 keys.
+# WHY THE OTHER ENTRY IS NAMED THE WAY IT IS. This is the one name in this file that is
+# not muse's to choose, and it is worth saying why that makes it the most dangerous line
+# here. `dependencies[].name` is a lookup key: `caf dev` and `pantry` resolve it against
+# the fleet's own registry and start the service it names. So this line is not a label,
+# it is a reference — and a reference has to be *true*, in every repository that holds
+# one, at the same time.
+#
+# Which is what the m39 fleet-wide rename from `guard` to `gateway` demonstrated the hard
+# way. Eight repositories were swept and this one was missed, leaving the last dependency
+# in the fleet pointing at a service no registry had under that name: a manifest that
+# parses, validates against core's schema, and composes to nothing. Nothing in the fleet
+# checks it — `kit`'s `fleet_check.py` reads this file for the shared cluster and for
+# stale container copies, and never reads this key at all, and `core`'s `fleet.yml` is an
+# EVENT registry that its own header says is not a service registry. So the only thing
+# standing between this line and the same drift again is
+# `tests/test_openapi.py::test_the_manifest_declares_exactly_the_services_it_runs_behind`,
+# which asserts the full set rather than testing each name for membership — a membership
+# test is what let the old name sit here while the test beside it agreed with it.
+#
+# So: if this service is ever renamed, this line changes in the same commit as every other
+# repository's reference to it, and the test above is the check that it did.
 dependencies:
   - name: identity
     version: ^0.1.0
     required: true
-  - name: guard
+  - name: gateway
     version: ^0.1.0
     required: false
 

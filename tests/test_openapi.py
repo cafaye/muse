@@ -662,14 +662,154 @@ def test_the_manifest_points_at_the_openapi_document() -> None:
     assert manifest()["exposes"]["api"] == "openapi/v1.yaml"
 
 
+def declared_dependencies() -> list[dict]:
+    return list(manifest()["dependencies"])
+
+
+#: The services `dependencies:` names, as an ORDERED pin and not a membership set. Two
+#: properties of the shape are load-bearing and both were got wrong the first time.
+#:
+#: **It is a list, compared with `==`, not a set tested with `in`.** A membership test
+#: asks only "is every declared name one I recognise", so it is blind to a name being
+#: *added* and blind to the shape entirely: the previous form here was
+#: `assert dependency["name"] in {"identity", "guard"}`, which reads like a check on the
+#: fleet's service names and checks nothing but itself — the set is defined three lines
+#: above the loop that consults it, so it cannot disagree with the manifest without a
+#: human editing both, and a human editing both is what a rename is.
+#:
+#: **It is ordered.** Not because order is meaningful — it is not, and a reorder here is
+#: a harmless diff — but because `sorted(...) == sorted(...)` over a LIST is what makes a
+#: duplicate visible. Compare sets and a name listed twice collapses into one element and
+#: the second declaration, which `caf dev` would resolve and a reader would read as a
+#: typo nobody caught, is invisible.
+#:
+#: WHAT THIS PIN CANNOT DO, stated here rather than left for the next reader to
+#: discover. It is a local pin: the expectation lives in the same file as the thing it
+#: checks, so it is satisfied by *agreement*, never by *correctness*. Rename every
+#: reference in the fleet to a name that resolves to nothing, update this tuple in the
+#: same commit, and this test is green. That is not a hypothetical — it is precisely how
+#: the m39 rename left this repository pointing at `guard` while its own test agreed with
+#: it. The test below is the one that asks the outside question.
+FLEET_SERVICES_MUSE_RUNS_BEHIND = ("identity", "gateway")
+
+
+def test_the_manifest_declares_exactly_the_services_it_runs_behind() -> None:
+    """The whole `dependencies:` list, exactly.
+
+    `dependencies[].name` is a lookup key rather than a label: `caf dev` and `pantry`
+    resolve it against the fleet's registry and start the service it names, so a name
+    the fleet does not hold composes to nothing — a manifest that parses, validates
+    against core's schema, and starts no one.
+    """
+    declared = [dependency["name"] for dependency in declared_dependencies()]
+    assert declared == list(FLEET_SERVICES_MUSE_RUNS_BEHIND), (
+        f"cafaye.yml declares {declared}; this repository runs behind "
+        f"{list(FLEET_SERVICES_MUSE_RUNS_BEHIND)}. Add a dependency here AND in the "
+        "pin above, in the same commit — a name added to one and not the other is the "
+        "drift this file exists to refuse. If a service was renamed, this is the line "
+        "that changes, and it changes in every repository that names it at once."
+    )
+
+
 def test_every_declared_dependency_is_a_service_and_not_a_package() -> None:
     """core's rule 4: a package belongs in the language's lockfile. A gem or a module
-    listed here is a dependency nothing can resolve."""
-    for dependency in manifest()["dependencies"]:
-        assert dependency["name"] in {"identity", "guard"}
+    listed here is a dependency nothing can resolve.
+
+    The old version of this test asserted each name against a hardcoded set, which is
+    the assertion this file's own header argues against: it re-decided, in the test, the
+    fact the manifest already records, so it could only ever catch a *typo* — and the
+    typo that actually happened, a whole repository left behind by a rename, sailed
+    through it.
+
+    So the rule is derived instead of retyped. The source of truth for "is this a
+    package?" is `pyproject.toml` — a package is a distribution this project installs,
+    so a dependency name that also appears in the declared requirement set is a package
+    listed as a service, and `uv.lock` resolves it while `caf dev` does not. The set is
+    read out of `tests/test_dependencies.py` rather than parsed a second time here,
+    because two parsers for one file is one of them a copy that rots.
+    """
+    from .test_dependencies import _declared
+
+    declared = {dependency["name"] for dependency in declared_dependencies()}
+    assert not declared & _declared(), (
+        f"{sorted(declared & _declared())} — core's rule 4: a package belongs in the "
+        "language's lockfile. `uv sync --locked` would resolve it; `caf dev` and "
+        "`pantry` resolve `dependencies[].name` against the fleet registry and would "
+        "find no service under it."
+    )
 
 
-def test_identity_is_a_required_dependency_and_guard_is_not() -> None:
+def test_every_declared_dependency_resolves_in_the_fleet_registry() -> None:
+    """The one assertion here that asks a question this repository cannot answer alone.
+
+    `dependencies[].name` is resolved against a registry that lives outside this
+    repository, so every other test in this file is a pin: the expectation is written
+    beside the thing it checks, and a test written beside the thing it checks agrees
+    with it by construction. That is not a weak version of the check — it is a
+    different question, and it is the question that had no answer here.
+
+    The m39 rename renamed the service in eight repositories and missed this one, so
+    `cafaye.yml` went on naming a service no registry held under that name while the
+    test beside it named the same thing. Nothing was red. Verified while sweeping it:
+    `kit`'s `fleet_check.py` reads this manifest for the shared cluster and for stale
+    container copies and never reads this key; `core`'s `fleet.yml` is an EVENT
+    registry whose own header says it is not a service registry. So the fleet has no
+    other check on this line, and the pin above could not become one without being
+    edited in the same commit as the drift.
+
+    `core`'s `fleet.yml` is the closest thing to a registry that a checkout can reach,
+    and reading it here is what makes this test different in kind: it can fail on a name
+    nobody in this repository chose.
+
+    THE LIMIT, because a check that cannot be trusted is worse than none. `fleet.yml`
+    records the services that PUBLISH EVENTS — `identity`, `billing`, `courier`, `muse`,
+    `gateway` — and not the rest of the fleet, so a future dependency on a service that
+    publishes nothing (`kit`, `caf`) fails here even though the name is perfectly good.
+    The failure message says so rather than making the next reader guess which of the
+    two readings applies, because guessing in the other direction is how a real rename
+    gets waved through as a registry gap.
+    """
+    root = core_root()
+    if root is None:
+        pytest.skip("MUSE_CORE_SCHEMAS is not set; skipping resolution against the fleet")
+    registry = root / "fleet.yml"
+    if not registry.is_file():
+        pytest.fail(
+            f"MUSE_CORE_SCHEMAS is set to {os.environ['MUSE_CORE_SCHEMAS']!r} and core "
+            f"was found, but there is no fleet.yml beside its schemas. The only check "
+            "in the fleet on a dependency NAME has just lost the file it reads, and a "
+            "check that cannot find its target is not a check."
+        )
+    recorded = {
+        service["name"]
+        for service in yaml.safe_load(registry.read_text(encoding="utf-8"))["services"]
+    }
+    # The floor, before the absence. `unknown == set()` below is an absence, and an
+    # absence computed from an empty registry is vacuously the absence this test was
+    # written to catch — so a `fleet.yml` that parsed to no services at all would make
+    # the failure below loud by accident rather than by design. Asserting the floor
+    # first turns that into a named failure, which is the discipline AGENTS.md states
+    # for every set-difference guard in this repository.
+    assert len(recorded) >= len(FLEET_SERVICES_MUSE_RUNS_BEHIND), (
+        f"core's fleet.yml records {sorted(recorded)} — fewer services than the "
+        f"{len(FLEET_SERVICES_MUSE_RUNS_BEHIND)} this manifest runs behind. A registry "
+        "that has lost its rows would make the assertion below vacuously true, so it is "
+        "refused before it is asked."
+    )
+    declared = {dependency["name"] for dependency in declared_dependencies()}
+    unknown = declared - recorded
+    assert not unknown, (
+        f"{sorted(unknown)} — core's fleet.yml records {sorted(recorded)}, and a "
+        "dependency `caf dev` and `pantry` cannot resolve is one no registry holds. "
+        "Two readings, and this message refuses to pick for you: either the name is a "
+        "spelling the fleet no longer has, which is the missed-rename this test was "
+        "written for, or the service publishes no events and core's registry — an EVENT "
+        "registry, not a service registry, as its own header says — has no row for it. "
+        "Read it, then fix the one that is wrong."
+    )
+
+
+def test_identity_is_a_required_dependency_and_the_public_edge_is_not() -> None:
     """muse-06, and the reason is a serving fact rather than a preference.
 
     `identity` was `required: false` while the token was an unchecked header. Every
@@ -677,13 +817,18 @@ def test_identity_is_a_required_dependency_and_guard_is_not() -> None:
     answers `/v1/route` with 503 for every request — and a soft dependency is how
     `caf dev` and a topology tool start a service that cannot serve.
 
-    `guard` stays soft: it is the public edge, and a service is reachable without an
+    `gateway` stays soft: it is the public edge, and a service is reachable without an
     edge in front of it. Asserted as the *pair* because the two are the same field with
     two meanings, and a test that checks one without the other cannot tell which is
     which.
+
+    The name is not in the function name. It used to be — `..._and_guard_is_not` — and
+    a rename has to edit a test's name to keep it honest, which is the one rename edit
+    with no compiler and no assertion behind it. It is asserted twice over instead: in
+    the value below, and by the two tests above.
     """
-    required = {d["name"]: d["required"] for d in manifest()["dependencies"]}
-    assert required == {"identity": True, "guard": False}
+    required = {d["name"]: d["required"] for d in declared_dependencies()}
+    assert required == {"identity": True, "gateway": False}
 
 
 def test_the_manifest_records_the_open_auth_decisions() -> None:

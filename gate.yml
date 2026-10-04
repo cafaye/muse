@@ -92,6 +92,16 @@ gate:
       # cross-repo tier did not execute. It is also a ratchet in the other
       # direction: delete one of the three and the parity gate goes red.
       #
+      # THERE ARE NOW FOUR, not three, because gateway-rename-muse-01 added
+      # test_openapi.py::test_every_declared_dependency_resolves_in_the_fleet_registry.
+      # So the arithmetic above reads 973 - 969, and the floor at the bottom of
+      # this block is 973. A fourth cross-repo tier is a cost worth stating: it
+      # means a run on a machine with no core checkout skips one more test, which
+      # is why the `suite` proof below has a generous floor and this one has an
+      # exact one. The two floors answer different questions and that is the
+      # design — one asks "did the suite shrink", the other asks "did every
+      # cross-repo check actually run".
+      #
       # RAISED 898 -> 907 by muse-08, then 907 -> 931 by muse-09, and the
       # second raise is the ratchet clause above catching a real defect rather
       # than a hypothetical one. muse-09 added 26 tenant-isolation tests, and
@@ -119,7 +129,26 @@ gate:
       # or it describes a suite that no longer exists. Measured with `git stash`
       # over the six changed files rather than arithmetic, because the number in
       # this comment is the one a reader will trust.
-      minimum: 968
+      #
+      # RAISED 968 -> 973 by gateway-rename-muse-01, which added ONE test and so
+      # moved the self-contained tier from 968 to 969 — but it also added a FOURTH
+      # core-gated test, and that is what the floor has to carry. Measured, not
+      # counted: `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest` reports
+      # `1 failed, 972 passed`, and the one failure is
+      # `test_the_vendored_schema_is_byte_identical_to_core` — PRE-EXISTING on
+      # clean `d4d5128`, before this packet touched anything, reported in
+      # REPORT-gateway-rename-muse-01.md and deliberately not fixed here, because
+      # re-vendoring core's schema is core's call and not a rename's side effect.
+      # 972 + 1 = 973 is the count when all four core-gated tests execute, which is
+      # what this floor means.
+      #
+      # And this is the ratchet clause catching a real defect rather than
+      # theorising, the third time it has. Leaving 968 here would have cleared a run
+      # at 972 — five tests of headroom — so deleting any ONE of the four
+      # cross-repo guards would have stayed green, which is the exact failure
+      # muse-08 recorded above and the reason the floor moves in the same commit as
+      # the suite rather than the next one.
+      minimum: 973
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

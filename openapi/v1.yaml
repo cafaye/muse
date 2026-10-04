@@ -18,7 +18,7 @@ openapi: 3.1.0
 #   * bearer auth stated in the security scheme
 #
 # The probe endpoints are deliberately absent. They are infrastructure, not contract:
-# guard and any orchestrator reach them by convention, and documenting them would put
+# gateway and any orchestrator reach them by convention, and documenting them would put
 # /healthz under the /v1 rule it does not belong under. They are in the README.
 
 info:
@@ -454,7 +454,7 @@ components:
         conventions and RFC 8693 agree on. The claim's *name* is an **open platform
         decision** and this service accepts either, because `identity` currently mints
         both and nobody has ruled: core's `docs/openapi-conventions.md` requires
-        `scopes`, and `guard` reads `scope`. **A token carrying both names where they
+        `scopes`, and `gateway` reads `scope`. **A token carrying both names where they
         disagree is refused** rather than merged, preferred or unioned — a token whose
         two authorisation claims contradict each other is a token this service does not
         understand, and guessing which one the issuer meant is how an escalation about a

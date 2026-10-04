@@ -5,6 +5,78 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### The dependency was named `guard`, and nothing in the fleet could see it
+
+**`cafaye.yml` declared `dependencies[].name: guard`.** The service was renamed
+to `gateway` fleet-wide in m39 — eight repositories were swept and this one was
+missed, so the last reference to the old name in the fleet was a line that
+*resolves*: `caf dev`, `caf gen` and `pantry` look the name up in the fleet's
+registry. A manifest that parses, validates against core's schema and starts
+nothing has been on master since.
+
+```diff
+  dependencies:
+    - name: identity
+-   - name: guard
++   - name: gateway
+```
+
+**Not a caller-visible break.** No request, response or wire format changed. The
+cost was that `caf dev` and `pantry` would look for a service no registry holds.
+
+**And the guard was inside the guard.** `tests/test_openapi.py` held the only
+check in the fleet on that line, and it read
+
+```python
+assert dependency["name"] in {"identity", "guard"}
+```
+
+— a membership test against a set defined three lines above it. Measured before
+changing anything: rename the manifest and both old tests go red, so the *shape*
+is not blind in the way a membership test usually is. The defect is one level up.
+The expectation lives in the same file as the thing it checks, so it is satisfied
+by *agreement* and never by *correctness* — rename every reference in the fleet
+to a name resolving to nothing, edit the set in the same commit, and it is green.
+That is not a hypothetical. It is how the old name sat here for the length of a
+fleet-wide rename with its own test agreeing with it.
+
+Three assertions now, in increasing order of what they can see:
+
+| test | what it can fail on |
+|---|---|
+| `..._declares_exactly_the_services_it_runs_behind` | manifest vs. a pin in this file. Ordered **list** equality, so a duplicate dependency is visible — compare sets and a name listed twice collapses into one element |
+| `..._is_a_service_and_not_a_package` | a dependency that is really a distribution. Derived from `pyproject.toml` instead of retyping the manifest's own fact |
+| `..._resolves_in_the_fleet_registry` | **a name this repository never chose.** Reads `core`'s `fleet.yml` through the `MUSE_CORE_SCHEMAS` checkout the other cross-repo guards use |
+
+The third is the one that could have caught this. Its limit is stated in its own
+docstring rather than left to be discovered: `fleet.yml` records the services that
+*publish events*, so a future dependency on a non-publisher (`kit`, `caf`) fails
+there on a perfectly good name, and the failure message names both readings
+instead of guessing.
+
+**Verified, not asserted.** Renaming the manifest back to `guard` with nothing
+else changed: three of three red, and the registry one reports
+`['guard'] — core's fleet.yml records ['billing', 'courier', 'gateway',
+'identity', 'muse']`.
+
+**Cost: a fourth core-gated test, and an exact floor.** `bin/prime` reads
+`969 passed, 4 skipped` where it read `968 passed, 3 skipped`. `gate.yml`'s
+`core-parity` floor is an exact ratchet and moved 968 → 973 in the same commit:
+leaving 968 would have cleared a run at 972, so deleting any one of the four
+cross-repo guards would have stayed green.
+
+**46 lines renamed across 11 files.** `186` occurrences of `guard` at `d4d5128`,
+`149` after — `186 − 46 + 9`, where the 9 added are comments that name the old
+name on purpose to explain the rename. The other occurrences are the **tripwire**
+sense: `guard` in this repository has always meant both *the service* and *an
+assertion*, used the way "test" is used. Of the 132 distinct lines still matching,
+**78 are tripwires and only 5 name the old service**, all five deliberately, in the
+comments that explain this rename. Renaming any of the other 78 would delete a
+sentence — `"a guard that cannot find its target is not a guard"` is a rule about
+tripwires, and it is the rule this sweep was working under.
+
+The 26 in this file are history and stay: the changelog records what was true.
+
 ### `RouteRequest.temperature` is a decimal string, and a JSON number is a 422
 
 **BREAKING, on one field, with no deprecation window.** `temperature` was
