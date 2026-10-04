@@ -91,13 +91,18 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
    one so a test reads the payload a collector would really receive). The suite
    is fast, hermetic, and parallel-safe.
    `TestClient`/live-`uvicorn` is for the rare case that genuinely needs a real
-   server. Three tests skip unless `MUSE_CORE_SCHEMAS` points at a core checkout;
+   server. Four tests skip unless `MUSE_CORE_SCHEMAS` points at a core checkout;
    they say so rather than passing quietly. (The tests that validate a span
    against core's telemetry schema are not among them: that schema ships inside
-   the package, so only its *byte-identity* with core needs a checkout.)
+   the package, so only its *byte-identity* with core needs a checkout.) The
+   fourth is
+   `test_openapi.py::test_every_declared_dependency_resolves_in_the_fleet_registry`
+   — the assertion that a dependency's name resolves against `core`'s
+   `fleet.yml`, and therefore the only one in the fleet that can fail on a name
+   this repository never chose.
 4. **Assert exact JSON shapes, not field presence.** `assert body == {...}` for
    every response. `in` checks let a stray new key slip through and break the
-   contract that `guard` and the generated SDKs depend on.
+   contract that `gateway` and the generated SDKs depend on.
 5. **`/healthz` checks nothing; `/readyz` checks everything.** Liveness must not
    consult a dependency or an outage becomes a restart loop. Readiness reports
    per-dependency status and is the only place allowed to fail on a dependency.
@@ -444,15 +449,21 @@ Three things in it are load-bearing here and are easy to undo by accident:
   breakage 13 asserts the red, and its companion asserts the green that
   deleting the proof would restore.
 - **`proof[].minimum` is a ratchet, and the `core-parity` floor is exact.**
-  `890` is below the suite's 903 so a new test does not need the floor raised
-  first; `906` is the exact count when the core tier runs, and dropping one of
-  the three drift guards takes it under. **So adding tests means raising
+  `890` is below the suite's 969 so a new test does not need the floor raised
+  first; `973` is the exact count when the core tier runs, and dropping one of
+  the four drift guards takes it under. **So adding tests means raising
   `core-parity`'s floor in the same commit.** `muse-08` learned this the
   expensive way: it added 8 hermetic compose tests, and a floor left at 898
   would have let a run with one drift guard deleted (905) still clear it —
   the ratchet quietly disarmed by a commit that only ever made the suite
   bigger. `tests/test_compose.py`'s pin cannot be loosened without the same
-  commit re-raising the floor.
+  commit re-raising the floor. `gateway-rename-muse-01` met the same clause for
+  the same reason: it added **one** test, which moved the floor by one, and
+  leaving `968` in place would have cleared a run at 972 — so deleting any one
+  of the four cross-repo guards would have stayed green. Measured, not counted:
+  `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest` reads `1 failed, 972 passed`
+  on that branch, and the one failure is pre-existing on clean `master`, so
+  972 + 1 = 973 is the count when the tier runs.
 - **`external.selfContained: false`** because `bin/prime` starts with
   `uv sync --locked`, which needs PyPI on a cold checkout and a pinned
   toolchain the machine does not carry until mise installs it.
