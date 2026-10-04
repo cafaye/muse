@@ -53,7 +53,7 @@ then retry forever.
 
 Neither is settled, and both are recorded in `cafaye.yml` for whoever decides.
 
-**The claim's name.** `core/docs/openapi-conventions.md` requires `scopes`; `guard` reads
+**The claim's name.** `core/docs/openapi-conventions.md` requires `scopes`; `gateway` reads
 a space-separated `scope`. `identity` mints **both**, byte-identical, precisely so the
 decision can land without breaking an issued token. muse accepts either name, and
 **refuses a token carrying both where they disagree** — not merged, not preferred, not
@@ -65,7 +65,7 @@ a claim name becomes a cross-tenant read.
 `resource:action` shape and names muse's own surface, but the exact string is
 provisional and this packet adds no scope namespace to core's document.
 
-A token with **no `account_id`** is refused, which is stricter than `guard`: muse bills
+A token with **no `account_id`** is refused, which is stricter than `gateway`: muse bills
 and meters per tenant, so a request whose cost cannot be attributed is a request nobody
 can charge for. Defaulting to `sub` would make a user id a tenancy key.
 

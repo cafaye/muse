@@ -77,9 +77,15 @@ DEFAULT_ROUTES = REPO_ROOT / "config" / "routes.yaml"
 #: `{issuer}/.well-known/jwks.json`. `MUSE_IDENTITY_ISSUER` overrides it.
 DEFAULT_IDENTITY_ISSUER = "https://identity.cafaye.com"
 
-#: The `aud` a token must carry to be for this service — muse's own client id. Guard
-#: calls it "guard's own client id" for the same reason: a resource server's audience
+#: The `aud` a token must carry to be for this service — muse's own client id. Gateway
+#: calls it "gateway's own client id" for the same reason: a resource server's audience
 #: is its own name, and anything wider would accept a token minted for a sibling.
+#:
+#: Both halves of the sentence were wrong and only one of them was visible: the earlier
+#: rename swept the *quoted* words on the next line and left the sentence's own subject
+#: capitalized under the old name, because a lowercase replacement does not match
+#: `Guard`. `gateway/src/index.test.ts:278` names the same thing, so the quote above is
+#: now the spelling its source actually uses.
 DEFAULT_IDENTITY_AUDIENCE = "muse"
 
 #: The vendors this build ships adapters for. Named in one place because the routes
@@ -322,7 +328,7 @@ def _build_auth(settings: Settings) -> TokenVerifier:
     )
 
 
-#: How long one fetch of the key set may take. Five seconds, and the same default `guard`
+#: How long one fetch of the key set may take. Five seconds, and the same default `gateway`
 #: uses: long enough that a slow identity is not a failed one, short enough that a hung
 #: endpoint does not hold a request open past the point where the caller has given up.
 JWKS_TIMEOUT_SECONDS = 5.0

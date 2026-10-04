@@ -169,7 +169,7 @@ async def test_the_response_echoes_the_trace_id_header() -> None:
 
 
 async def test_an_incoming_trace_id_is_echoed_rather_than_replaced() -> None:
-    """`guard` and the SDKs propagate the id across services, so muse has to keep the
+    """`gateway` and the SDKs propagate the id across services, so muse has to keep the
     one it was given or a trace stops at the edge."""
     async with asgi_client(app_for(serving())) as client:
         response = await client.post(

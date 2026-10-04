@@ -250,13 +250,13 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
    - **A token with no `account_id` is refused**, not defaulted to `sub`. muse bills
      per tenant, so an unattributable spend is a request nobody can charge for, and
      `sub` as a tenancy key makes a bug in one service a cross-tenant read. This is
-     **stricter than `guard`**, which treats a missing `account_id` as `undefined`
+     **stricter than `gateway`**, which treats a missing `account_id` as `undefined`
      because its use is a rate-limit key; the two are answering different questions
      and `cafaye.yml` records the divergence for a fleet-wide ruling.
    - **The claim checks are ours, not the library's, because a verifier's errors
      carry its messages.** `joserfc`'s `InvalidClaimError.args[0]` is not the claim
      name — it is the sentence `"invalid_claim: Claim 'sub' must be a StringOrURI
-     value"` — and `guard` gives the rule this follows: a library's expected values
+     value"` — and `gateway` gives the rule this follows: a library's expected values
      are the platform's internals. So `muse.auth` does its own presence, type and
      value checks, one per rule, and the response says what was wrong in muse's
      vocabulary. The library keeps the two jobs it is better at — verifying the

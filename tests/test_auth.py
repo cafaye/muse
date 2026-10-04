@@ -180,24 +180,24 @@ async def test_a_token_from_another_issuer_is_refused() -> None:
 
 async def test_a_token_addressed_to_another_service_is_refused() -> None:
     """`aud`. A token minted for a sibling is not a token for muse, and accepting it
-    would let a credential scoped to `guard` spend money here."""
+    would let a credential scoped to `gateway` spend money here."""
     identity = Identity()
-    response = await call(app_for(identity), bearer(token(identity, aud="guard")))
+    response = await call(app_for(identity), bearer(token(identity, aud="gateway")))
     assert response.status_code == 401
     assert "audience" in problem_of(response)["detail"]
 
 
 async def test_a_token_naming_several_audiences_is_accepted_when_one_is_ours() -> None:
     """RFC 7519 §4.1.3: `aud` may be an array when there is more than one intended
-    recipient, and a token minted for `muse` and `guard` is a token for muse."""
+    recipient, and a token minted for `muse` and `gateway` is a token for muse."""
     identity = Identity()
-    response = await call(app_for(identity), bearer(token(identity, aud=[AUDIENCE, "guard"])))
+    response = await call(app_for(identity), bearer(token(identity, aud=[AUDIENCE, "gateway"])))
     assert response.status_code == 200
 
 
 async def test_a_token_naming_several_audiences_none_of_them_ours_is_refused() -> None:
     identity = Identity()
-    response = await call(app_for(identity), bearer(token(identity, aud=["guard", "caf"])))
+    response = await call(app_for(identity), bearer(token(identity, aud=["gateway", "caf"])))
     assert response.status_code == 401
 
 
@@ -210,7 +210,7 @@ async def test_an_expired_token_is_refused() -> None:
 
 
 async def test_a_token_that_is_not_yet_valid_is_refused() -> None:
-    """`nbf`. core lists it as refused by `guard`, and a token minted for a clock that
+    """`nbf`. core lists it as refused by `gateway`, and a token minted for a clock that
     disagrees with ours should not be accepted on the strength of that disagreement."""
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, nbf=int(time.time()) + 600)))
@@ -289,7 +289,7 @@ async def test_only_rs256_is_accepted_and_the_algorithm_is_one_constant() -> Non
     the first — which is how a service ends up accepting two algorithms and having
     forgotten why it widened.
 
-    ES256 is deliberately absent: core's conventions allow it, `guard` does not take
+    ES256 is deliberately absent: core's conventions allow it, `gateway` does not take
     it, and widening belongs with the moment identity publishes ES256 keys. Recorded in
     `cafaye.yml`.
     """
@@ -371,7 +371,7 @@ async def test_a_claim_of_the_wrong_type_is_refused(claim: str, value) -> None:
 async def test_a_refusal_never_quotes_the_verifiers_library() -> None:
     """**No third-party text in a `problem+json` body.**
 
-    This is `guard`'s `refusalOf` rule, and it is why the claim checks are written here
+    This is `gateway`'s `refusalOf` rule, and it is why the claim checks are written here
     rather than delegated to `joserfc`'s `JWTClaimsRegistry`: that library's
     `InvalidClaimError.args[0]` is not the claim name, it is the sentence
     `"invalid_claim: Claim 'sub' must be a StringOrURI value"`. Putting that in a
@@ -386,7 +386,7 @@ async def test_a_refusal_never_quotes_the_verifiers_library() -> None:
         "bad signature": tampered(token(identity), sub="attacker"),
         "malformed": "not-a-jwt",
         "wrong issuer": token(identity, iss="https://evil.test"),
-        "wrong audience": token(identity, aud="guard"),
+        "wrong audience": token(identity, aud="gateway"),
         "expired": token(identity, exp=int(time.time()) - 10),
         "future nbf": token(identity, nbf=int(time.time()) + 600),
         "bad sub type": token(identity, sub=1),
@@ -462,7 +462,7 @@ async def test_a_token_with_no_account_id_is_refused() -> None:
 
 
 async def test_a_non_string_account_id_is_refused_rather_than_ignored() -> None:
-    """Deliberately unlike `guard`, which ignores a non-string `account_id` because its
+    """Deliberately unlike `gateway`, which ignores a non-string `account_id` because its
     use is a rate-limit key.
 
     That reasoning does not transfer to a billing boundary: a malformed tenancy claim
@@ -595,7 +595,7 @@ async def test_a_token_with_only_the_scopes_claim_is_accepted() -> None:
 
 
 async def test_a_token_with_only_the_scope_claim_is_accepted() -> None:
-    """`guard`'s name (`jwt.ts:32`). identity mints both, byte-identical, with a test
+    """`gateway`'s name (`jwt.ts:32`). identity mints both, byte-identical, with a test
     holding them equal, precisely so the ruling can land without breaking a token."""
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, scope=SCOPE, scopes=None)))
@@ -629,8 +629,8 @@ async def test_a_token_carrying_both_names_where_they_disagree_is_refused() -> N
 
 
 async def test_a_scope_claim_that_is_not_a_string_is_refused() -> None:
-    """An array claim. `guard` splits on whitespace and refuses a non-string outright;
-    an array is a token guard itself would not parse, so accepting it here would make
+    """An array claim. `gateway` splits on whitespace and refuses a non-string outright;
+    an array is a token the gateway itself would not parse, so accepting it here would make
     the two services disagree about what a valid token is."""
     identity = Identity()
     response = await call(app_for(identity), bearer(token(identity, scopes=["completions:write"])))
@@ -1038,7 +1038,7 @@ def test_a_principal_is_frozen_and_immutable() -> None:
 
 
 def test_the_audience_is_a_configuration_value_and_defaults_to_this_service() -> None:
-    """`muse`'s own name, the way `guard` uses its own client id. Anything wider would
+    """`muse`'s own name, the way `gateway` uses its own client id. Anything wider would
     accept a token minted for a sibling."""
     from muse.main import DEFAULT_IDENTITY_AUDIENCE, DEFAULT_IDENTITY_ISSUER
 

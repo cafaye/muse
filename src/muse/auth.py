@@ -23,7 +23,7 @@ raises `UnsupportedAlgorithmError` for all three before any key is looked up.
 
 ## The claim-name duality, and why it refuses rather than merges
 
-core's conventions name a `scopes` claim; `guard`'s middleware reads a space-separated
+core's conventions name a `scopes` claim; `gateway`'s middleware reads a space-separated
 `scope` string. Nobody has ruled — it is a public API decision and the manager's to
 escalate — and identity is minting **both**, byte-identical, with a test holding them
 equal, precisely so the decision can land without breaking an issued token.
@@ -65,7 +65,7 @@ from muse.jwks import JWKS_PATH, JwksClient
 #: The one algorithm this build accepts.
 #:
 #: core's conventions allow RS256 **and** ES256. RS256 only, and the reason is the same
-#: one `guard` gives: the algorithm is a property of the key set identity publishes, not
+#: one `gateway` gives: the algorithm is a property of the key set identity publishes, not
 #: a hint the token carries, and accepting an algorithm no published key uses buys
 #: nothing while widening what a forged token can ask for. Widening is a one-line change
 #: and belongs with the moment identity publishes ES256 keys — recorded in `cafaye.yml`.
@@ -89,7 +89,7 @@ SCOPE = "completions:write"
 
 #: The two claim names, and which is primary.
 #:
-#: `scopes` is core's and is checked first; `scope` is what `guard` reads and what
+#: `scopes` is core's and is checked first; `scope` is what `gateway` reads and what
 #: identity mirrors. See the module docstring for why a token carrying both and
 #: disagreeing is refused.
 SCOPES_CLAIM = "scopes"
@@ -211,9 +211,9 @@ class TokenVerifier:
         """Presence, type and value for every claim core lists as required.
 
         **Written here rather than delegated to `joserfc`'s `JWTClaimsRegistry`, and
-        the reason is the one `guard` gives in `refusalOf`.** A verifier library's
+        the reason is the one `gateway` gives in `refusalOf`.** A verifier library's
         errors carry its messages, and those messages describe the platform's internals
-        — `guard` notes that an expected audience "is this gateway's client id". A
+        — `gateway` notes that an expected audience "is this gateway's client id". A
         library-composed message in a `problem+json` body is the same leak wearing a
         nicer hat, and `joserfc`'s `InvalidClaimError.args[0]` is not even the claim
         name; it is the sentence `"invalid_claim: Claim 'sub' must be a StringOrURI
@@ -292,7 +292,7 @@ class TokenVerifier:
         is the reason to refuse one, because the spend is then unattributable to anyone
         and the alternative (defaulting to `sub`) makes a user id a tenancy key.
 
-        A non-string `account_id` is refused rather than ignored. `guard` ignores it,
+        A non-string `account_id` is refused rather than ignored. `gateway` ignores it,
         deliberately, because its use is a rate-limit key and "a worse thing to lose than
         a well-formed claim is to gain" — that reasoning is about a different question
         and does not transfer to a billing boundary.

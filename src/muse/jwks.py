@@ -57,7 +57,7 @@ logger = logging.getLogger("muse.auth")
 JWKS_PATH = "/.well-known/jwks.json"
 
 #: How long a fetched key set is reused before it is refetched on the slow path.
-#: 300s, and the same default `guard` uses: long enough that a burst of traffic costs
+#: 300s, and the same default `gateway` uses: long enough that a burst of traffic costs
 #: one fetch, short enough that a withdrawn key is gone within a coffee break.
 DEFAULT_TTL_SECONDS = 300.0
 
