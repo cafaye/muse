@@ -94,6 +94,34 @@ The second row is the interesting one: that breakage leaves the alias's JSON per
 correct and still fails, which is the only reason the guarantee is mechanical rather
 than a claim in a comment.
 
+### And the delegation itself, read off the source
+
+Those behavioural tests all pass against a handler that *inlined* its own copy of the
+routing logic and happened to agree with `/v1/route` on every observable the suite
+reaches — the delegation is a structural claim and no request/response assertion can
+tell "delegates" from "copied and matches". So `tests/test_alias_delegation.py` parses
+`src/muse/api.py` and asserts the structure: three registered paths, both completion
+handlers calling `serve_completion`, **neither** calling a dispatch or the meter
+directly, metering living in the shared path, `require_bearer` ordered before the body
+is read, and the model list reading `container.routes` with no model id written as a
+literal.
+
+Same technique `test_tenant_scoping.py` uses for SQL and `test_dependencies.py` for
+imports: **the tree is the oracle for a claim about the tree.** Four more breakages were
+applied by hand and each went red:
+
+| Breakage | Went red |
+| --- | --- |
+| alias given its own `router.route` call | `test_the_completion_endpoints_hold_no_dispatch_of_their_own` |
+| alias metering for itself | `test_the_shared_path_is_where_the_metering_happens` |
+| model list hardcoded to `("fast", "smart")` | `test_the_model_list_is_sourced_from_the_route_table` |
+| model list's bearer check removed | `test_the_model_list_authenticates_the_same_way` |
+
+The AST walk's limit is stated in the file rather than left for the next reader: it sees
+calls it can name and misses work done through a subclass or a dispatch table. It
+therefore holds the *delegation* claim and `test_alias.py` holds the *behaviour* claim,
+and neither replaces the other.
+
 ### Two guards had to learn about the new paths
 
 `tests/test_openapi.py`'s path pin went from one path to three, `x-required-scopes` is

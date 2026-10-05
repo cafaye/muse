@@ -80,9 +80,13 @@ tests/                pytest; one module per concern, plus tests/support/
                      error class against core's vocabulary — see rule 19;
                      test_auth.py is the bearer contract and test_jwks.py the
                      key-set cache — see rule 20;
-                     test_tenant_scoping.py enumerates the 12 account-scoped
-                     entry points and holds 3 of them to a tenant axis — see
-                     rule 24, and note the `test_*.py` naming it depends on)
+                     test_alias.py holds the OpenAI aliases to *behaving* like
+                     /v1/route and test_alias_delegation.py holds that they
+                     *delegate* to it — see rules 25 and 26, and both depend on
+                     the `test_*.py` naming rule 24 records;
+                     test_tenant_scoping.py enumerates the 14 account-scoped
+                     entry points and holds 4 of them to a tenant axis — see
+                     rule 24)
 bin/prime             the gate: uv sync --locked && ruff && pytest
 gate.yml              the gate, declared: the command, the mise task, what it
                       needs from the machine, and the lines it must print
@@ -343,11 +347,20 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
     has no tenant axis to get wrong. `vault_secrets` is keyed by `provider` (one
     platform credential per vendor, by design) and `outbox_events` has no tenant column
     at all, because core's payload schema still pins `subject: platform` until D9.
-    `tests/test_tenant_scoping.py` therefore enumerates **12 account-scoped entry
-    points of which exactly three carry a tenant axis**, and asserts the *absence* of one
-    for the other nine — which is the only thing assertable about a discriminator that
-    does not exist. The count is deliberately not inflated; a reader who believes 12
-    surfaces are tenant-checked when 3 are is worse off than one who knows.
+    `tests/test_tenant_scoping.py` therefore enumerates **14 account-scoped entry
+    points of which exactly four carry a tenant axis**, and asserts the *absence* of one
+    for the other ten — which is the only thing assertable about a discriminator that
+    does not exist. The count is deliberately not inflated; a reader who believes 14
+    surfaces are tenant-checked when 4 are is worse off than one who knows.
+    The alias packet moved it from 12/3 to 14/4, and the delta is the honest reading
+    rather than the convenient one. `POST /v1/chat/completions` could have been filed
+    `PLATFORM` on the grounds that it "only renders a different body from a call that
+    was already made". It cannot: it reaches the same `Meter.record`, so it carries the
+    same tenancy establishment and the same D9 gap. **A second body is not a second
+    surface — but the path is new, so the enumeration moved because the path is new, not
+    because a new discriminator appeared.** That distinction is the whole content of the
+    rule; a future packet should not collapse it by filing a body-only variant
+    `PLATFORM`.
     Three properties hold, and each has a test named after the failure it prevents:
     - **Absence, never 403, on the tenant axis.** A 403 says "this exists and is not
       yours", which is strictly more information than a 404 for a resource that never
@@ -361,9 +374,10 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
       the running app serves (read off its generated OpenAPI document) must be in the
       table, *and* the table must not claim a route the app does not serve; every SQL
       string literal in `src/muse/` must be attributed to an entry point, **count
-      included**. `TENANT_SCOPED_COUNT` is pinned, so a packet that grows a fourth tenant
-      surface changes that number on purpose next to the negative test for whatever it
-      added. Read the HTTP surface off `app.openapi()["paths"]`, not `app.routes` — this
+      included**. `TENANT_SCOPED_COUNT` is pinned at 4, so a packet that grows a fifth
+      tenant surface changes that number on purpose next to the negative test for whatever
+      it added — and the alias packet did exactly that when it took the count from 3 to 4
+      (see above). Read the HTTP surface off `app.openapi()["paths"]`, not `app.routes` — this
       FastAPI version represents an included router as an opaque `_IncludedRouter` with
       no `.routes`, so a route walk finds none of `POST /v1/route` and passes.
     - **A tenant surface cannot grow quietly.** No query may mention a tenant column, no
@@ -389,6 +403,39 @@ tests/gate_self_test.sh  the proof that gate.yml can fail — 13 breakages
     and cannot write it, so the test checks the metered payload is exactly core's five
     fields and the subject is core's reserved literal. A test implying the gap was closed
     would be the defect, not the coverage.
+
+25. **The alias is guarded structurally as well as behaviourally, and the two halves
+    answer different questions.** `tests/test_alias.py` proves the alias *behaves* like
+    `/v1/route` — one provider call, one outbox row, identical failure statuses on both
+    paths. Every one of those passes against a handler that inlined its own copy of the
+    routing logic and happened to agree on each observable the suite reaches, because
+    "delegates" and "copied and matches" are indistinguishable from outside the process.
+    So `tests/test_alias_delegation.py` parses `src/muse/api.py` and asserts the
+    structure: three registered paths, both completion handlers calling
+    `serve_completion`, **neither** calling a dispatch or the meter directly, metering
+    living in the shared path, and `require_bearer` ordered before the body is read.
+    Same technique as rule 24's SQL walk and `test_dependencies.py`'s import walk: **the
+    tree is the oracle for a claim about the tree.**
+    Two halves because rule 23's discipline applies to the positive half too — asserting
+    a handler calls `serve_completion` is compatible with a handler that delegates *and*
+    does its own dispatch, and that is precisely the shape of the bug. So the absence is
+    asserted separately and neither assertion means anything alone. The AST walk's limit
+    is stated in the file rather than left for the next reader: it sees calls it can name
+    and misses work done through a subclass or a dispatch table, so it holds the
+    *structural* claim while `test_alias.py` holds the *behavioural* one, and a successor
+    who breaks one file should read the other before deciding which half they broke.
+26. **The `/v1/models` ids are route names and `created` is `0`, and neither may be
+    "improved".** Route names (`fast`, `smart`) rather than vendor model ids is the
+    *same indirection the fallback chain depends on*: a caller who could learn
+    `gpt-4o-mini` from the model list could pin a request to a vendor, and the chain
+    stops being possible. And `created: 0` rather than a plausible timestamp, because a
+    lie in a machine-readable field is worse than a constant a client can learn to
+    ignore — some clients display it and none may act on it.
+    The listing requires `completions:write`, **unchanged**, because a read tempts
+    `models:read` and a new scope namespace is a platform decision recorded in
+    `cafaye.yml`, not one a compatibility packet makes. Independently of the naming: a
+    model list is not harmless public information, because it names every route and
+    through them every vendor this deployment talks to.
 
 ## Dependencies
 

@@ -472,7 +472,7 @@ uv run pytest -k vault -vv       # one concern
 uv run pytest --cov-report=html  # htmlcov/index.html
 ```
 
-1010 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
+1021 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
 process over `httpx.ASGITransport`, the database is an in-memory store behind the same
 `Database` seam production uses, and litellm is a stand-in module — so the real
 adapter's exception mapping is the code under test, not a mock of it. The one
@@ -490,7 +490,7 @@ bash tests/gate_self_test.sh          # the declaration can fail: 13 breakages
 ```
 
 One property is worth knowing before you touch it. `bin/prime` exits 0 with
-`1006 passed, 4 skipped` on any machine without a `cafaye/core` checkout, and those
+`1017 passed, 4 skipped` on any machine without a `cafaye/core` checkout, and those
 four are the tests that catch muse's vendored copies of core's specs drifting.
 `gate.yml`'s `core-parity` proof is what turns that state red. See
 [AGENTS.md](AGENTS.md#the-gate-is-declared-not-discovered).
@@ -510,7 +510,7 @@ drift risk, and this is the check that catches it. The tests that *use* that sch
 validate a span muse actually exported are not among them: the copy ships with the
 package, so they run on the default gate.
 
-So the counts are not the same number twice: `1010` with a core checkout, `1006 passed,
+So the counts are not the same number twice: `1021` with a core checkout, `1017 passed,
 4 skipped` without one, both at 100% coverage and both green. Nothing is proved by the
 second one.
 
