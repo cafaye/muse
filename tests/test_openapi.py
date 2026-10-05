@@ -100,6 +100,28 @@ def test_info_version_is_present_and_parseable() -> None:
     assert re.match(r"^\d+\.\d+\.\d+$", spec()["info"]["version"])
 
 
+def test_a_non_breaking_addition_bumps_only_the_minor() -> None:
+    """core's sync rule, read as a *check* rather than followed by discipline.
+
+    `openapi-conventions.md:35-38`: "a breaking API change bumps the prefix **and** the
+    document version in the same commit. A non-breaking change bumps only
+    `info.version`. Bumping `info.version` while `/v1` changes shape is the mistake this
+    rule exists to prevent — a reader of the document has no other signal."
+
+    The alias packet is exactly the non-breaking case — two new paths, and
+    `/v1/route`'s request schema, response schema and every status it can produce
+    unchanged — so 1.1.1 -> **1.2.0** is the correct bump and a major would overstate
+    it. A reader has no other signal, which is why this is asserted rather than left to
+    whoever bumps it next: the failure it prevents is a major bump on an additive change,
+    which reads to every consumer as a breaking release.
+    """
+    document = spec()
+    assert document["info"]["version"] == "1.2.0"
+    # The prefix is the API version and `/v1` was not mutated, so the major stays 1.
+    assert document["info"]["version"].startswith("1.")
+    assert list(document["paths"]) == ["/v1/route", "/v1/chat/completions", "/v1/models"]
+
+
 def test_every_path_is_under_the_v1_prefix() -> None:
     """core: every path is prefixed, and `/v1` is never mutated in place. A second
     prefix in one document means a breaking change landed without one."""

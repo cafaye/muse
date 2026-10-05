@@ -149,23 +149,31 @@ gate:
       # muse-08 recorded above and the reason the floor moves in the same commit as
       # the suite rather than the next one.
       #
-      # RAISED 973 -> 1021 by muse-alias-01, which added 48 tests and no core-gated
+      # RAISED 973 -> 1022 by muse-alias-01, which added 49 tests and no core-gated
       # ones, so the arithmetic is unchanged in kind: the same four cross-repo tests
       # skip without a checkout as before. Measured, not counted — `uv run pytest`
-      # reports `1017 passed, 4 skipped` with no `MUSE_CORE_SCHEMAS`, and 1017 + 4 = the
+      # reports `1018 passed, 4 skipped` with no `MUSE_CORE_SCHEMAS`, and 1018 + 4 = the
       # count when all four execute, which is what this floor means. The pre-existing
       # `test_the_vendored_schema_is_byte_identical_to_core` failure recorded above is
       # unchanged and still not this packet's to fix.
       #
-      # Left at 973 this would have cleared a run 48 tests short, which is the fourth
+      # NOT YET OBSERVED WITH A CORE CHECKOUT. There is no `../core` on the machine this
+      # was written on, so the 1018 + 4 arithmetic is the same one every previous raise
+      # used but has not been watched green with `MUSE_CORE_SCHEMAS` set. A successor
+      # with a core checkout should run `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest`
+      # and correct this floor if the total differs — named here rather than left as a
+      # claim, because a floor asserted only against arithmetic is exactly the
+      # "a version pin nobody has executed" defect rule 23 exists for.
+      #
+      # Left at 973 this would have cleared a run 49 tests short, which is the fourth
       # time this clause has caught a real possibility rather than a hypothetical one:
-      # 48 headroom would have hidden a whole deleted test module. The delta is two
+      # 49 headroom would have hidden a whole deleted test module. The delta is two
       # alias suites — `tests/test_alias.py` (32 behavioural tests) and
       # `tests/test_alias_delegation.py` (11 structural ones, which parse `api.py`) —
-      # plus the five guards that had to learn about two new paths: three in
+      # plus the guards that had to learn about two new paths: six in
       # `test_openapi.py` for the documents and two enumeration rows in
       # `test_tenant_scoping.py`.
-      minimum: 1021
+      minimum: 1022
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
