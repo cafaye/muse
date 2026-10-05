@@ -5,7 +5,8 @@ the binding house document; this file records what is specific to muse.
 
 ## What this service is
 
-muse = LLM routing + credentials vault + token metering, for cafaye, Phase 4.
+muse = LLM routing + credentials vault + token metering + OpenAI-compatible alias
+paths, for cafaye, Phase 4.
 It embeds LiteLLM (`../../refs/litellm`) as a **library** through its Python API.
 None of LiteLLM's code is copied; the adapter is `src/muse/providers/`.
 
@@ -21,6 +22,19 @@ out of scope — and so is `Idempotency-Key`, which PLAN §7 assigned to `muse-0
 which is **not built**; `muse.errors.ProviderIndeterminate` documents the billing
 consequence of its absence.
 
+Packet `muse-alias-01` added reach, and changed no rule: `POST /v1/chat/completions`
+and `GET /v1/models`, so a stock OpenAI client can reach the fleet gateway without
+knowing muse exists. They are **aliases**, not a second implementation — both
+completion endpoints call `muse.api.serve_completion`, which authenticates, validates,
+routes and meters, so there is one auth check, one fallback chain, one breaker registry
+and one metered event, and every failure mode is identical *by construction* rather
+than by two pieces of code agreeing. Only the body shape differs. Streaming is still out
+of scope and is **refused with a 422 naming the field** rather than silently ignored,
+and `/v1/audio/*` is untouched — it is blocked on a platform-wide ruling about
+capability scope names. `tests/test_alias.py` holds the guarantee by *comparison* rather
+than by assertion, because a shape check passes against a second router that returns the
+right JSON.
+
 Packet `muse-06` made the bearer token real. `require_bearer` used to count the
 header; it now verifies the signature against identity's published JWKS with the
 algorithm **pinned in the call**, checks the issuer, audience, expiry and every
@@ -32,7 +46,9 @@ token carrying no scope is a 403.
 
 ```
 src/muse/main.py      the composition root: settings, Container, create_app()
-src/muse/api.py       POST /v1/route, the error envelope, the bearer check, trace ids
+src/muse/api.py       POST /v1/route + POST /v1/chat/completions + GET /v1/models,
+                     serve_completion (the one auth/route/meter path they share),
+                     the error envelope, the bearer check, trace ids
 src/muse/auth.py      the verifier: pinned algorithm, claims, capability, tenancy
 src/muse/jwks.py      identity's key set: cached, and refreshed under a bound
 src/muse/router.py    request -> ordered candidates -> completion

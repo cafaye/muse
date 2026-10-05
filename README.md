@@ -14,9 +14,10 @@ rest, and emits a `muse.tokens.consumed` event for every completion it serves so
 
 ## Status: v1 core
 
-Routing, the vault, metering, the HTTP surface and **real JWT verification** are done and
-tested. Not in this version: streaming, tool calls, embeddings, images, batches, and a
-real admin UI.
+Routing, the vault, metering, the HTTP surface, **real JWT verification** and the
+**OpenAI-compatible aliases** (`POST /v1/chat/completions`, `GET /v1/models`) are done
+and tested. Not in this version: streaming, tool calls, embeddings, images, batches,
+`/v1/audio/*`, and a real admin UI.
 
 ## Auth
 
@@ -407,7 +408,9 @@ section of `AGENTS.md`.
 ```
 src/muse/
   main.py            the composition root: settings, the container, create_app()
-  api.py             POST /v1/route, the error envelope, the bearer check, trace ids
+  api.py             POST /v1/route + the two OpenAI aliases, serve_completion
+                     (the one auth/route/meter path they share), the error envelope,
+                     the bearer check, trace ids
   auth.py            the verifier: pinned algorithm, claims, capability, tenancy
   jwks.py            identity's key set: cached, and refreshed under a bound
   router.py          request -> ordered candidates -> completion, with fallback
@@ -469,7 +472,7 @@ uv run pytest -k vault -vv       # one concern
 uv run pytest --cov-report=html  # htmlcov/index.html
 ```
 
-898 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
+1010 tests, 100% branch coverage. The suite never opens a socket: HTTP is driven in
 process over `httpx.ASGITransport`, the database is an in-memory store behind the same
 `Database` seam production uses, and litellm is a stand-in module — so the real
 adapter's exception mapping is the code under test, not a mock of it. The one
@@ -487,27 +490,28 @@ bash tests/gate_self_test.sh          # the declaration can fail: 13 breakages
 ```
 
 One property is worth knowing before you touch it. `bin/prime` exits 0 with
-`895 passed, 3 skipped` on any machine without a `cafaye/core` checkout, and those
-three are the tests that catch muse's vendored copies of core's specs drifting.
+`1006 passed, 4 skipped` on any machine without a `cafaye/core` checkout, and those
+four are the tests that catch muse's vendored copies of core's specs drifting.
 `gate.yml`'s `core-parity` proof is what turns that state red. See
 [AGENTS.md](AGENTS.md#the-gate-is-declared-not-discovered).
 
-Three tests skip unless pointed at a core checkout:
+Four tests skip unless pointed at a core checkout:
 
 ```sh
 MUSE_CORE_SCHEMAS=../core/schemas uv run pytest
 ```
 
 They assert that the event patterns copied into `muse/contracts.py` are byte-identical
-to core's schema, that `cafaye.yml` validates against core's manifest schema, and that
-the vendored `src/muse/schemas/telemetry/traces.schema.json` — the file
+to core's schema, that `cafaye.yml` validates against core's manifest schema, that the
+vendored `src/muse/schemas/telemetry/traces.schema.json` — the file
 `muse/errortype.py` reads the error vocabulary out of — is still byte-identical to
-core's. A copy is a drift risk, and this is the check that catches it. The tests that
-*use* that schema to validate a span muse actually exported are not among them: the copy
-ships with the package, so they run on the default gate.
+core's, and that every declared dependency resolves in core's `fleet.yml`. A copy is a
+drift risk, and this is the check that catches it. The tests that *use* that schema to
+validate a span muse actually exported are not among them: the copy ships with the
+package, so they run on the default gate.
 
-So the counts are not the same number twice: `765` with a core checkout, `763 passed,
-2 skipped` without one, both at 100% coverage and both green. Nothing is proved by the
+So the counts are not the same number twice: `1010` with a core checkout, `1006 passed,
+4 skipped` without one, both at 100% coverage and both green. Nothing is proved by the
 second one.
 
 ### A green gate is a claim about a clean machine

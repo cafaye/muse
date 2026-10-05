@@ -5,6 +5,109 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### Two OpenAI-compatible aliases, which are aliases
+
+`POST /v1/chat/completions` and `GET /v1/models`. `openapi/v1.yaml` goes **1.1.1 →
+1.2.0**: additive, with `/v1/route`'s request schema, response schema and every status
+it can produce unchanged, so a client generated against 1.1.1 keeps working without
+regeneration.
+
+**The mechanism is one function, and that is the whole design.**
+`muse.api.serve_completion` does authenticate → validate → route → meter, and both
+completion endpoints call it. One auth check, one fallback chain, one breaker registry,
+one metered event. A request to the alias cannot reach a provider on terms `/v1/route`
+would have refused.
+
+The failure modes are therefore identical *by construction* rather than by two pieces of
+code agreeing — which is the reason the 503-not-401 rule needed no new argument in this
+packet. identity being unreachable is not the caller's credential being bad, and a
+second handler could easily have got that wrong.
+
+Only the body shape differs:
+
+```diff
+  # POST /v1/route                     # POST /v1/chat/completions
+  {                                    {
+    "id": ..., "object": ...,             "id": ..., "object": ...,
+    "created": ..., "model": ...,         "created": ..., "model": ...,
+    "provider": "openai",                 "choices": [...],
+    "route": "fast",                      "usage": {...}
+    "choices": [...],                   }
+    "usage": {...},
+    "cost_micros": 7,
+    "trace_id": "0af7..."
+  }
+```
+
+`provider`, `route`, `cost_micros` and `trace_id` are **absent** from the alias. A
+compatibility surface that grows its own extras is one a caller has to be taught about,
+and the generated clients this path exists for are the strictest readers of it. The
+trace id still comes back in the `X-Trace-Id` **header**, which middleware sets on every
+response regardless of body shape — so support correlation survives the field's removal
+from the body.
+
+`GET /v1/models` reads `RouteTable.models()` in file order, so the ids are **route
+names** (`fast`, `smart`) and not vendor model ids: the same indirection the fallback
+chain depends on, which is what stops a caller pinning a request to a vendor through
+the list. `created` is `0` rather than invented — a lie in a machine-readable field is
+worse than a constant.
+
+Three decisions worth stating because a reader might reasonably expect otherwise:
+
+- **`GET /v1/models` requires a credential and the same `completions:write`.** A read
+  tempts `models:read`; that is a new scope namespace and a platform decision recorded
+  in `cafaye.yml`, not one a compatibility packet makes. Separately, a model list names
+  every route and through them every vendor this deployment talks to — that is
+  reconnaissance, not harmless public information. It also matches core's convention of
+  `security` applied globally, so an open listing would need a per-operation override
+  to exist at all.
+- **`temperature` as a JSON number is a 422 on the alias**, exactly as on `/v1/route`.
+  OpenAI's own clients send that field as a number, so this is the field most likely to
+  surprise somebody using the alias. It is refused rather than coerced for the reason
+  `openapi/v1.yaml` states at length: a float cannot be round-tripped, and `0.1 + 0.2`
+  reaches the provider as `0.30000000000000004`. Coercing here would put that exact
+  defect back on the compatibility path, where it is least likely to be noticed.
+- **No streaming.** A body carrying `stream` is a 422 naming the field, not a silently
+  non-streaming answer — a caller who asked for a stream and received a whole response
+  has no way to tell what happened. `extra="forbid"` was already the house rule; this
+  packet says it out loud rather than changing it.
+
+### How the alias was held to being an alias
+
+A test that only checked the alias's own output passes just as happily against a second
+parallel implementation of routing that happens to return the right JSON — which is the
+defect this work exists to prevent. So `tests/test_alias.py`'s load-bearing tests are
+written as *comparisons* against `/v1/route`: both call the provider exactly once, both
+send it the same request (`max_tokens` included), both emit exactly one
+`muse.tokens.consumed` row, and both fall through the same chain when the primary times
+out.
+
+Each guard was then broken on purpose and watched go red, because a guard that cannot
+fail is a comment:
+
+| Breakage | Went red |
+| --- | --- |
+| `/v1/models` renamed in `openapi/v1.yaml` | 4 tests in `test_openapi.py` |
+| the alias given a second private `router.route` call | 3 counting tests in `test_alias.py` |
+
+The second row is the interesting one: that breakage leaves the alias's JSON perfectly
+correct and still fails, which is the only reason the guarantee is mechanical rather
+than a claim in a comment.
+
+### Two guards had to learn about the new paths
+
+`tests/test_openapi.py`'s path pin went from one path to three, `x-required-scopes` is
+now keyed by all three `operationId`s rather than just `route`, and the
+response-schema-against-model comparison covers all three bodies.
+
+`tests/test_tenant_scoping.py`'s enumeration went **12 → 14 entry points, 3 → 4 with a
+tenant axis**. The alias is `ACCOUNT`, not `PLATFORM`: it reaches the same
+`Meter.record`, so it inherits the tenancy establishment and the D9 gap. Calling it
+`PLATFORM` on the grounds that it "only renders a different body" would have been a
+claim about the shape rather than about the path — and a second body is not a second
+surface, but the path *is* new, so the enumeration had to say so next to a negative test
+for it. `GET /v1/models` is `PLATFORM`: a route table is configuration, not tenant data.
+
 ### The dependency was named `guard`, and nothing in the fleet could see it
 
 **`cafaye.yml` declared `dependencies[].name: guard`.** The service was renamed
