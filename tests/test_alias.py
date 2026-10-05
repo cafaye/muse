@@ -268,9 +268,7 @@ async def test_the_alias_uses_the_same_fallback_chain():
         )
     )
     database = FakeDatabase()
-    app = build_test_app(
-        registry=registry, database=database, table=table
-    )
+    app = build_test_app(registry=registry, database=database, table=table)
 
     async with asgi_client(app) as client:
         response = await client.post(ALIAS, json=BODY, headers=authed())

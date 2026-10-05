@@ -51,7 +51,28 @@ info:
   # implements another" defect, in a contract system. So the break lands whole. A
   # caller sending a number gets a **422 naming `temperature`**, which is a one-line
   # fix, rather than a silent coercion that hides the change from everybody.
-  version: 1.1.1
+  # 1.2.0 ADDS TWO PATHS and changes no existing one.
+  #
+  # `POST /v1/chat/completions` is an OpenAI-compatible alias for `POST /v1/route` and
+  # `GET /v1/models` is OpenAI's model list. Both are additive: `/v1/route`'s request
+  # schema, its response schema and every status it can produce are unchanged, so a
+  # generated client built against 1.1.1 keeps working with no regeneration. That is
+  # why this is a MINOR rather than a major, and it is checked rather than asserted:
+  # `tests/test_openapi.py` compares this document against the running app in both
+  # directions.
+  #
+  # The aliases are aliases. Both endpoints call one function, `muse.api`'s
+  # `serve_completion`, which authenticates, validates, routes and meters. A request to
+  # `/v1/chat/completions` therefore travels the same routing, authentication,
+  # authorization, metering and outbox path as a request to `/v1/route` and differs
+  # only in the shape of the body it gets back — which is why every failure status below
+  # is identical to the one documented for `/v1/route`, including the 503 that means
+  # `identity` is unreachable rather than that the caller's credential is bad.
+  #
+  # The one thing 1.2.0 does NOT add is streaming. A request carrying `stream` is a 422
+  # naming the field, not a silently non-streaming answer. See the alias's own
+  # description.
+  version: 1.2.0
   summary: LLM routing, credentials vault, and token metering for cafaye.
   description: |
     muse routes a chat completion to the first provider that can serve it, holds
@@ -63,12 +84,36 @@ info:
     lets a request fall through to a second provider when the first is rate limited or
     down, and it is why a caller cannot pin a request to a vendor.
 
+    ## OpenAI compatibility
+
+    Two of the three paths are the shape a stock OpenAI client expects, so an existing
+    integration can point its base URL here without learning that muse exists:
+
+    | Path | What it is |
+    | --- | --- |
+    | `POST /v1/route` | This service's own contract. Carries `provider`, `route` and `cost_micros`. |
+    | `POST /v1/chat/completions` | An **alias** for the above, in OpenAI's response shape. Same request, same auth, same metering, same outbox event. |
+    | `GET /v1/models` | OpenAI's model list, read from this service's own route table. |
+
+    The alias deliberately carries **only** OpenAI's six fields. `provider`, `route`,
+    `cost_micros` and `trace_id` are absent from its body; the trace id is still
+    returned in the `X-Trace-Id` **header**, which every response carries. A caller who
+    wants the muse-specific fields is a caller who wants `/v1/route`.
+
+    Both new paths require a credential and the same `completions:write` capability as
+    `/v1/route`. `GET /v1/models` in particular is not open: a model list names every
+    route and, through them, every vendor this deployment talks to.
+
     ## What this version does not do
 
-    * No streaming. Every response is a complete completion.
+    * **No streaming**, on any path. Every response is a complete completion, and a
+      request carrying `stream` is a 422 naming the field rather than a silently
+      non-streaming answer.
     * No tool calls. A provider response with null content is reported as an error
       rather than as empty text.
     * No embeddings, no images, no batches.
+    * No `/v1/audio/*`. Blocked on a platform-wide ruling about capability scope
+      names.
     * **The bearer token is verified**, and a valid signature is not on its own an
       authorization: the token must also carry the `completions:write` capability and
       an `account_id`. See the `bearerAuth` scheme below for the full list.
@@ -418,14 +463,466 @@ paths:
                     code: unavailable
                     trace_id: 0af7651916cd43dd8448eb211c80319c
 
+  /v1/chat/completions:
+    post:
+      tags: [llm]
+      operationId: createChatCompletion
+      summary: Create a chat completion (OpenAI-compatible alias for /v1/route)
+      description: |
+        OpenAI's path and response shape, served by the same routing, authentication,
+        authorization, metering and outbox path as `POST /v1/route`. This is an **alias**,
+        not a second implementation: both endpoints call one function in this service,
+        so there is one auth check, one fallback chain, one breaker registry and one
+        metered event, and a request here cannot reach a provider on terms `/v1/route`
+        would have refused.
+
+        The request body is `RouteRequest`, identical to `/v1/route`'s — including
+        `temperature` as a **decimal string**. OpenAI's own clients send that field as a
+        JSON number, and a number is a 422 naming `temperature`. That is the 1.1.1
+        decision applied unchanged rather than quietly reversed on the compatibility
+        path, where a `float64` artefact would be least likely to be noticed.
+
+        **Streaming is not supported.** A body carrying `stream` is a 422 naming the
+        field, because a caller who asked for a stream and received a whole response has
+        no way to tell what happened. Streaming is a separate piece of work, not a
+        parameter this endpoint accepts and ignores.
+
+        The 200 body is OpenAI's six fields and nothing else. `provider`, `route` and
+        `cost_micros` are absent — they are this service's additions and belong to
+        `/v1/route`. The trace id is still returned in the `X-Trace-Id` header.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteRequest'
+            examples:
+              single-turn:
+                summary: One user message
+                value:
+                  model: fast
+                  messages:
+                    - role: user
+                      content: Summarise this in one sentence.
+      parameters:
+        - name: traceparent
+          in: header
+          required: false
+          description: |
+            W3C trace context to continue. Identical in behaviour to `/v1/route`: a
+            well-formed header joins that trace, and a malformed or absent one starts a
+            new trace rather than failing the request.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      responses:
+        '200':
+          description: |
+            A completion, in OpenAI's shape. Exactly one `muse.tokens.consumed` event
+            was emitted, with the same payload `/v1/route` would have emitted.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletion'
+              examples:
+                completion:
+                  summary: A served completion
+                  value:
+                    id: chatcmpl-9f2c1a4b7e0d3f8a5c6b2e1d
+                    object: chat.completion
+                    created: 1798849200
+                    model: gpt-4o-mini
+                    choices:
+                      - index: 0
+                        message:
+                          role: assistant
+                          content: An outbox table, written in the same transaction.
+                        finish_reason: stop
+                    usage:
+                      prompt_tokens: 12
+                      completion_tokens: 8
+                      total_tokens: 20
+        '401':
+          description: |
+            The credential is absent, malformed, signed by a key `identity` does not
+            publish, expired, or missing a claim core requires — including
+            `account_id`. Same check, same statuses, same `detail` vocabulary as
+            `/v1/route`: `muse.auth` is one implementation and this path calls it.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/unauthorized
+                title: Unauthorized
+                status: 401
+                detail: a bearer credential is required
+                instance: /v1/chat/completions
+                code: unauthorized
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '403':
+          description: |
+            The token verified and does not carry `completions:write`. A valid signature
+            is not on its own an authorization, and this is the status that makes it
+            observable on the alias too.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/forbidden
+                title: Forbidden
+                status: 403
+                detail: token is missing the completions:write scope
+                instance: /v1/chat/completions
+                code: forbidden
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '404':
+          description: No route is configured for the requested model.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/not_found
+                title: Not found
+                status: 404
+                detail: no route is configured for model 'gpt-5-turbo'
+                instance: /v1/chat/completions
+                code: not_found
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '405':
+          description: The path exists but not for this method. A completion costs
+            money, so it is POST-only.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: |
+            The body is not a valid chat completion request, `errors[]` lists each
+            offending field, and a field this service does not support — `stream`
+            among them — is refused rather than ignored.
+
+            Identical to `/v1/route`'s 422 in every respect but the `instance`, because
+            it is the same validator on the same request model.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                missing-messages:
+                  summary: No messages
+                  value:
+                    type: https://errors.cafaye.com/validation_failed
+                    title: Validation failed
+                    status: 422
+                    detail: 'messages: Field required'
+                    instance: /v1/chat/completions
+                    code: validation_failed
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                    errors:
+                      - field: messages
+                        code: missing
+                unsupported-stream:
+                  summary: Streaming asked for on a path that does not do it
+                  value:
+                    type: https://errors.cafaye.com/validation_failed
+                    title: Validation failed
+                    status: 422
+                    detail: "stream: Extra inputs are not permitted"
+                    instance: /v1/chat/completions
+                    code: validation_failed
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                    errors:
+                      - field: stream
+                        code: extra_forbidden
+        '500':
+          description: |
+            muse failed, or — as on `/v1/route` — the completion's usage could not be
+            recorded. Deliberately not swallowed: the completion was paid for and
+            returning it without its metered record would lose the spend.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/internal
+                title: Internal error
+                status: 500
+                detail: an unexpected error occurred
+                instance: /v1/chat/completions
+                code: internal
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '503':
+          description: |
+            muse is up and something it depends on is not, for exactly the two reasons
+            `/v1/route` documents, and on the same terms:
+
+            * **Every candidate for the route failed.** `detail` names each provider,
+              the error class, and how many attempts it took.
+            * **`identity`'s signing keys could not be retrieved.** 503 and **not** 401 —
+              the credential is not known to be bad, only unchecked, and a 401 would send
+              a caller with a good token to re-authenticate against a healthy `identity`
+              and retry forever. muse does not serve unauthenticated traffic when
+              `identity` is down.
+
+            A client branching on this difference is the reason the alias exists on one
+            shared implementation rather than two.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                providers-down:
+                  summary: Every candidate failed
+                  value:
+                    type: https://errors.cafaye.com/unavailable
+                    title: Service unavailable
+                    status: 503
+                    detail: >-
+                      every candidate for model 'fast' failed —
+                      openai/gpt-4o-mini: ProviderTimeout (after 3 attempts);
+                      anthropic/claude-haiku-4-5: ProviderAuthError
+                    instance: /v1/chat/completions
+                    code: unavailable
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+                identity-down:
+                  summary: The signing keys could not be retrieved
+                  value:
+                    type: https://errors.cafaye.com/unavailable
+                    title: Service unavailable
+                    status: 503
+                    detail: the signing keys at
+                      https://identity.cafaye.com/.well-known/jwks.json could not be
+                      retrieved
+                    instance: /v1/chat/completions
+                    code: unavailable
+                    trace_id: 0af7651916cd43dd8448eb211c80319c
+
+  /v1/models:
+    get:
+      tags: [llm]
+      operationId: listModels
+      summary: List the models this service can route to
+      description: |
+        OpenAI's model list, so a stock client can discover what to ask for. Sourced
+        from this service's own route table — every model named in `config/routes.yaml`,
+        in file order — and **not** from a hardcoded list. A hardcoded list is a second
+        source of truth about what this service can route to, and it goes stale the
+        first time somebody edits the routes file.
+
+        The ids are **route names**, not vendor model ids: `fast` and `smart`, not
+        `gpt-4o-mini`. That is deliberate and it is the same indirection `/v1/route`
+        depends on — a caller cannot pin a request to a vendor through this list, which
+        is what keeps the fallback chain possible. `owned_by` is `muse`: this service is
+        a router in front of vendors it does not own.
+
+        **Requires a credential and `completions:write`** — the same capability string
+        as every other operation here, unchanged. A model list is not harmless public
+        information: it names every route and, through them, every vendor this
+        deployment talks to, which is reconnaissance. And core's conventions apply
+        `security` to this document globally, so an open listing would take a
+        per-operation override to exist at all.
+
+        `created` is `0` for every entry. This service has no model-creation timestamp to
+        report, and inventing one would be a lie in a machine-readable field.
+
+        A `POST` to this path is a 405 carrying the `not_found` code, like every other
+        method error in this service.
+      parameters:
+        - name: traceparent
+          in: header
+          required: false
+          description: |
+            W3C trace context to continue, on the same terms as the completion paths.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      responses:
+        '200':
+          description: Every model this service can route to, in route-table file order.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+              examples:
+                configured:
+                  summary: Two routes as this service is configured today
+                  value:
+                    object: list
+                    data:
+                      - id: fast
+                        object: model
+                        created: 0
+                        owned_by: muse
+                      - id: smart
+                        object: model
+                        created: 0
+                        owned_by: muse
+        '401':
+          description: |
+            No credential, or one that did not verify. Absent, malformed, signed by a
+            key `identity` does not publish, expired, or missing a claim core requires —
+            including `account_id`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/unauthorized
+                title: Unauthorized
+                status: 401
+                detail: a bearer credential is required
+                instance: /v1/models
+                code: unauthorized
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '403':
+          description: |
+            The token verified and does not carry `completions:write`. The same scope
+            string as `/v1/route` and the alias: a read would tempt `models:read`, and a
+            new scope namespace is a platform decision this service does not make in a
+            compatibility packet.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/forbidden
+                title: Forbidden
+                status: 403
+                detail: token is missing the completions:write scope
+                instance: /v1/models
+                code: forbidden
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '405':
+          description: The path exists but not for this method.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: muse failed.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/internal
+                title: Internal error
+                status: 500
+                detail: an unexpected error occurred
+                instance: /v1/models
+                code: internal
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+        '503':
+          description: |
+            `identity`'s signing keys could not be retrieved, so the credential could
+            not be checked. **503, not 401**, on the same reasoning as the completion
+            paths: the caller's credential is not known to be bad, only unchecked. muse
+            does not serve the model list unauthenticated when `identity` is down.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: https://errors.cafaye.com/unavailable
+                title: Service unavailable
+                status: 503
+                detail: the signing keys at
+                  https://identity.cafaye.com/.well-known/jwks.json could not be
+                  retrieved
+                instance: /v1/models
+                code: unavailable
+                trace_id: 0af7651916cd43dd8448eb211c80319c
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      # Keyed by `operationId`, and every operation that needs a capability is listed.
+      # `GET /v1/models` is here too, and it needs the SAME string: a read would tempt
+      # `models:read`, and a new scope namespace is a platform decision recorded in
+      # `cafaye.yml`, not one this service makes in a compatibility packet. An extension
+      # that describes only the endpoint it was written for stops describing the API.
       x-required-scopes:
-        route: [completions:write]
+        routeCompletion: [completions:write]
+        createChatCompletion: [completions:write]
+        listModels: [completions:write]
       description: |
         An RS256 JWT issued by `identity`, verified locally against its published
         JWKS. Keys are cached by `kid` with a bounded TTL, so `identity` is never on
@@ -699,6 +1196,97 @@ components:
         trace_id:
           type: string
           description: Matches the `X-Trace-Id` response header.
+
+    ChatCompletion:
+      type: object
+      description: |
+        OpenAI's `chat.completion` object, and only that.
+
+        Exactly six fields. `provider`, `route`, `cost_micros` and `trace_id` are
+        deliberately absent — they are this service's additions and belong to
+        `/v1/route`. A compatibility surface that grows its own extras is one a caller
+        has to be taught about, which is the opposite of what an alias is for, and the
+        generated clients this path exists for are the strictest readers of it.
+
+        The trace id is still returned in the `X-Trace-Id` header on every response,
+        including this one, so support correlation is not lost with the field.
+      additionalProperties: false
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+          description: |
+            This service's identifier for the completion, in the same `chatcmpl-` form
+            `/v1/route` uses. The *same* id the routed path would have minted for this
+            request — the alias does not renumber anything.
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix seconds, which is what OpenAI's clients read here.
+        model:
+          type: string
+          description: |
+            The vendor's model id that actually served the request. A caller asked for a
+            route name and gets the vendor's id back, exactly as on `/v1/route` — which
+            is how a caller can tell which vendor answered without this service ever
+            telling it to.
+        choices:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    ModelEntry:
+      type: object
+      additionalProperties: false
+      required: [id, object, created, owned_by]
+      properties:
+        id:
+          type: string
+          description: |
+            A **route name** from this service's `config/routes.yaml` — `fast`, `smart` —
+            not a vendor model id. The same indirection `/v1/route` depends on: a caller
+            cannot pin a request to a vendor through this list, which is what keeps the
+            fallback chain possible.
+        object:
+          type: string
+          const: model
+        created:
+          type: integer
+          description: |
+            Always `0`. This service has no model-creation timestamp to report, and
+            inventing one would be a lie in a machine-readable field. Some clients
+            display it; none should act on it.
+        owned_by:
+          type: string
+          const: muse
+          description: |
+            OpenAI's field names the organisation that owns the model. This service is
+            not an organisation — it is a router in front of vendors it does not own — so
+            the honest value is this service's own name.
+
+    ModelList:
+      type: object
+      additionalProperties: false
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          description: |
+            Every model this service can route to, in route-table **file order** — the
+            order a human reads in a diff. Sorted would hide a reordered
+            `config/routes.yaml`, and a reorder is a change to which vendor a customer's
+            requests reach.
+          items:
+            $ref: '#/components/schemas/ModelEntry'
 
     FieldError:
       type: object

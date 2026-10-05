@@ -128,6 +128,22 @@ REQUIRE_SCOPE = EntryPoint(
 POST_ROUTE = EntryPoint(
     "POST /v1/route", "http", "read", "ACCOUNT", "test_two_accounts_get_the_same_completion"
 )
+#: The OpenAI-compatible alias. `ACCOUNT`, and not `PLATFORM`, because it is the same
+#: write: `muse.api.serve_completion` is what meters it, so it inherits the tenancy
+#: establishment and the D9 gap of `/v1/route` rather than escaping them. Calling it
+#: `PLATFORM` on the grounds that it "only renders a different body" would be a claim
+#: about the shape rather than about the path, and the path is what meters.
+POST_CHAT_COMPLETIONS = EntryPoint(
+    "POST /v1/chat/completions",
+    "http",
+    "read",
+    "ACCOUNT",
+    "test_the_alias_carries_no_account_and_emits_the_same_payload",
+)
+#: `PLATFORM`: the route table is configuration, not tenant data.
+GET_MODELS = EntryPoint(
+    "GET /v1/models", "http", "read", "PLATFORM", "test_the_model_list_names_no_account"
+)
 HEALTHZ = EntryPoint("GET /healthz", "http", "read", "PLATFORM", "test_healthz_names_no_account")
 READYZ = EntryPoint("GET /readyz", "http", "read", "PLATFORM", "test_readyz_names_no_account")
 
@@ -173,16 +189,27 @@ OUTBOX_CLAIM = EntryPoint(
     "test_the_claim_query_is_unscoped_and_only_reads_unpublished",
 )
 
-#: **12 account-scoped entry points. 7 read, 2 list, 2 update, 1 delete.**
+#: **14 account-scoped entry points. 9 read, 2 list, 2 update, 1 delete.**
 #:
-#: Of the twelve, **three carry a tenant axis** (`ACCOUNT`: `require_bearer`,
-#: `POST /v1/route`, `Meter.record`) and nine do not. That ratio is the measurement:
-#: muse's tenant surface is the auth gate, the one route, and the one write that meters
-#: the route — and the other nine are load-bearing *because* they cannot see a tenant.
+#: Of the fourteen, **four carry a tenant axis** (`ACCOUNT`: `require_bearer`,
+#: `POST /v1/route`, `POST /v1/chat/completions`, `Meter.record`) and ten do not. That
+#: ratio is the measurement: muse's tenant surface is the auth gate, the two
+#: entry points into the one routed write, and that write itself — and the other ten are
+#: load-bearing *because* they cannot see a tenant.
+#:
+#: The alias packet took this from three to four, and the delta is worth reading
+#: because it is the honest answer rather than the convenient one. `POST
+#: /v1/chat/completions` could have been classified `PLATFORM` on the grounds that it
+#: only renders a different body from a call that was already made. It cannot: it
+#: reaches the same `Meter.record`, so it carries the same tenancy establishment and the
+#: same D9 gap. A second body is not a second surface, and the enumeration had to move
+#: because the *path* is new — not because a new discriminator appeared.
 ENTRY_POINTS: tuple[EntryPoint, ...] = (
     REQUIRE_BEARER,
     REQUIRE_SCOPE,
     POST_ROUTE,
+    POST_CHAT_COMPLETIONS,
+    GET_MODELS,
     HEALTHZ,
     READYZ,
     METER_RECORD,
@@ -197,16 +224,16 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
 #: The ratchet. `gate.yml`'s floor counts *tests*, and a test that stops being collected
 #: keeps it green. This counts *enumerated entry points*, so deleting a row without its
 #: negative test fails here instead.
-ENTRY_POINT_COUNT = 12
+ENTRY_POINT_COUNT = 14
 
 #: Per-operation counts, reported in the packet and asserted so a table that quietly
 #: loses a whole operation cannot pass.
-OPERATION_COUNTS = {"read": 7, "list": 2, "update": 2, "delete": 1}
+OPERATION_COUNTS = {"read": 9, "list": 2, "update": 2, "delete": 1}
 
-#: How many of the twelve carry a tenant axis. The single most load-bearing number in
+#: How many of the fourteen carry a tenant axis. The single most load-bearing number in
 #: this file, because it is the one that says "muse has almost no tenancy surface", and a
 #: future packet that grows one has to move it deliberately.
-TENANT_SCOPED_COUNT = 3
+TENANT_SCOPED_COUNT = 4
 
 
 def auth(account: str, **claims: object) -> dict[str, str]:
@@ -327,15 +354,25 @@ def test_the_enumeration_covers_every_operation_the_packet_asks_for():
     assert counted == OPERATION_COUNTS
 
 
-def test_only_three_entry_points_carry_a_tenant_axis():
-    """The measurement, pinned: muse's tenant surface is three entry points wide.
+def test_only_four_entry_points_carry_a_tenant_axis():
+    """The measurement, pinned: muse's tenant surface is four entry points wide.
 
     Asserted because a packet that *grows* one should have to change this number on
     purpose, next to the negative test for the thing it added — not leave the old count
     sitting there claiming the surface is still three.
+
+    The alias packet moved this from three to four. Both new rows are listed here in
+    order so the delta is legible: `POST /v1/chat/completions` joins because it meters,
+    and `GET /v1/models` stays off the list because a route table is configuration
+    rather than tenant data.
     """
     carrying = [entry.name for entry in ENTRY_POINTS if entry.tenant_axis == "ACCOUNT"]
-    assert carrying == ["api.require_bearer", "POST /v1/route", "metering.Meter.record"]
+    assert carrying == [
+        "api.require_bearer",
+        "POST /v1/route",
+        "POST /v1/chat/completions",
+        "metering.Meter.record",
+    ]
     assert len(carrying) == TENANT_SCOPED_COUNT
 
 
@@ -672,6 +709,57 @@ async def test_two_accounts_get_the_same_completion():
             }
 
     assert bodies[ACCOUNT] == bodies[OTHER_ACCOUNT] == bodies[NO_SUCH_ACCOUNT]
+
+
+async def test_the_alias_carries_no_account_and_emits_the_same_payload():
+    """`POST /v1/chat/completions` — ACCOUNT, read.
+
+    The negative test for the alias, and it is deliberately the *same* question asked
+    of `/v1/route`: two accounts and one that has never existed all get a body naming
+    no tenant, and the metered event is byte-identical apart from its own ids.
+
+    Asserting the alias against `/v1/route`'s negative test rather than inventing a
+    second one is the point of the classification. An alias that meters differently, or
+    that leaked a tenant into a body `/v1/route` does not, would be a tenant surface
+    the suite had silently grown — and the payload comparison is what makes "the same
+    write" checkable rather than asserted in a comment.
+    """
+    paths = ("/v1/route", "/v1/chat/completions")
+    accounts = (ACCOUNT, OTHER_ACCOUNT, NO_SUCH_ACCOUNT)
+    database = FakeDatabase()
+    async with asgi_client(app_for(database)) as client:
+        for path in paths:
+            for account in accounts:
+                response = await client.post(path, json=BODY, headers=auth(account))
+                assert response.status_code == 200, f"{path} as {account}"
+                assert account not in response.text, f"{path} named the caller's account"
+
+    # One event per completion, on either path. `Meter.record` is reached through
+    # `api.serve_completion`, so the alias cannot meter twice or not at all — and this
+    # count is what would notice if a future change gave it its own write.
+
+    # Two paths times three accounts = six requests, six events. The count is derived from
+    # the two collections the loop above walked rather than written as a literal, so
+    # adding a path or an account to that loop cannot leave this asserting a stale
+    # number — which would be a test that fails loudly and for the wrong reason.
+    assert len(database.outbox) == len(paths) * len(accounts)
+    data = [json.loads(row["data"]) for row in database.outbox]
+    # The payload is exactly core's five fields, identical across both paths, and the
+    # subject is core's reserved literal rather than a tenant.
+    for row, payload in zip(database.outbox, data, strict=True):
+        assert row["subject"] == SUBJECT == "platform"
+        assert set(payload) == {
+            "model",
+            "provider",
+            "tokens_in",
+            "tokens_out",
+            "cost_micros",
+        }
+        for other in (ACCOUNT, OTHER_ACCOUNT, NO_SUCH_ACCOUNT):
+            assert other not in str(row)
+    # One distinct payload across all four requests: the alias does not add a field,
+    # rename one, or compute the cost somewhere else.
+    assert len({json.dumps(payload, sort_keys=True) for payload in data}) == 1
 
 
 async def test_a_path_that_does_not_exist_is_404_for_every_account():

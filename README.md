@@ -194,11 +194,52 @@ have decided the stored provider credentials in it are not worth a `pg_dump`.
 
 ## Endpoints
 
-| Method | Path         | Purpose                                                    |
-| ------ | ------------ | ---------------------------------------------------------- |
-| POST   | `/v1/route`   | Serve a chat completion from the first candidate that works. |
-| GET    | `/healthz`   | Liveness. `{"status":"ok"}`; consults nothing.              |
-| GET    | `/readyz`    | Readiness. Reports the `db` slot.                           |
+| Method | Path                       | Purpose                                                     |
+| ------ | -------------------------- | ----------------------------------------------------------- |
+| POST   | `/v1/route`                | Serve a chat completion from the first candidate that works. |
+| POST   | `/v1/chat/completions`     | The same thing, in OpenAI's shape. An **alias**, not a second implementation. |
+| GET    | `/v1/models`               | The routable models, in OpenAI's shape. Requires a credential. |
+| GET    | `/healthz`                 | Liveness. `{"status":"ok"}`; consults nothing.              |
+| GET    | `/readyz`                  | Readiness. Reports the `db` slot.                           |
+
+### The aliases are aliases
+
+`POST /v1/chat/completions` exists so a stock OpenAI client can reach the fleet gateway
+without knowing muse is there. It is not a second implementation, and the difference
+matters enough to state precisely: **both endpoints call one function**,
+`muse.api.serve_completion`, which authenticates, validates, routes and meters. So there
+is one auth check, one fallback chain, one breaker registry and one metered event, and a
+request to the alias cannot reach a provider on terms `/v1/route` would have refused.
+
+Only the response *shape* differs. The alias returns OpenAI's six fields and nothing
+else — `provider`, `route`, `cost_micros` and `trace_id` are absent, because a
+compatibility surface that grows its own extras is one a caller has to be taught about.
+The trace id still comes back in the `X-Trace-Id` header. A caller who wants the
+muse-specific fields is a caller who wants `/v1/route`.
+
+Every failure mode is therefore identical *by construction* rather than by two pieces of
+code agreeing: a verified token without the capability is a 403, a bad token is a 401,
+and **an unreachable key set is a 503 rather than a 401** — see [Auth](#auth) for why
+that distinction exists. `tests/test_alias.py` asserts each of those on *both* paths, and
+its load-bearing tests count provider calls and outbox rows rather than only reading the
+alias's own JSON, because a shape assertion passes just as happily against a second
+implementation that returns the right thing.
+
+`GET /v1/models` is sourced from `config/routes.yaml`, in file order, so the ids are
+route names (`fast`, `smart`) rather than vendor model ids — the same indirection
+`/v1/route` depends on, which is what keeps the fallback chain possible. It requires a
+credential and the same `completions:write` scope, because a model list names every
+route and through them every vendor this deployment talks to.
+
+Two things the alias deliberately does **not** do:
+
+- **No streaming.** A body carrying `stream` is a 422 naming the field, because a caller
+  who asked for a stream and got a whole response has no way to tell what happened. It
+  is a separate piece of work.
+- **No `temperature` as a JSON number.** OpenAI's clients send that field as a number
+  and it is a 422 here, on the alias as on `/v1/route`. That is the 1.1.1 decision
+  applied unchanged rather than quietly reversed on the compatibility path, where a
+  `float64` artefact would be least likely to be noticed.
 
 The probe endpoints are deliberately absent from `openapi/v1.yaml`: they are
 infrastructure, not contract, and documenting them would put `/healthz` under the `/v1`

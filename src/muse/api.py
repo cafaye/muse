@@ -99,6 +99,13 @@ TRACE_HEADER = "X-Trace-Id"
 #: for a provider-passthrough parameter where exact bytes matter.
 TEMPERATURE_PATTERN = r"^(?:0(?:\.[0-9]+)?|1(?:\.[0-9]+)?|2(?:\.0+)?)$"
 
+#: `owned_by` on every entry in `GET /v1/models`.
+#:
+#: OpenAI's field names the organisation that owns the model, and this service is not
+#: an organisation — it is a router in front of vendors it does not own. So the value
+#: is muse's own name: the honest answer, and the one a reader can act on.
+MODEL_OWNER = "muse"
+
 
 #: The request body. `extra="forbid"` because core closes request bodies like it
 #: closes schemas: a typo'd `max_token` that is silently ignored leaves a caller
@@ -294,6 +301,171 @@ class RouteResponseBody(BaseModel):
     trace_id: str
 
 
+class ChatCompletionBody(BaseModel):
+    """OpenAI's `chat.completion` object, and only that.
+
+    Six fields, chosen because a generated OpenAI client validates against them and
+    because every one of them is already on `ServedCompletion`. The three muse-specific
+    fields on `RouteResponseBody` — `provider`, `route`, `cost_micros` — are absent on
+    purpose: this is the compatibility surface, and a caller who wants them is a caller
+    who should be calling `/v1/route`. `trace_id` is absent for the same reason and its
+    loss is covered by the `X-Trace-Id` header, which middleware sets on every response.
+    """
+
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: list[dict[str, Any]]
+    usage: dict[str, int]
+
+
+class ModelEntry(BaseModel):
+    """One entry in OpenAI's model list."""
+
+    id: str
+    object: str
+    created: int
+    owned_by: str
+
+
+class ModelList(BaseModel):
+    """OpenAI's list envelope."""
+
+    object: str
+    data: list[ModelEntry]
+
+
+#: A served completion, before any response shape is chosen.
+#:
+#: One type for both endpoints because there is one served completion: the alias and
+#: `/v1/route` render the same object differently, and a second type here would be an
+#: invitation to compute the alias's numbers independently — which is exactly the bug
+#: this packet is about. The token counts and the cost on this object are the ones that
+#: were metered.
+@dataclass(frozen=True, slots=True)
+class ServedCompletion:
+    id: str
+    created: int
+    model: str
+    provider: str
+    route: str
+    content: str
+    finish: str
+    tokens_in: int
+    tokens_out: int
+    cost_micros: int
+    trace_id: str
+
+    @property
+    def choices(self) -> list[dict[str, Any]]:
+        """The single choice, in OpenAI's shape.
+
+        A property rather than a field because it is derived from `content` and
+        `finish` and must not be stored twice: two copies of one choice is two things
+        to keep in agreement.
+        """
+        return [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": self.content},
+                "finish_reason": self.finish,
+            }
+        ]
+
+    @property
+    def usage(self) -> dict[str, int]:
+        """`total_tokens` computed here rather than taken from a provider.
+
+        Same rule as `RouteResponseBody.usage`: a provider that reports its two counts
+        inconsistently must not be able to make the three disagree. Computed on both
+        paths from the same object, so the alias cannot disagree with what was metered.
+        """
+        return {
+            "prompt_tokens": self.tokens_in,
+            "completion_tokens": self.tokens_out,
+            "total_tokens": self.tokens_in + self.tokens_out,
+        }
+
+
+async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
+    """Authenticate, validate, route, meter — the whole path both endpoints share.
+
+    **This is the alias's reason for existing.** `POST /v1/chat/completions` calls this
+    function and renders the result in OpenAI's shape; `POST /v1/route` calls it and
+    renders it in muse's. There is no second routing call, no second metering call, and
+    no second auth check, because there is one function that does all three and both
+    endpoints delegate to it.
+
+    The order is load-bearing and is `/v1/route`'s existing order, unchanged:
+
+    1. **Authenticate, before the body is read and before any provider is contacted.**
+       An unauthenticated request must not be able to make muse spend money, and it
+       must not be able to learn whether a model name routes at all.
+    2. **Validate**, so a typo'd field is a 422 naming the field rather than a bill for
+       a request nobody meant.
+    3. **Route**, through `container.router` — the one router, with the one fallback
+       chain and the one breaker registry.
+    4. **Meter, before the response is built and not inside a `try`.** The completion has
+       already been paid for; returning it without its record loses the spend silently,
+       and a 503 makes the loss visible. This is why metering happens *here* rather
+       than in either endpoint: metering on the alias's own path would be the second
+       call this packet is trying not to write.
+
+    A `JSONResponse` return is a `problem+json` failure — every one of them produced by
+    the same helpers `/v1/route` uses, so the failure modes are identical by
+    construction rather than by agreement between two pieces of code.
+    """
+    try:
+        await require_bearer(request)
+    except AuthError as error:
+        return auth_problem(request, error)
+
+    try:
+        body = RouteRequestBody.model_validate(await request.json())
+    except ValidationError as error:
+        return problem(request, "validation_failed", 422, _describe(error), fields=_fields(error))
+    except ValueError:
+        return problem(request, "validation_failed", 422, "the request body is not valid JSON")
+
+    container = request.app.state.container
+    try:
+        result = await container.router.route(
+            body.model,
+            [(message.role, message.content) for message in body.messages],
+            max_tokens=body.max_tokens,
+            temperature=body.sampling_temperature(),
+            secrets=container.credentials_held(),
+        )
+    except RouteNotFound as error:
+        return problem(
+            request, "not_found", 404, f"no route is configured for model {error.model!r}"
+        )
+    except ValueError as error:
+        # A bad role or an empty message, raised by the router before any provider
+        # was called — so naming it here costs the caller nothing.
+        return problem(request, "validation_failed", 422, str(error))
+    except AllCandidatesFailed as error:
+        return problem(request, "unavailable", 503, _chain(error))
+
+    await container.meter.record(result)
+
+    completion = result.completion
+    return ServedCompletion(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=completion.model,
+        provider=completion.provider,
+        route=result.route,
+        content=completion.content,
+        finish=completion.finish,
+        tokens_in=completion.tokens_in,
+        tokens_out=completion.tokens_out,
+        cost_micros=result.cost_micros,
+        trace_id=trace_id_for(request),
+    )
+
+
 def build_router() -> APIRouter:
     """The versioned surface. A separate router so the probes and the API can be
     mounted, tested and reasoned about independently."""
@@ -311,74 +483,98 @@ def build_router() -> APIRouter:
         ),
     )
     async def route_completion(request: Request) -> Response:
-        # Authentication before the body is read, and before any provider is contacted:
-        # an unauthenticated request must not be able to make muse spend money, and it
-        # must not be able to learn whether a model name routes at all.
+        served = await serve_completion(request)
+        if isinstance(served, JSONResponse):
+            return served
+
+        response = RouteResponseBody(
+            id=served.id,
+            object="chat.completion",
+            created=served.created,
+            model=served.model,
+            provider=served.provider,
+            route=served.route,
+            choices=served.choices,
+            usage=served.usage,
+            cost_micros=served.cost_micros,
+            trace_id=served.trace_id,
+        )
+        return JSONResponse(
+            content=response.model_dump(),
+            headers={TRACE_HEADER: response.trace_id},
+        )
+
+    @api.post(
+        "/chat/completions",
+        response_model=ChatCompletionBody,
+        status_code=200,
+        summary="Create a chat completion (OpenAI-compatible alias for /v1/route)",
+        description=(
+            "OpenAI's path and response shape, served by the same routing, "
+            "authentication, authorization, metering and outbox path as `POST "
+            "/v1/route`. It is an alias, not a second implementation: a stock OpenAI "
+            "client reaches this service without knowing muse exists. **Streaming is "
+            "not supported** — a request carrying `stream` is a 422 naming the field, "
+            "not a silently non-streaming answer."
+        ),
+    )
+    async def create_chat_completion(request: Request) -> Response:
+        served = await serve_completion(request)
+        if isinstance(served, JSONResponse):
+            return served
+
+        # OpenAI's six fields and nothing else. `provider`, `route` and `cost_micros`
+        # are muse's additions and belong to `/v1/route`; a compatibility surface that
+        # grew its own extras is one a generated client has to be taught about, which
+        # is the opposite of what an alias is for. `X-Trace-Id` still carries the trace
+        # id — it is set by middleware every response passes through, so support
+        # correlation survives the body dropping the field.
+        response = ChatCompletionBody(
+            id=served.id,
+            object="chat.completion",
+            created=served.created,
+            model=served.model,
+            choices=served.choices,
+            usage=served.usage,
+        )
+        return JSONResponse(
+            content=response.model_dump(),
+            headers={TRACE_HEADER: served.trace_id},
+        )
+
+    @api.get(
+        "/models",
+        response_model=ModelList,
+        status_code=200,
+        summary="List the models this service can route to",
+        description=(
+            "OpenAI's model list, sourced from this service's own route table rather "
+            "than a hardcoded list — so it cannot disagree with what muse can actually "
+            "route. Requires a credential and the same `completions:write` capability "
+            "as every other operation here; a model list names every route and, through "
+            "them, every vendor this deployment talks to."
+        ),
+    )
+    async def list_models(request: Request) -> Response:
+        # The same check, the same scope, and therefore the same 401 / 403 / 503
+        # distinctions. A separate weaker check here would be a parallel auth policy,
+        # which is the class of thing `muse.auth`'s docstring argues against.
         try:
             await require_bearer(request)
         except AuthError as error:
             return auth_problem(request, error)
 
-        try:
-            body = RouteRequestBody.model_validate(await request.json())
-        except ValidationError as error:
-            return problem(
-                request, "validation_failed", 422, _describe(error), fields=_fields(error)
-            )
-        except ValueError:
-            return problem(request, "validation_failed", 422, "the request body is not valid JSON")
-
-        container = request.app.state.container
-        try:
-            result = await container.router.route(
-                body.model,
-                [(message.role, message.content) for message in body.messages],
-                max_tokens=body.max_tokens,
-                temperature=body.sampling_temperature(),
-                secrets=container.credentials_held(),
-            )
-        except RouteNotFound as error:
-            return problem(
-                request, "not_found", 404, f"no route is configured for model {error.model!r}"
-            )
-        except ValueError as error:
-            # A bad role or an empty message, raised by the router before any provider
-            # was called — so naming it here costs the caller nothing.
-            return problem(request, "validation_failed", 422, str(error))
-        except AllCandidatesFailed as error:
-            return problem(request, "unavailable", 503, _chain(error))
-
-        # Metered before the response is built, and not inside a try. The completion
-        # has already been paid for; returning it without its record loses the spend
-        # silently, and a 503 makes the loss visible.
-        await container.meter.record(result)
-
-        completion = result.completion
-        response = RouteResponseBody(
-            id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            object="chat.completion",
-            created=int(time.time()),
-            model=completion.model,
-            provider=completion.provider,
-            route=result.route,
-            choices=[
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": completion.content},
-                    "finish_reason": completion.finish,
-                }
+        table = request.app.state.container.routes
+        response = ModelList(
+            object="list",
+            data=[
+                ModelEntry(id=name, object="model", created=0, owned_by=MODEL_OWNER)
+                for name in table.models()
             ],
-            usage={
-                "prompt_tokens": completion.tokens_in,
-                "completion_tokens": completion.tokens_out,
-                "total_tokens": completion.tokens_in + completion.tokens_out,
-            },
-            cost_micros=result.cost_micros,
-            trace_id=trace_id_for(request),
         )
         return JSONResponse(
             content=response.model_dump(),
-            headers={TRACE_HEADER: response.trace_id},
+            headers={TRACE_HEADER: trace_id_for(request)},
         )
 
     return api
@@ -472,15 +668,21 @@ def register_error_handlers(app: FastAPI) -> None:
 
 
 __all__ = [
+    "MODEL_OWNER",
     "TRACE_HEADER",
+    "ChatCompletionBody",
+    "ModelEntry",
+    "ModelList",
     "Problem",
     "RouteRequestBody",
     "RouteResponseBody",
+    "ServedCompletion",
     "auth_problem",
     "build_router",
     "new_trace_id",
     "problem",
     "register_error_handlers",
     "require_bearer",
+    "serve_completion",
     "trace_id_for",
 ]

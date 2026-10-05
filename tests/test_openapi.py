@@ -27,7 +27,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from muse.api import TEMPERATURE_PATTERN, RouteRequestBody, RouteResponseBody
+from muse.api import (
+    TEMPERATURE_PATTERN,
+    ChatCompletionBody,
+    ModelEntry,
+    ModelList,
+    RouteRequestBody,
+    RouteResponseBody,
+)
 from muse.auth import SCOPE, SCOPE_CLAIM, SCOPES_CLAIM
 from muse.contracts import TOKENS_CONSUMED, validate_event_type
 from muse.main import create_app
@@ -113,10 +120,16 @@ def test_the_version_prefix_and_the_document_version_are_both_present() -> None:
     assert spec()["info"]["version"]
 
 
-def test_the_only_endpoint_is_the_routed_completion() -> None:
+def test_the_documented_paths_are_exactly_the_three_muse_serves() -> None:
     """Pinned so adding a path is a deliberate act with a test to update, rather than
-    something that lands because a handler was added."""
-    assert list(spec()["paths"]) == ["/v1/route"]
+    something that lands because a handler was added.
+
+    Three, in this order: the routed completion, the OpenAI-compatible alias for it,
+    and the model list a stock client discovers models through. `POST /v1/chat/completions`
+    and `GET /v1/models` arrived together with the alias packet, and the count is
+    asserted rather than described so a fourth path has to be argued for.
+    """
+    assert list(spec()["paths"]) == ["/v1/route", "/v1/chat/completions", "/v1/models"]
 
 
 def test_the_probe_endpoints_are_not_in_the_contract() -> None:
@@ -249,9 +262,78 @@ async def test_the_running_app_emits_every_correlation_header_the_document_promi
 
 def test_the_response_schema_names_exactly_the_response_models_fields() -> None:
     """A field in a response model that the document omits is a field no SDK has. This
-    is the check that makes the committed document worth committing."""
-    documented = set(spec()["components"]["schemas"]["RouteResponse"]["properties"])
-    assert documented == set(RouteResponseBody.model_fields)
+    is the check that makes the committed document worth committing.
+
+    Applied to all three success bodies — `/v1/route`, the chat-completions alias and
+    the model list — because a document that describes one of three and not the others
+    is a document that describes some of the API. The alias is the one most likely to
+    rot: it is the shape a generated OpenAI client validates against, so a field that
+    exists in the code and not in the document is a client that rejects a valid answer.
+    """
+    document = spec()
+    for schema, model in (
+        ("RouteResponse", RouteResponseBody),
+        ("ChatCompletion", ChatCompletionBody),
+        ("ModelList", ModelList),
+    ):
+        documented = set(document["components"]["schemas"][schema]["properties"])
+        assert documented == set(model.model_fields), (
+            f"{schema}: the document names {sorted(documented)} and the model has "
+            f"{sorted(model.model_fields)}"
+        )
+
+
+def test_the_model_entry_schema_names_exactly_its_models_fields() -> None:
+    """The list's rows, separately — a nested schema is where a generated client looks
+    for `owned_by`, and an omitted row field is a client that cannot read a model id."""
+    documented = set(spec()["components"]["schemas"]["ModelEntry"]["properties"])
+    assert documented == set(ModelEntry.model_fields)
+    assert "id" in documented and "owned_by" in documented
+
+
+def test_the_alias_body_is_openais_shape_and_carries_no_muse_extras() -> None:
+    """The alias's documented body is OpenAI's six fields.
+
+    Asserted in both directions — against the model, and against the *absence* of the
+    three muse-specific fields. The second half is the one that matters: a compatibility
+    surface that quietly grows `provider` or `cost_micros` is a surface a caller has to
+    be taught about, which defeats the purpose of having one. A generated client that
+    validates strictly is exactly the caller this endpoint exists for.
+    """
+    properties = set(spec()["components"]["schemas"]["ChatCompletion"]["properties"])
+    assert properties == {"id", "object", "created", "model", "choices", "usage"}
+    for muse_only in ("provider", "route", "cost_micros", "trace_id"):
+        assert muse_only not in properties, (
+            f"{muse_only} is muse's, not OpenAI's, and belongs on /v1/route"
+        )
+
+
+def test_the_alias_documents_that_streaming_is_not_supported() -> None:
+    """Said out loud in the contract, because a silent non-streaming answer is the
+    failure a caller cannot detect.
+
+    `RouteRequestBody` sets `extra="forbid"`, so a request carrying `stream` is a 422
+    naming the field rather than a completion the caller did not ask for. A client
+    reading this document learns that; a client that does not read it gets a 422 and a
+    field name, which is the honest version of the same news.
+    """
+    description = prose(spec()["paths"]["/v1/chat/completions"]["post"]["description"])
+    assert "not supported" in description
+    assert "stream" in description
+    assert "alias" in description
+
+
+def test_the_model_list_is_documented_as_sourced_from_the_route_table() -> None:
+    """The claim that it is not a hardcoded list, stated where a reader will look.
+
+    A hardcoded list is a second source of truth about what muse can route to, and it
+    goes stale the first time somebody edits `config/routes.yaml`. `tests/test_alias.py`
+    proves the behaviour with a route table named alpha/beta/gamma; this proves the
+    document agrees rather than describing a list someone hand-maintained.
+    """
+    description = prose(spec()["paths"]["/v1/models"]["get"]["description"])
+    assert "route table" in description
+    assert "completions:write" in description
 
 
 def test_the_request_schema_names_exactly_the_request_models_fields() -> None:
@@ -288,7 +370,17 @@ def test_the_security_scheme_names_the_capability_the_operation_requires() -> No
 
     assert scheme["scheme"] == "bearer"
     assert scheme["bearerFormat"] == "JWT", "every other service states the format"
-    assert scheme["x-required-scopes"]["route"] == [SCOPE]
+    # Every operation, not just the routed one. `x-required-scopes` is keyed by
+    # operation id, so a new endpoint that needs the capability has to be added here
+    # or the extension silently stops describing it — and the alias and the model list
+    # both do need it, with the SAME string. `GET /v1/models` is a read and would
+    # tempt `models:read`; that is a new scope namespace, a platform decision recorded
+    # in `cafaye.yml`, and not one this packet makes.
+    assert scheme["x-required-scopes"] == {
+        "routeCompletion": [SCOPE],
+        "createChatCompletion": [SCOPE],
+        "listModels": [SCOPE],
+    }
 
     description = prose(scheme["description"])
     for phrase in (
