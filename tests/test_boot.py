@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+import httpx
 import pytest
 
 from muse.db import PsycopgDatabase
@@ -313,6 +314,46 @@ async def test_the_stand_in_database_names_the_statement_it_refused() -> None:
 
 
 # --- the factory ------------------------------------------------------------
+
+
+async def test_the_booted_container_can_serve_a_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A container from `build_container` must be able to answer a request at all.
+
+    **This is the test that a field would have caught, and it exists because a quickstart
+    packet ran the real service for the first time.** `build_container` handed
+    `Telemetry` a `TracerProvider` where it wants a `Tracer`, and `Telemetry.span`
+    calls `start_as_current_span` — a method only the tracer has. So every request a
+    *real* muse served 500'd inside `TraceMiddleware`, before auth, before routing,
+    before anything this repository has an opinion about, and `/healthz` was as dead
+    as `/v1/route`.
+
+    Nothing caught it, and the reason is worth writing down: **every HTTP test builds
+    its own container** (`tests/support/test_app.build_test_app`), where `Telemetry`
+    arrives as a real tracer, and the boot tests asserted the container's *fields* —
+    `container.database is database`, `credential_for(...) == Secret(...)` — which
+    says nothing about whether a request can be served. A boot sequence that builds
+    correctly and serves nothing is the exact failure `test_boot.py`'s own module
+    docstring claims to be about, and it was in the file.
+
+    So the assertion is deliberately the cheapest possible end of the whole path: one
+    `GET /healthz` over `httpx.ASGITransport`, no socket, no provider, no database —
+    because `/healthz` consults nothing (rule 5). If the container cannot open a span,
+    this is a 500 and the whole service is dead.
+    """
+    monkeypatch.setenv("MUSE_VAULT_KEY", KEY)
+    fake_pool(monkeypatch, FakeDatabase(), [])
+    container = await build_container(Settings(routes_path=routes_file(tmp_path), database_url=DSN))
+
+    app = create_app(container=container)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://muse.test"
+    ) as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 def test_the_factory_returns_a_new_app_each_call() -> None:

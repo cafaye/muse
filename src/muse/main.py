@@ -282,8 +282,17 @@ async def build_container(settings: Settings) -> Container:
     for vendor in VENDORS:
         registry.register(LiteLLMProvider(name=vendor, credentials=credentials))
     routes.validate(registry)
+    # The PROVIDER's tracer, not the provider: `Telemetry` opens spans through
+    # `Tracer.start_as_current_span`, and a `TracerProvider` does not have it — so
+    # handing the provider over produced a container whose every request 500s in the
+    # middleware, before routing, auth or anything else. Nothing caught it because the
+    # HTTP tests build their own container and `tests/test_boot.py` asserted the
+    # container's fields rather than making a request through it. See
+    # `tests/test_boot.py::test_the_booted_container_can_serve_a_request`.
     telemetry = Telemetry(
-        build_provider(endpoint=settings.otel_endpoint, service_name=settings.otel_service_name)
+        build_provider(
+            endpoint=settings.otel_endpoint, service_name=settings.otel_service_name
+        ).get_tracer(APP_TITLE)
     )
     return Container(
         settings=settings,
