@@ -316,9 +316,7 @@ async def test_the_stand_in_database_names_the_statement_it_refused() -> None:
 # --- the factory ------------------------------------------------------------
 
 
-async def test_the_booted_container_can_serve_a_request(
-    tmp_path: Path, monkeypatch
-) -> None:
+async def test_the_booted_container_can_serve_a_request(tmp_path: Path, monkeypatch) -> None:
     """A container from `build_container` must be able to answer a request at all.
 
     **This is the test that a field would have caught, and it exists because a quickstart

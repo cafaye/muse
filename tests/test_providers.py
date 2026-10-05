@@ -760,6 +760,41 @@ async def test_the_adapter_rejects_a_message_with_null_content() -> None:
         await provider.complete(ask())
 
 
+async def test_the_adapter_reads_a_real_litellm_model_response() -> None:
+    """**The shape the real library returns, not the shape the stub returns.**
+
+    `acompletion` hands back a `litellm.types.utils.ModelResponse`: a pydantic model
+    whose `choices[0]` is a `Choices` and whose `usage` is a `Usage`. The adapter read
+    `response["choices"][0].get("message")`, which works for a dict and fails for an
+    object — so every real completion raised `ResponseShapeError`. The stub in
+    `tests/support/litellm_stub.py` returns a plain dict, so the entire shape-handling
+    surface was green against a shape litellm never produces, and the failure only
+    appeared against a live provider.
+
+    Constructed here from litellm's own classes rather than a hand-built imitation, so
+    the test fails if litellm changes the type it returns rather than if somebody
+    edits the imitation. No socket: this is the library's data model, not a call.
+    """
+    import litellm
+
+    response = litellm.types.utils.ModelResponse(
+        id="chatcmpl-real-shape",
+        model="gpt-4o-mini",
+        choices=[
+            litellm.types.utils.Choices(
+                index=0,
+                finish_reason="stop",
+                message=litellm.types.utils.Message(content="hello there", role="assistant"),
+            )
+        ],
+        usage=litellm.types.utils.Usage(prompt_tokens=12, completion_tokens=8, total_tokens=20),
+    )
+    result = await make_provider(response=response).complete(ask())
+
+    assert (result.content, result.tokens_in, result.tokens_out) == ("hello there", 12, 8)
+    assert result.finish == "stop"
+
+
 async def test_the_adapter_treats_absent_token_counts_as_zero() -> None:
     """A provider that reports content but omits one of the counters is giving a
     partial answer, and the honest reading of the missing half is zero — which

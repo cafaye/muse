@@ -74,6 +74,31 @@ PROBE_MODELS = {
 PER_DOLLAR = 1_000_000
 
 
+def _read(container: Any, field: str) -> Any:
+    """One field of a litellm response, whether it arrived as a mapping or an object.
+
+    **litellm returns `ModelResponse` and friends — pydantic models, not dicts.** The
+    adapter read `response["choices"][0].get("message")`, which works only for the dict
+    form, and the dict form is what `tests/support/litellm_stub.py` hands it. So the
+    whole of the adapter's shape handling was verified against a shape the real library
+    does not produce: against a live provider every completion raised
+    `ResponseShapeError`, which reads as an upstream fault and advances the fallback
+    chain. The observable symptom was "every candidate failed", on every request, on
+    every vendor.
+
+    One helper rather than an `isinstance` check in each of the four places, because
+    the shapes are not uniform: `ModelResponse` supports `response["choices"]`, so
+    subscripting alone works for the response and fails for `usage` and for the choice,
+    and a fix applied at one level would have looked right and been wrong at the next.
+
+    `None` for absent rather than a raise, because every absence here is a
+    `ResponseShapeError` naming a field and the caller decides what it means.
+    """
+    if isinstance(container, dict):
+        return container.get(field)
+    return getattr(container, field, None)
+
+
 @dataclass(frozen=True, slots=True)
 class Price:
     """Micro-dollars per 1k tokens, input and output.
@@ -460,22 +485,17 @@ class LiteLLMProvider:
         them may become an `IndexError` or a `TypeError` three frames down: an
         upstream problem has to be reported as one.
         """
-        try:
-            choices = response["choices"]
-        except (TypeError, KeyError) as error:
-            raise ResponseShapeError(
-                f"{self.name} returned a response with no choices: {error}"
-            ) from error
+        choices = _read(response, "choices")
         if not choices:
             raise ResponseShapeError(f"{self.name} returned a response with no choices")
         choice = choices[0]
-        message = choice.get("message") if isinstance(choice, dict) else None
-        if not message or "content" not in message:
+        message = _read(choice, "message")
+        if not message:
             raise ResponseShapeError(
                 f"{self.name} returned a choice with no message; a completion that "
                 "cannot be read is not metered, because its usage is unknown"
             )
-        content = message["content"]
+        content = _read(message, "content")
         if content is None:
             # A tool call has null content. v1 has no tool support, so reporting it
             # as empty text would hand the caller a silent wrong answer.
@@ -483,7 +503,7 @@ class LiteLLMProvider:
                 f"{self.name} returned a message with no content; tool calls are not "
                 "supported by this service"
             )
-        usage = response.get("usage") if isinstance(response, dict) else None
+        usage = _read(response, "usage")
         if not usage:
             raise ResponseShapeError(
                 f"{self.name} returned a response with no usage; a completion whose "
@@ -493,10 +513,10 @@ class LiteLLMProvider:
             provider=self.name,
             model=model,
             content=content,
-            tokens_in=int(usage.get("prompt_tokens", 0)),
-            tokens_out=int(usage.get("completion_tokens", 0)),
+            tokens_in=int(_read(usage, "prompt_tokens") or 0),
+            tokens_out=int(_read(usage, "completion_tokens") or 0),
             price=self.cost_per_1k_tokens(model),
-            finish_reason=choice.get("finish_reason"),
+            finish_reason=_read(choice, "finish_reason"),
         )
 
     def _translate(self, error: Exception, key: Secret) -> Exception:
