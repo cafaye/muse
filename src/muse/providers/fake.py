@@ -70,12 +70,16 @@ class FakeProvider:
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
         """The same completion as chunks, split on word boundaries.
 
-        Streamed from the *same* content `complete()` returns, so a test asserting the
-        two agree is asserting something true rather than something the double
-        arranged. Four chunks: a role-only opener, one per word, and a finish. No
-        usage chunk — the tokens are on `self` and the router meters from them, so a
-        double that invented a usage chunk would be teaching the router to read usage
-        from a source that only exists in a test.
+        Streamed from the *same* content and the *same* token counts `complete()`
+        returns, so a test asserting the two agree is asserting something true rather
+        than something the double arranged.
+
+        **It emits a usage chunk, because real providers do.** A stream's token counts
+        arrive only in a final usage chunk, so a double that omitted one would teach
+        every test above this layer that a streamed completion is metered with zero
+        tokens — which is exactly the bug this shape exists to prevent, and it would be
+        green here and wrong in production. `LiteLLMProvider.stream` always requests
+        usage for the same reason.
         """
         self.calls += 1
         self.requests.append(request)
@@ -83,8 +87,7 @@ class FakeProvider:
         for word in self.content.split(" "):
             yield StreamChunk(content=f"{word} ")
         yield StreamChunk(finish_reason="stop")
-        # A trailing `return` is implicit; the generator ends here. Spelled this way so
-        # the absence of a usage chunk is a visible decision rather than an oversight.
+        yield StreamChunk(tokens_in=self.tokens_in, tokens_out=self.tokens_out)
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         return self.price
@@ -159,6 +162,7 @@ class ScriptedProvider(FakeProvider):
         yield StreamChunk(role="assistant")
         yield StreamChunk(content=scripted.content)
         yield StreamChunk(finish_reason=scripted.finish_reason or "stop")
+        yield StreamChunk(tokens_in=scripted.tokens_in, tokens_out=scripted.tokens_out)
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         if self._prices:

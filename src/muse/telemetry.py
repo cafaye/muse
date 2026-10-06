@@ -53,6 +53,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from opentelemetry import context as otel_context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Tracer, TracerProvider
 from opentelemetry.trace import (
@@ -325,8 +326,39 @@ class Telemetry:
         *current* for the duration of the body — that is what makes the provider
         span a child of the route span and what lets `outbound_traceparent` see it
         from inside the adapter.
+
+        **Not usable across a `yield`.** `start_as_current_span` attaches a token to a
+        `ContextVar` and detaches it on exit, and the detach fails with `ValueError:
+        <Token ...> was created in a different Context` if the generator holding it is
+        resumed — or closed — in a different context. A streaming response body is
+        exactly that: Starlette iterates it from a different task than the one that
+        started it, so the `with` block would raise on the way out and turn a
+        successful stream into a 500. Use `detached_span` there; this stays the right
+        tool for a straight-line body.
         """
         with self.tracer.start_as_current_span(name) as started:
+            record(started, attributes)
+            yield started
+
+    @contextmanager
+    def detached_span(self, name: str, **attributes: object) -> Iterator[Span]:
+        """A span that is a child of the current one but is never made current.
+
+        For the places `span` cannot go: an async generator that yields to a caller
+        between chunks. The span still nests under whatever is current when it is
+        created — that is why the trace reads correctly — but it is not *attached*, so
+        resuming or closing the generator in another context cannot fail to detach.
+
+        The cost, stated because it is a real one: `outbound_traceparent` will not see
+        this span, because that reads the ambient context rather than taking an
+        argument. So a detached span cannot wrap the actual provider call. The
+        streaming path accepts that, and `Router.stream` compensates by opening its
+        stream through an ordinary attached span for the first chunk — the call that
+        carries `traceparent` — before switching to the detached span for the walk.
+        """
+        parent = otel_context.get_current()
+        started = self.tracer.start_span(name, context=parent)
+        with started:
             record(started, attributes)
             yield started
 

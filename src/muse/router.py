@@ -236,7 +236,11 @@ class _StreamAttempt:
         tokens_in: int | None = None
         tokens_out: int | None = None
         finish: str | None = None
-        with self._router._telemetry.span(
+        # `detached_span`, not `span`: this block spans a `yield`, and Starlette
+        # iterates a streaming body from a different task than the one that started it,
+        # so an attached span would fail to detach on the way out and turn a successful
+        # stream into a 500. See `Telemetry.span`'s docstring for the whole story.
+        with self._router._telemetry.detached_span(
             "muse.provider.call",
             muse_provider=self._candidate.provider,
             muse_model=self._model,
@@ -248,7 +252,20 @@ class _StreamAttempt:
                 # Outside the guard, deliberately. Opening a generator does not run it,
                 # so this is where the credential check, the vendor call, and the
                 # failure that usually kills a stream all actually happen.
-                first = await anext(stream)
+                #
+                # The `with` here is an ATTACHED span, and deliberately the only one on
+                # this path: it is what makes the outbound `traceparent` carry this
+                # call's span id, which `detached_span` cannot do because it never
+                # becomes current. It closes before the first yield, so it never spans a
+                # suspension and cannot hit the detach failure the detached span exists
+                # to avoid. The walk below continues on the detached span, which nests
+                # under this one.
+                with self._router._telemetry.span(
+                    "muse.provider.connect",
+                    muse_provider=self._candidate.provider,
+                    muse_model=self._model,
+                ):
+                    first = await anext(stream)
             except StopAsyncIteration as error:
                 # A provider that produced NOTHING: no chunk, no usage, nothing to
                 # meter and nothing to show a caller.
@@ -795,7 +812,10 @@ class Router:
         validated = tuple(Message(role=role, content=content) for role, content in messages)
 
         failures: list[CandidateFailure] = []
-        with self._telemetry.span("muse.route", muse_route=route.model) as span:
+        # Detached for the same reason as the provider span in `_StreamAttempt.chunks`:
+        # this block spans a yield to the caller, and a streaming body is resumed from a
+        # different task than it was started in.
+        with self._telemetry.detached_span("muse.route", muse_route=route.model) as span:
             for index, candidate in enumerate(route.candidates):
                 # The breaker is consulted *before* the provider is touched, so an open
                 # breaker is a refusal that never becomes a request.

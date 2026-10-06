@@ -487,11 +487,33 @@ async def test_a_stream_ending_without_usage_meters_zero_rather_than_guessing(
     Tokenising the content to invent one would be a guess dressed as a measurement, and
     a guess that gets metered is a guess that gets billed. Zero under-bills, which is
     the recoverable direction.
+
+    A local double rather than one of the shipped ones, because both of those now emit
+    a usage chunk on purpose — a double that omitted one would teach every test above
+    this layer that a streamed completion costs nothing.
     """
-    completion = await completion_of(router_with([FakeProvider(name="primary")], table))
+
+    class NoUsage:
+        name = "primary"
+
+        async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+            yield StreamChunk(role="assistant")
+            yield StreamChunk(content="hello")
+            yield StreamChunk(finish_reason="stop")
+
+        async def complete(self, request: CompletionRequest) -> Completion:
+            raise AssertionError("not reached")
+
+        async def health(self):  # pragma: no cover - never called here
+            raise AssertionError("not reached")
+
+        def cost_per_1k_tokens(self, model: str) -> Price:
+            return PRICE
+
+    completion = await completion_of(router_with([NoUsage()], table))
 
     assert completion.tokens_in == 0 and completion.tokens_out == 0
-    assert completion.content.strip(), "the content still reached the caller"
+    assert completion.content == "hello", "the content still reached the caller"
 
 
 async def test_an_empty_stream_from_the_only_candidate_fails_the_request(table) -> None:

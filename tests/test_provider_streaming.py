@@ -339,7 +339,13 @@ async def test_the_fake_provider_streams_the_content_it_would_have_returned() ->
     streamed = "".join(chunk.content for chunk in chunks if chunk.content is not None)
     assert streamed.strip() == completion.content
     assert chunks[0].role == "assistant", "the role-only opener is not optional"
-    assert chunks[-1].finish_reason == "stop"
+    # The finish chunk is second-to-last: the usage chunk is last, which is what a real
+    # provider sends and what the router's settlement reads.
+    assert chunks[-2].finish_reason == "stop"
+    assert chunks[-1].tokens_in == 7 and chunks[-1].tokens_out == 4, (
+        "a double that omitted usage would teach the router to meter streamed "
+        "completions as zero tokens"
+    )
 
 
 async def test_the_scripted_provider_streams_and_raises_the_same_script() -> None:
@@ -373,7 +379,8 @@ async def test_the_scripted_provider_streams_and_raises_the_same_script() -> Non
 
     chunks = [chunk async for chunk in provider.stream(ask())]
     assert [chunk.content for chunk in chunks if chunk.content] == ["one two"]
-    assert chunks[-1].finish_reason == "length", "the scripted finish crosses over"
+    assert chunks[-2].finish_reason == "length", "the scripted finish crosses over"
+    assert chunks[-1].tokens_out == 2, "and the scripted usage crosses over too"
 
 
 async def test_the_scripted_provider_refuses_a_stream_past_the_end_of_its_script() -> None:

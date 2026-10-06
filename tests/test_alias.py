@@ -372,18 +372,20 @@ async def test_the_problem_body_names_the_path_that_was_requested():
 
 
 async def test_an_unknown_field_is_refused_on_the_alias_too():
-    """`extra="forbid"` on the shared request model, so `stream: true` is a 422.
+    """`extra="forbid"` on the shared request model, so an unrecognised field is a 422.
 
-    Streaming is out of scope for this packet and a separate one. Silently ignoring
-    `stream` would hand a caller a non-streaming answer to a request that asked for a
-    stream, and it would do so silently — which is the failure mode
-    `RouteRequestBody`'s `extra="forbid"` exists to prevent. Named rather than left
-    implicit, because "we do not support that yet" is only honest if it is said.
+    **This test previously used `stream` as its example field, when `stream: true` was a
+    422 because streaming was unsupported.** 1.3.0 added streaming, so `stream` is now
+    a *supported* field (see `test_streaming.py`) and using it here would assert the
+    opposite of the contract. The closed-schema rule did not change — only the field
+    that demonstrates it — and a test that quietly kept its old example would have gone
+    green against a body shape that no longer exists.
     """
     async with asgi_client(app_for()) as client:
-        response = await client.post(ALIAS, json={**BODY, "stream": True}, headers=authed())
+        response = await client.post(ALIAS, json={**BODY, "nonsense": True}, headers=authed())
     assert response.status_code == 422
     assert response.json()["code"] == "validation_failed"
+    assert response.json()["errors"] == [{"field": "nonsense", "code": "extra_forbidden"}]
 
 
 async def test_temperature_is_the_same_decimal_string_on_the_alias():

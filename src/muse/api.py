@@ -29,16 +29,19 @@ returning it without its record loses the spend silently.
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from muse.auth import SCOPE, Principal, TokenVerifier, bearer_token, require_scope
@@ -53,6 +56,14 @@ from muse.errors import (
     SigningKeysUnavailable,
     Unauthenticated,
 )
+from muse.providers import Completion, StreamChunk
+from muse.router import RoutedCompletion, SettledStream, StreamResult
+
+#: This module's logger. Named and used rather than `logging.getLogger(__name__)`
+#: at each call site so a rule about what may be logged (no token, no prompt, no
+#: credential — AGENTS.md rules 16 and 22) has one place to be enforced and one line
+#: to grep. Everything that goes in is an error *class*, a route name and a trace id.
+logger = logging.getLogger("muse.api")
 
 #: core's error type URIs. Stable, machine-readable, and the last segment is the same
 #: slug as `code`.
@@ -132,6 +143,18 @@ class RouteRequestBody(BaseModel):
     # unavoidable exactly once. That is the same single-conversion seam
     # `cost_per_1k_tokens` converts money on, for the same reason.
     temperature: str | None = Field(default=None, pattern=TEMPERATURE_PATTERN)
+    #: Added in 1.3.0, and **strictly** a boolean: `"true"`, `1` and `"yes"` are 422s
+    #: naming the field rather than quietly streaming.
+    #:
+    #: `StrictBool` rather than `bool` because pydantic's lax mode coerces all three of
+    #: those to `True` and all of `"false"`, `0` and `"no"` to `False`. That is the
+    #: precise hazard this repository already refused once for `temperature` (1.1.1):
+    #: a caller who wrote the wrong thing gets a 200 and no indication of it. Here the
+    #: coercion is worse than a lost rounding — a caller sending `stream: "false"`
+    #: because their serialiser stringifies booleans would silently get a **stream**,
+    #: which their client may not be reading at all.
+    stream: StrictBool = Field(default=False)
+    stream_options: StreamOptions | None = Field(default=None)
 
     def sampling_temperature(self) -> float | None:
         """The caller's decimal string as the float LiteLLM wants, or None.
@@ -165,6 +188,47 @@ class RouteMessage(BaseModel):
 
     role: str
     content: str
+
+
+class StreamOptions(BaseModel):
+    """`stream_options`, as OpenAI defines it.
+
+    One field, and one boolean. `include_usage` is the only thing OpenAI's
+    `stream_options` carries today, and a closed schema that grew a second field
+    without a use for it would be a field every generated client has to be taught
+    about.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    include_usage: StrictBool = Field(
+        default=False,
+        description=(
+            "Include a final chunk carrying token usage. Off by default, because the "
+            "default is what a caller who did not ask for a bill wants."
+        ),
+    )
+
+
+class CompletionChunkBody(BaseModel):
+    """One `chat.completion.chunk`, exactly as OpenAI's SSE frames carry it.
+
+    Seven fields, all of which a generated OpenAI client reads and none of which muse
+    adds. `cost_micros`, `provider` and `route` are absent for the same reason they
+    are absent from `ChatCompletionBody`: this is the compatibility surface, and a
+    stream is not a licence to grow it. `/v1/route` renders the same completion with
+    them.
+    """
+
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: list[dict[str, Any]]
+    #: `None` rather than absent on every chunk but the last. OpenAI omits the key on
+    #: the chunks that have no usage, and a client that does `chunk.usage.total_tokens`
+    #: without checking would otherwise raise on every chunk but the last.
+    usage: dict[str, int] | None = None
 
 
 class Problem(BaseModel):
@@ -388,7 +452,328 @@ class ServedCompletion:
         }
 
 
-async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
+#: The SSE frame terminator OpenAI sends and every OpenAI client library stops on.
+#: Not a `data:` frame like the others: a client reading `data:` lines parses each as
+#: JSON, and `[DONE]` is not JSON — so the frame is deliberately unparseable and is how
+#: the client knows to stop.
+SSE_DONE = "data: [DONE]\n\n"
+
+
+def sse_frame(payload: dict[str, Any] | str) -> str:
+    """One SSE frame.
+
+    `data: `, the JSON, then a blank line — the three parts of an SSE event, per the
+    wire format. The trailing newline pair is the frame separator and omitting it makes
+    a client buffer the next event, so a stream that "works" but never flushes is the
+    failure this line prevents.
+
+    A bare string is passed through unquoted, which is how `SSE_DONE` is sent: the
+    terminator must not become `"[DONE]"` because a client compares the payload text,
+    not a parsed value.
+    """
+    body = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
+    return f"data: {body}\n\n"
+
+
+async def stream_completion(request: Request, body: RouteRequestBody) -> Response:
+    """Authenticate, validate, route, stream, meter — the streamed half of the shared path.
+
+    **This is the second reason `serve_completion` exists.** Before 1.3.0 a streamed
+    request would have needed its own auth check, its own validation and its own router
+    call, and the alias invariant — that a request reaches a provider on the terms
+    `/v1/route` would have refused — would have been true only of non-streaming
+    requests. A caller who discovered they could reach a provider by sending
+    `stream: true` would have found the weaker path, which is the exact shape of bug
+    this repository keeps guarding against.
+
+    The order is `serve_completion`'s order, unchanged and for its reasons:
+
+    1. **Authenticate, before the body is read and before any provider is contacted.**
+       `require_bearer` is called here, at the top, exactly as it is on the
+       non-streaming path — so an unauthenticated streaming request cannot make muse
+       spend money and cannot learn whether a model name routes at all.
+    2. **Validate**, before the headers are sent. This is why validation happens here
+       rather than inside the generator: a `StreamingResponse` has already sent its
+       `200` and `text/event-stream` by the time its body runs, so a 422 raised later
+       could only be an SSE frame, and a caller reading problem+json would get a
+       stream instead.
+    3. **Open the stream**, by asking the router. A failure here is still a normal
+       `problem+json` status — 404, 422, 503 — because no bytes have been sent yet.
+    4. **Meter, after the walk.** Inside the generator, because the tokens only exist
+       once the stream has been read to the end. The completion is what was metered and
+       the bytes are what was sent, so a metering failure cannot produce a response
+       that disagrees with the bill.
+
+    **A failure after the headers is an SSE error frame, in OpenAI's shape.** An SSE
+    response cannot carry a 503 once it has begun, so the only honest thing on the wire
+    is a `data:` frame carrying the error envelope's own fields, and then `[DONE]`, so
+    the client closes the stream the way it would on a success. It is the same
+    envelope object `problem()` builds, not a second error shape — a caller that can
+    parse one failure from this service can parse the other.
+    """
+    container = request.app.state.container
+    # The bearer check, exactly as `serve_completion` performs it and with the same
+    # vocabulary. **There is no `except AuthError` here on purpose.** `serve_completion`
+    # has already run this check and taken its failure branch before it decides to call
+    # this function, so an `AuthError` here would be unreachable — and an unreachable
+    # error arm is worse than no arm: it reads as "this function refuses an
+    # unauthenticated caller", which is exactly the guarantee a reader of this signature
+    # is looking for, while in fact the guarantee lives one frame up. Making the check
+    # unconditional and letting an unexpected `AuthError` propagate to the global
+    # handler keeps the code honest about where the boundary is.
+    await require_bearer(request)
+
+    served_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    trace = trace_id_for(request)
+    messages = [(message.role, message.content) for message in body.messages]
+    secrets = container.credentials_held()
+
+    try:
+        stream = container.router.stream(
+            body.model,
+            messages,
+            max_tokens=body.max_tokens,
+            temperature=body.sampling_temperature(),
+            secrets=secrets,
+        )
+        # Opened eagerly, and only to the first chunk, so that every failure the chain
+        # can still answer with a status is answered with one. Everything after this is
+        # past the point of no return, and goes on the wire as an error frame.
+        first = await anext(stream)
+    except RouteNotFound as error:
+        return problem(
+            request, "not_found", 404, f"no route is configured for model {error.model!r}"
+        )
+    except ValueError as error:
+        return problem(request, "validation_failed", 422, str(error))
+    except AllCandidatesFailed as error:
+        return problem(request, "unavailable", 503, _chain(error))
+
+    include_usage = bool(body.stream_options and body.stream_options.include_usage)
+
+    async def body_stream() -> AsyncIterator[str]:
+        async for result in _prepend(first, stream):
+            if result.settled is not None:
+                if result.settled.error is not None:
+                    # Recorded before the frame goes out, and for the same reason the
+                    # success path meters before it returns: this is a fact about work
+                    # that was done and not billed, and it must not depend on a client
+                    # reading the stream to the end.
+                    await _record_unmetered(result.settled, body, trace)
+                    # **A failure after the headers, in OpenAI's shape.** The response
+                    # is already `200 text/event-stream`, so a 503 can no longer be sent
+                    # and pretending otherwise would leave the client waiting. The error
+                    # goes on the wire as a `data:` frame carrying this service's own
+                    # envelope — `error`, `message`, `type`, `param`, `code` — followed
+                    # by `[DONE]` so the client ends the stream the way it ends a
+                    # success rather than hanging on a connection nobody will close.
+                    #
+                    # The same envelope object `problem()` builds, so a caller that can
+                    # parse one failure from this service can parse this one. A second,
+                    # stream-only error shape would be a client that has to special-case
+                    # muse exactly where it is least able to.
+                    #
+                    # `unavailable` rather than `internal`: the request reached a vendor
+                    # and the vendor is why it failed, which is the 503 `/v1/route` would
+                    # have returned had it not started.
+                    yield sse_frame(_error_frame(result.settled.error, trace))
+                    yield SSE_DONE
+                    return
+                await _meter_stream(container, result.settled, body, trace)
+                if include_usage and result.settled.completion is not None:
+                    yield sse_frame(
+                        _chunk_body(
+                            served_id,
+                            created,
+                            result.settled.completion.model,
+                            [],
+                            result.settled.completion,
+                        )
+                    )
+                yield SSE_DONE
+                return
+            yield sse_frame(
+                _chunk_body(served_id, created, body.model, [delta_of(result.chunk)], usage=None)
+            )
+
+    return StreamingResponse(
+        body_stream(),
+        media_type="text/event-stream",
+        headers={TRACE_HEADER: trace, "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _error_frame(error: BaseException, trace: str) -> dict[str, Any]:
+    """A settled-stream failure as an SSE frame, in OpenAI's error shape.
+
+    Seven keys, and they are OpenAI's: a client library raises from the `error` object
+    rather than inspecting the frame, so a frame without `error.message` and
+    `error.type` produces an unhelpful message on the client side however good the
+    text is.
+
+    `detail` is the scrubbed provider text the router produced — `muse.router._scrub`
+    runs on every failure that reaches a caller, so a vendor echoing the key it
+    rejected cannot reach the wire here either.
+    """
+    return {
+        "error": {
+            "message": str(error),
+            "type": "unavailable",
+            "param": None,
+            "code": "upstream_error",
+        },
+        "trace_id": trace,
+    }
+
+
+async def _prepend(
+    first: StreamResult, rest: AsyncIterator[StreamResult]
+) -> AsyncIterator[StreamResult]:
+    """The already-pulled first result, then the rest.
+
+    The first chunk was pulled before the response existed so that a status could still
+    be returned; it must not be lost for that. A one-line generator rather than a
+    `chain`, because the two are not the same thing when the first value may be the only
+    one and a caller abandons the iterator.
+    """
+    yield first
+    async for result in rest:
+        yield result
+
+
+async def _record_unmetered(settled: SettledStream, body: RouteRequestBody, trace: str) -> None:
+    """Log that a stream finished without producing a billable completion.
+
+    **Silently recording nothing is not an option.** The *decision* not to meter an
+    incomplete stream is defensible — a completion that did not happen is not a
+    completion to bill — but being unable to tell afterwards that it happened is not, and
+    an outbox row's absence is not queryable. One line turns "no row" into a fact an
+    operator can count.
+
+    Only the error's **class**, the route name and the trace id. Never the message,
+    which is provider text and may echo a credential; never the prompt or the partial
+    content, because a log line is retained and searchable by anyone with log access
+    (rules 16 and 22). `test_a_failed_stream_is_recorded_...` asserts the absences with
+    canaries rather than trusting the argument above.
+    """
+    logger.warning(
+        "muse.stream.not_metered",
+        extra={
+            "reason": "stream_did_not_complete",
+            "error_class": type(settled.error).__name__ if settled.error else None,
+            "model": body.model,
+            "trace_id": trace,
+        },
+    )
+
+
+async def _meter_stream(
+    container: Any,
+    settled: SettledStream,
+    body: RouteRequestBody,
+    trace: str,
+) -> None:
+    """Meter a settled stream, or record why it was not metered.
+
+    **A stream that did not complete is not metered**, and the error is logged rather
+    than raised: the bytes are already on the wire, so raising here would produce a
+    traceback on a response the caller has finished reading, and the completion being
+    absent is not a bug in muse — it is the outcome the router already reported to the
+    caller as an error frame. Silently recording nothing is what this refuses to do, so
+    the refusal is recorded: the event that a completion was dropped is emitted rather
+    than swallowed.
+
+    **A metering failure on a completed stream propagates**, exactly as it does on the
+    non-streaming path. The completion has been paid for; losing its record silently
+    loses the spend, and here the caller cannot even be told, because the bytes are
+    already gone. That asymmetry is the reason metering is not fire-and-forget here.
+    """
+    if settled.completion is None:
+        logger.warning(
+            "muse.stream.not_metered",
+            extra={
+                "reason": "stream_did_not_complete",
+                "error_class": type(settled.error).__name__ if settled.error else None,
+                "model": body.model,
+                "trace_id": trace,
+            },
+        )
+        return
+    completion = settled.completion
+    await container.meter.record(
+        RoutedCompletion(
+            completion=completion,
+            route=settled.route or body.model,
+            model=completion.model,
+            candidates_tried=1,
+            attempts=1,
+        )
+    )
+
+
+def delta_of(chunk: StreamChunk | None) -> dict[str, Any]:
+    """One chunk as OpenAI's `choices[0]`.
+
+    **`index` and `delta` are the wrapper, and omitting them is not a simplification.**
+    A client reads `chunk.choices[0].delta.content` to assemble the message and
+    `chunk.choices[0].index` to know *which* choice it is; sending the delta fields
+    directly in `choices[0]` produces frames that parse and assemble to an empty string
+    on a stock client. That is why the frames are asserted by exact equality against
+    OpenAI's shape rather than "the text is somewhere in there".
+
+    `index` is always 0, as it is in `RouteResponseBody.choices`: `n > 1` is not
+    supported by this version, and a client that saw a non-zero index would look for a
+    second choice.
+
+    `content` is omitted from the delta when the chunk carries none — the role-only
+    opener and the finish-only closer. A `"content": null` key is legal but redundant,
+    and omitting it is what OpenAI itself does.
+    """
+    if chunk is None:  # pragma: no cover - callers pass a chunk or settle instead
+        return {"index": 0, "delta": {}}
+    delta: dict[str, Any] = {}
+    if chunk.role is not None:
+        delta["role"] = chunk.role
+    if chunk.content is not None:
+        delta["content"] = chunk.content
+    if chunk.finish_reason is not None:
+        delta["finish_reason"] = chunk.finish_reason
+    return {"index": 0, "delta": delta}
+
+
+def _chunk_body(
+    completion_id: str,
+    created: int,
+    model: str,
+    choices: list[dict[str, Any]],
+    usage: Completion | None,
+) -> dict[str, Any]:
+    """One chunk's JSON, in OpenAI's shape.
+
+    Built by hand rather than through `CompletionChunkBody` because this is on the hot
+    path of every frame of every stream, and the pydantic round trip per token-chunk is
+    a cost with no benefit — the shape is fixed by this function and asserted by exact
+    equality in the suite. `object` is `chat.completion.chunk`, which is what tells a
+    client these frames are not whole completions.
+    """
+    body: dict[str, Any] = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": choices,
+    }
+    if usage is not None:
+        body["usage"] = {
+            "prompt_tokens": usage.tokens_in,
+            "completion_tokens": usage.tokens_out,
+            "total_tokens": usage.tokens_in + usage.tokens_out,
+        }
+    return body
+
+
+async def serve_completion(request: Request) -> ServedCompletion | JSONResponse | Response:
     """Authenticate, validate, route, meter — the whole path both endpoints share.
 
     **This is the alias's reason for existing.** `POST /v1/chat/completions` calls this
@@ -396,6 +781,13 @@ async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
     renders it in muse's. There is no second routing call, no second metering call, and
     no second auth check, because there is one function that does all three and both
     endpoints delegate to it.
+
+    Since 1.3.0 it also owns the streamed half: a body carrying `stream: true`
+    dispatches to `stream_completion`, which does the same four steps in the same order
+    and is reached from here rather than from either endpoint. The choice is made HERE,
+    after the body has been validated and before any provider is contacted, so both
+    endpoints agree on what a streamed request is by construction rather than by two
+    handlers each having remembered.
 
     The order is load-bearing and is `/v1/route`'s existing order, unchanged:
 
@@ -414,7 +806,9 @@ async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
 
     A `JSONResponse` return is a `problem+json` failure — every one of them produced by
     the same helpers `/v1/route` uses, so the failure modes are identical by
-    construction rather than by agreement between two pieces of code.
+    construction rather than by agreement between two pieces of code. A
+    `StreamingResponse` return is a `stream: true` request, and is the only third shape
+    this can return.
     """
     try:
         await require_bearer(request)
@@ -427,6 +821,14 @@ async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
         return problem(request, "validation_failed", 422, _describe(error), fields=_fields(error))
     except ValueError:
         return problem(request, "validation_failed", 422, "the request body is not valid JSON")
+
+    if body.stream:
+        # The authenticated principal has been established above and the body is
+        # validated; `stream_completion` re-runs the bearer check rather than being
+        # handed a principal, because a function that can be called with a principal
+        # and a function that cannot tell whether there was one are different
+        # functions, and the second is the one that cannot be called wrongly.
+        return await stream_completion(request, body)
 
     container = request.app.state.container
     try:
@@ -479,12 +881,26 @@ def build_router() -> APIRouter:
         description=(
             "Serves a completion from the first candidate that succeeds for the named "
             "route. The caller never learns which vendor answered. Every served "
-            "completion emits a `muse.tokens.consumed` event."
+            "completion emits a `muse.tokens.consumed` event.\n\n"
+            "**With `stream: true`** this returns `text/event-stream`: `data:` frames of "
+            "`chat.completion.chunk`, terminated by `data: [DONE]`. The fallback chain "
+            "runs until the first chunk and not after — once a caller holds bytes the "
+            "next candidate cannot be used without splicing two answers into one body. "
+            "A failure after the first chunk arrives as a `data:` frame carrying this "
+            "service's `problem+json` envelope, followed by `[DONE]`."
         ),
     )
     async def route_completion(request: Request) -> Response:
         served = await serve_completion(request)
-        if isinstance(served, JSONResponse):
+        if isinstance(served, JSONResponse | StreamingResponse):
+            # `problem+json` failure, or a stream already built by the shared path.
+            #
+            # **`StreamingResponse` is checked here as carefully as `JSONResponse`
+            # is.** `serve_completion` can now return either, so a handler that only
+            # knew about the old one would take a `StreamingResponse` as if it were a
+            # served completion and read `.id` off it — a 500 on every streamed request
+            # from this endpoint, and the kind of failure that looks like a broken
+            # router rather than a missed isinstance.
             return served
 
         response = RouteResponseBody(
@@ -513,14 +929,20 @@ def build_router() -> APIRouter:
             "OpenAI's path and response shape, served by the same routing, "
             "authentication, authorization, metering and outbox path as `POST "
             "/v1/route`. It is an alias, not a second implementation: a stock OpenAI "
-            "client reaches this service without knowing muse exists. **Streaming is "
-            "not supported** — a request carrying `stream` is a 422 naming the field, "
-            "not a silently non-streaming answer."
+            "client reaches this service without knowing muse exists.\n\n"
+            "**`stream: true` is supported** and behaves exactly as it does on "
+            "`/v1/route`, because both go through one function. `stream_options."
+            "{include_usage: true}` adds a final chunk carrying token usage; without it "
+            "the usage is metered but not returned, which is what OpenAI's own default "
+            "of `false` means."
         ),
     )
     async def create_chat_completion(request: Request) -> Response:
         served = await serve_completion(request)
-        if isinstance(served, JSONResponse):
+        if isinstance(served, JSONResponse | StreamingResponse):
+            # Both shapes the shared path can return without a completion to render —
+            # see `route_completion` for why the second one is checked rather than
+            # assumed away.
             return served
 
         # OpenAI's six fields and nothing else. `provider`, `route` and `cost_micros`
