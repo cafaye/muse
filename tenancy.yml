@@ -1,0 +1,94 @@
+# tenancy.yml — what muse declares about its own account boundary.
+#
+# Checked by cafaye/core's contract harness:
+#
+#     /Users/kaka/Code/any/wt/core/harness/bin/tenancy-check .
+#
+# THE HONEST ZERO. muse stores no customer rows and scopes nothing by account.
+# Its two tables are the platform's own: `outbox_events` is keyed by the
+# envelope `id` (core's outbox contract, `subject: platform` until D9) and
+# `vault_secrets` is keyed by `provider` — one platform credential per vendor,
+# not a customer's. Neither has an `account_id` column, and no migration adds
+# one; `tests/test_tenant_scoping.py` holds the negative (no query, no
+# migration, no function parameter carries a tenant column).
+#
+# `account_id` DOES appear in this tree — in `src/muse/auth.py` and
+# `src/muse/metering.py` — as a VERIFIED TOKEN CLAIM, not a row scope. muse
+# bills per tenant, so `require_bearer` refuses a token with no usable
+# `account_id` (`MissingAccount`, 401) and the account travels on the metered
+# event's payload. That is an authorization and metering fact about the
+# CALLER, not a discriminator on any row muse reads or writes: no SQL
+# statement in `src/` carries the key, which is what the entry-point scanner
+# measures — and what the suite's negative tests assert (§1.5 of the report).
+#
+# A zero nobody can be caught leaving is not a zero, it is an absence nobody
+# looked for — so both halves are declared and both are CHECKED: an
+# account-scoped statement appearing in `src` is `tenancy.honest-zero`, a
+# FAILURE, and a policy appearing in `migrations` is `tenancy.rls-undeclared`,
+# a FAILURE.
+#
+# WHAT THE SCANNER FINDS IN `src`, AND WHY NONE OF IT IS DECLARABLE. The
+# entry-point scanner reads `src` and finds the key on fifteen lines:
+#
+#   src/muse/auth.py:6,78,118,160,163,232,289,295,300,303
+#   src/muse/errors.py:269,271
+#   src/muse/metering.py:21,31
+#   src/muse/schemas/telemetry/traces.schema.json:203
+#
+# Not one of them is an account-scoped statement, and the scanner says so itself
+# (`tenancy.enumeration-partial`: "could not classify 15 account-scoped site(s)
+# … no statement within 4 lines"). They are three kinds of token-claim mention,
+# and the format's `entryPoints` vocabulary — select/update/delete/call against
+# a subject, scoped at a line, proven by a three-way denial — has no way to
+# declare any of them, because none of them reaches a row:
+#
+#   * claim verification (`auth.py`): `REQUIRED_CLAIMS`, the `Principal`
+#     field, `_account_of`, the claim loop. The account is READ OUT OF a
+#     verified token and carried on the caller; it is never a predicate.
+#   * docstrings describing that verification (`auth.py`, `errors.py`,
+#     `metering.py`).
+#   * core's own telemetry schema, vendored byte-identically
+#     (`traces.schema.json`), where `account_id` is a span-attribute
+#     description — and rule 16 forbids putting it on a span anyway.
+#
+# So `tenancy.honest-zero` reports this declaration as a failure: the checker
+# counts every key-carrying line in the declared sources as evidence against a
+# zero, "whether or not this checker could classify the statement it appears
+# in". That is a false red for this service — the zero above is the measured
+# truth (no account-scoped row, statement, migration or parameter exists in
+# this tree, and `tests/test_tenant_scoping.py` proves the negative on all
+# four axes) — and it is a limitation of the text scanner, which cannot tell a
+# token claim from a row scope. Narrowing `scope.sources` to make the scanner
+# miss these lines would hide the only files that mention the key, which is the
+# omission wearing a declaration; the declaration keeps the whole tree and
+# says here what the scanner will find. Full measurement, the checker's output
+# and the recommended core fix are in REPORT-muse-tenancy-01.md.
+version: 1
+service: muse
+
+accountScoped: false
+
+scope:
+  # The fleet's vocabulary and muse's token claim, declared so the scanner
+  # reads for it by name. A key that finds no account-scoped STATEMENT earns
+  # `tenancy.scope-key-unused` — the honest "I found nothing", which is the
+  # difference between an honest zero and an unexamined one.
+  key: account_id
+  sources:
+    - src
+
+# Empty, because it is empty. Legal only because `accountScoped` is false; a
+# service that says `true` and lists nothing is the same omission wearing a
+# declaration, and the schema refuses that one.
+entryPoints: []
+
+# The database half, and the same argument. muse's migrations create no
+# row-level-security DDL — no `create policy`, no `alter table … row level
+# security` — so `databaseEnforced: false` with an empty list is the truth
+# rather than an omission, and it is checked the same way: a policy anywhere
+# in `migrations` is `tenancy.rls-undeclared`, a FAILURE.
+rls:
+  databaseEnforced: false
+  sources:
+    - migrations
+  tables: []
