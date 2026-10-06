@@ -217,7 +217,24 @@ gate:
       # plus the guards that had to learn about two new paths: six in
       # `test_openapi.py` for the documents and two enumeration rows in
       # `test_tenant_scoping.py`.
-      minimum: 1037
+      #
+      # RAISED 1037 -> 1057 by muse-05, the streaming packet, which added 20 tests and
+      # no core-gated ones — 20 in `tests/test_provider_streaming.py`, all of them
+      # hermetic because the provider seam is a stand-in litellm module rather than a
+      # checkout. So the `+ 4` arithmetic above is unchanged in kind, and it is still
+      # exact on both sides rather than carrying a compensating failure. Measured, not
+      # counted, on the same machine that measured the pair above:
+      #
+      #   MUSE_CORE_SCHEMAS=<core>/schemas uv run pytest   ->  1057 passed, exit 0
+      #   uv run pytest (no checkout)                      ->  1053 passed, 4 skipped
+      #
+      # 1053 + 4 = 1057. The raise is required by the clause above rather than chosen:
+      # a 20-test packet that left this floor at 1037 would have cleared a run 20 tests
+      # short, and since the four cross-repo guards are worth four of them, deleting one
+      # would have stayed green — which is the exact thing the muse-08 paragraph above
+      # records the clause existing to prevent. The margin this floor carries is now
+      # exactly zero, on purpose, and the next packet that adds a test moves it again.
+      minimum: 1057
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

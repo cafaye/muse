@@ -1,8 +1,9 @@
 """Providers: the protocol muse routes through, and the three implementations.
 
-`Provider` is a structural protocol with exactly three operations:
+`Provider` is a structural protocol with exactly four operations:
 
 - `complete(request)` — one chat completion.
+- `stream(request)` — the same completion, as chunks.
 - `health()` — can this provider serve a request right now.
 - `cost_per_1k_tokens(model)` — what a thousand tokens of this model cost.
 
@@ -23,6 +24,7 @@ litellm's per-token dollars once, on the way in.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -31,6 +33,7 @@ from muse.errors import (
     CredentialUnavailable,
     PriceUnavailable,
     ProviderAuthError,
+    ProviderError,
     ProviderIndeterminate,
     ProviderInvalidRequest,
     ProviderRateLimited,
@@ -213,6 +216,35 @@ class Completion:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamChunk:
+    """One chunk of a streamed completion, vendor-neutral.
+
+    Every field is optional because litellm's chunks are heterogeneous, and a
+    normalised chunk that had to invent a value for an absent one would be a lie
+    about tokens. Three of the shapes actually occur:
+
+    - a **content** chunk: `content` set, `role` usually not.
+    - the **first** chunk: `role` set, `content` `None`. Not an empty string and not
+      skipped — a stock OpenAI client reads the role off it, and dropping it changes
+      what the caller assembles.
+    - the **usage** chunk: both contents `None`, `tokens_in`/`tokens_out` set. It
+      arrives only because muse asks for it (see `LiteLLMProvider.stream`), and it
+      carries `choices == []`, which is why `finish_reason` is `None` rather than a
+      default.
+
+    `content is None` and `content == ""` are different and are not merged: the first
+    means "this chunk carries no text", the second means "the model emitted nothing
+    this time", and only the second is a character that goes into the caller's answer.
+    """
+
+    content: str | None = None
+    role: str | None = None
+    finish_reason: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Health:
     """Whether a provider can serve a request right now."""
 
@@ -253,6 +285,20 @@ class Provider(Protocol):
 
     async def complete(self, request: CompletionRequest) -> Completion:
         """One chat completion, or raise a `ProviderError` subclass."""
+        ...
+
+    def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """The same completion, as chunks.
+
+        An **async generator**, not a coroutine returning one: litellm's
+        `acompletion(stream=True)` answers with an object whose *iteration* can also
+        fail, so the exception mapping has to span the whole walk rather than only the
+        call that obtained the stream.
+
+        Every chunk a vendor sends is yielded, including the role-only and usage-only
+        ones. Filtering them here would be a guess about which chunks matter, and the
+        two that carry nothing visible are the two a stock OpenAI client needs.
+        """
         ...
 
     async def health(self) -> Health:
@@ -461,6 +507,87 @@ class LiteLLMProvider:
             raise self._translate(error, key) from error
         return self._to_completion(request.model, response)
 
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """The same completion as chunks, or a `ProviderError` subclass.
+
+        **The exception mapping spans the whole walk, not just the call.** This is
+        the difference between an async generator and a coroutine, and it is the thing
+        that is easy to get wrong: `await acompletion(stream=True)` returns a stream
+        object, and the vendor's real failure usually arrives *while iterating it* —
+        a socket reset three chunks in. Wrapping only the `await` would let that
+        escape as a raw litellm exception, so a mid-stream 500 would be raised as an
+        unclassified transport error instead of the `ProviderUnavailable` the router
+        would then advance past, and the credential scrub in `_translate` would never
+        run over text the vendor wrote. Hence the `try` around the whole `async for`.
+
+        **`stream_options={"include_usage": True}` is always sent, whatever the caller
+        asked for.** A stream's token counts only ever arrive in a final usage chunk,
+        and muse meters every completion it serves — so a stream without usage would
+        be one whose spend is never billed. The *caller's* `include_usage` decides
+        whether usage goes on the wire; whether muse asks the vendor for it is not the
+        caller's decision, because it is the difference between a metered completion
+        and an unrecorded bill.
+        """
+        key = await self._key()
+        if not key:
+            # Same check and same reason as `complete`: no request, no spend, no
+            # rate-limit counter spent on a credential that was never going to work.
+            raise CredentialUnavailable(f"no credential is configured for provider {self.name!r}")
+        kwargs = self._stream_kwargs(request, key)
+        try:
+            stream = await self.litellm.acompletion(**kwargs)
+        except Exception as error:  # a third-party exception taxonomy, mapped below
+            raise self._translate(error, key) from error
+        # The whole walk, deliberately: see this method's docstring. `raise ... from
+        # error` rather than a bare re-raise so a mid-stream failure is the same class
+        # as a mid-request one, and so the credential is scrubbed out of the message
+        # a vendor attached to it.
+        try:
+            async for chunk in stream:
+                yield self._to_chunk(chunk)
+        except ProviderError:
+            # **A muse error re-raised untouched.** `_to_chunk` raises
+            # `ResponseShapeError`, which IS a `ProviderError` subclass, so the
+            # guard around this walk would otherwise catch muse's own refusal and
+            # re-translate it — turning "the vendor sent a shape I cannot read" into
+            # the default `ProviderUnavailable`, which the router *retries*. So a
+            # shape refusal mid-stream would be retried as though it were a transport
+            # fault, on a stream that has already put bytes in the caller's hands.
+            # Translating a third-party taxonomy and re-raising our own are two
+            # different jobs, and the second one is not this handler's.
+            raise
+        except Exception as error:
+            raise self._translate(error, key) from error
+
+    def _stream_kwargs(self, request: CompletionRequest, key: Secret) -> dict[str, Any]:
+        """The `acompletion` keyword arguments for a streamed call.
+
+        Split out of `stream()` rather than duplicated, because the two methods must
+        send the *same* request: a stream that dropped `temperature`, or sent it as a
+        `float` where `complete()` sends a `float`, or omitted `max_tokens`, would
+        answer a different question from the non-streaming path for the same body.
+
+        `stream` and `stream_options` are the only additions, and both are set here
+        rather than by the caller so no path can ask for a stream without asking for
+        usage.
+        """
+        kwargs: dict[str, Any] = {
+            "model": self.qualified_model(request.model),
+            "messages": [message.as_wire() for message in request.messages],
+            "api_key": key.reveal(),
+        }
+        headers = self._outbound_headers()
+        if headers:
+            kwargs["extra_headers"] = headers
+        if request.max_tokens is not None:
+            kwargs["max_tokens"] = request.max_tokens
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+        kwargs["stream"] = True
+        # See `stream()`: muse always asks, whatever the caller asked for.
+        kwargs["stream_options"] = {"include_usage": True}
+        return kwargs
+
     def _outbound_headers(self) -> dict[str, str]:
         """The tracing headers to send with this call.
 
@@ -517,6 +644,56 @@ class LiteLLMProvider:
             tokens_out=int(_read(usage, "completion_tokens") or 0),
             price=self.cost_per_1k_tokens(model),
             finish_reason=_read(choice, "finish_reason"),
+        )
+
+    def _to_chunk(self, chunk: Any) -> StreamChunk:
+        """Normalise one litellm streaming chunk, or raise `ResponseShapeError`.
+
+        Written against `litellm.types.utils.ModelResponseStream` — a pydantic model
+        whose `choices[0]` is a `StreamingChoices` and whose `delta` is a `Delta`. The
+        `_read` helper's docstring says why that matters here and not only for
+        `ModelResponse`: a dict-shaped imitation of a chunk is a fixture that can
+        agree with the adapter while the library disagrees with both.
+
+        Three facts about the real type drive the shape of this function, and all
+        three are invisible in the dict form:
+
+        - **`usage` is not a declared field.** `ModelResponseStream` is built with
+          `extra="allow"`, so the usage chunk carries its `Usage` as an *extra*
+          attribute rather than as one of `model_fields`. `_read` finds it by name and
+          a hand-written `chunk.usage` guard against the declared fields would have
+          missed it — which is the difference between metering a stream and billing
+          nobody for it.
+        - **`choices` can be empty.** The usage chunk has `choices == []` by
+          definition, so indexing `[0]` is a crash on the one chunk that carries the
+          numbers. Empty is not an error here; it is the usage chunk.
+        - **`finish_reason` is optional.** It is absent on every chunk but the last, and
+          `None` there is "still going", not "finished for no reason".
+
+        So: an absent `choices` with usage present is the usage chunk; an absent
+        `choices` with no usage is a shape muse cannot meter and refuses, because a
+        chunk with neither text nor numbers is not a completion.
+        """
+        usage = _read(chunk, "usage")
+        choices = _read(chunk, "choices")
+        if not choices:
+            if usage is None:
+                raise ResponseShapeError(
+                    f"{self.name} returned a stream chunk with neither content nor usage"
+                )
+            return StreamChunk(
+                tokens_in=int(_read(usage, "prompt_tokens") or 0),
+                tokens_out=int(_read(usage, "completion_tokens") or 0),
+            )
+        choice = choices[0]
+        delta = _read(choice, "delta")
+        if delta is None:
+            raise ResponseShapeError(f"{self.name} returned a stream chunk with no delta")
+        finish = _read(choice, "finish_reason")
+        return StreamChunk(
+            content=_read(delta, "content"),
+            role=_read(delta, "role"),
+            finish_reason=finish if isinstance(finish, str) else None,
         )
 
     def _translate(self, error: Exception, key: Secret) -> Exception:

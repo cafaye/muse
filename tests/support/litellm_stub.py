@@ -12,6 +12,7 @@ test rather than a mock of it.
 from __future__ import annotations
 
 import types
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 #: Every exception class name the adapter's mapping consults. A stub that omits one
@@ -63,6 +64,7 @@ def make_stub(
     error_message: str = "",
     model_info: dict[str, dict[str, Any]] | None = None,
     status_code: int | None = None,
+    chunks: Sequence[Any] = (),
 ) -> types.ModuleType:
     """Build the stub.
 
@@ -82,6 +84,15 @@ def make_stub(
     `model_info` overrides the price table, and a model missing from it raises
     `KeyError` — what the real `get_model_info` does, and what `PriceUnavailable`
     exists to translate.
+
+    **`chunks` is the streaming surface, and it is the one place the stub can inject a
+    defect the real library actually produces.** When it is non-empty, `acompletion`
+    returns an async iterator that yields its entries in order. An entry of the string
+    form `"boom:<ExceptionName>"` **raises that exception mid-walk, at exactly that
+    position** — which is what a vendor's real fault looks like: a stream that was
+    healthy for three chunks and then reset. A stub that could only fail at the call
+    could not express that, and an adapter that only wrapped the `await` would pass
+    every such test.
     """
     module = types.ModuleType("litellm_stub")
     captured: dict[str, Any] = {}
@@ -93,6 +104,16 @@ def make_stub(
     for name in LITELLM_ERROR_NAMES:
         module.__dict__[name] = type(name, (Exception,), {})
 
+    async def _stream() -> AsyncIterator[Any]:
+        for entry in chunks:
+            if isinstance(entry, str) and entry.startswith("boom:"):
+                name = entry.split(":", 1)[1]
+                error = module.__dict__[name](error_message)
+                if status_code is not None:
+                    error.status_code = status_code
+                raise error
+            yield entry
+
     async def acompletion(**kwargs: Any) -> Any:
         module.acompletion_calls += 1  # type: ignore[attr-defined]
         captured.update(kwargs)
@@ -101,6 +122,8 @@ def make_stub(
             if status_code is not None:
                 error.status_code = status_code
             raise error
+        if kwargs.get("stream") or chunks:
+            return _stream()
         return RESPONSE if response is DEFAULT else response
 
     def get_model_info(model: str) -> dict[str, Any]:

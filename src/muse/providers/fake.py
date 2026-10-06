@@ -13,7 +13,7 @@ rather than in a counter.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 from muse.errors import PriceUnavailable
 from muse.providers import (
@@ -22,6 +22,7 @@ from muse.providers import (
     Health,
     Message,
     Price,
+    StreamChunk,
 )
 
 
@@ -65,6 +66,25 @@ class FakeProvider:
 
     async def health(self) -> Health:
         return Health(healthy=self.healthy, detail="fake provider")
+
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """The same completion as chunks, split on word boundaries.
+
+        Streamed from the *same* content `complete()` returns, so a test asserting the
+        two agree is asserting something true rather than something the double
+        arranged. Four chunks: a role-only opener, one per word, and a finish. No
+        usage chunk — the tokens are on `self` and the router meters from them, so a
+        double that invented a usage chunk would be teaching the router to read usage
+        from a source that only exists in a test.
+        """
+        self.calls += 1
+        self.requests.append(request)
+        yield StreamChunk(role="assistant")
+        for word in self.content.split(" "):
+            yield StreamChunk(content=f"{word} ")
+        yield StreamChunk(finish_reason="stop")
+        # A trailing `return` is implicit; the generator ends here. Spelled this way so
+        # the absence of a usage chunk is a visible decision rather than an oversight.
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         return self.price
@@ -117,6 +137,28 @@ class ScriptedProvider(FakeProvider):
             price=self._prices.get(request.model, scripted.price),
             finish_reason=scripted.finish_reason,
         )
+
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """Stream the next scripted completion, or raise the next scripted error.
+
+        The same script as `complete()`, consumed the same way, so a test that writes
+        one script for a route exercises both paths with it. An error is raised
+        *before* the first chunk, which is the only point a fallback chain may still
+        advance — see `Router.stream` for why a later failure cannot.
+        """
+        self.calls += 1
+        self.requests.append(request)
+        if self._errors:
+            raise self._errors.pop(0)
+        if not self._completions:
+            raise AssertionError(
+                f"provider {self.name!r} has no scripted completion left; the router "
+                "retried past the end of the script"
+            )
+        scripted = self._completions.pop(0)
+        yield StreamChunk(role="assistant")
+        yield StreamChunk(content=scripted.content)
+        yield StreamChunk(finish_reason=scripted.finish_reason or "stop")
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         if self._prices:

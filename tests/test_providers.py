@@ -100,14 +100,17 @@ def make_provider(
 # --- the protocol ----------------------------------------------------------
 
 
-def test_a_provider_only_needs_the_three_protocol_methods() -> None:
-    """Structural, not nominal: a provider is anything with the three operations,
+def test_a_provider_only_needs_the_four_protocol_methods() -> None:
+    """Structural, not nominal: a provider is anything with the four operations,
     so a future adapter does not inherit from anything muse owns."""
 
     class Minimal:
         name = "minimal"
 
         async def complete(self, request):  # pragma: no cover - never called
+            raise NotImplementedError
+
+        async def stream(self, request):  # pragma: no cover - never called
             raise NotImplementedError
 
         async def health(self):  # pragma: no cover - never called
