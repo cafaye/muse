@@ -345,6 +345,27 @@ three endpoints.
 
 A 503 is the one worth retrying: it means muse is up and something it depends on is not.
 
+### If every completion is a 503
+
+Check the issuer **first**, because a 503 is indistinguishable from a routing fault at
+the response and the routing is the thing you will go looking at. In
+`docker-compose.yml` the line is commented out:
+
+```yaml
+      # MUSE_IDENTITY_ISSUER: http://identity:8080
+```
+
+Unset, muse uses the production default `https://identity.cafaye.com`, which is not
+reachable from a laptop — so the key-set fetch fails and the answer is a 503 naming
+nothing helpful. Commented out rather than defaulted to the compose network on purpose:
+an issuer that does not exist would fail every request at the fetch, and a *wrong*
+issuer that does exist is a worse failure. Set it when your identity is running.
+
+Then the credential. `503` also means every candidate provider failed, and the `detail`
+field names which and why — `CredentialUnavailable` is a deploy mistake (no key in the
+vault, §6) and `ProviderAuthError` is a rejected key. Read `detail` before touching
+anything else; it is written for this.
+
 ## 6. Before the first request: a provider credential
 
 A route needs a key for the vendor that serves it, and muse reads it from the encrypted

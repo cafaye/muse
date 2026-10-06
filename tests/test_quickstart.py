@@ -113,7 +113,9 @@ def test_the_quickstart_is_where_the_readme_says_it_is() -> None:
     links = re.findall(r"\]\(([^)]*quickstart[^)]*)\)", readme)
     assert links, "the README links to no quickstart"
     for link in links:
-        assert (REPO_ROOT / link).resolve().is_file(), f"the README links at {link}, which is not a file"
+        assert (REPO_ROOT / link).resolve().is_file(), (
+            f"the README links at {link}, which is not a file"
+        )
 
 
 # --- every path it names is served -------------------------------------------
@@ -128,7 +130,9 @@ def test_every_path_the_quickstart_calls_is_in_the_committed_contract() -> None:
     """
     documented = document_paths()
     assert documented, "the quickstart calls no path at all, which cannot be right"
-    assert documented <= set(spec()["paths"]), f"undocumented paths: {documented - set(spec()['paths'])}"
+    assert documented <= set(spec()["paths"]), (
+        f"undocumented paths: {documented - set(spec()['paths'])}"
+    )
 
 
 def test_the_quickstart_calls_both_completion_paths_and_the_model_list() -> None:
@@ -179,7 +183,9 @@ def test_the_quickstart_says_a_vendor_model_id_is_not_askable() -> None:
     """
     body = text()
     assert "gpt-4o-mini" in body
-    assert re.search(r"`gpt-4o-mini` is a 404", body), "the document must refuse the vendor id explicitly"
+    assert re.search(r"`gpt-4o-mini` is a 404", body), (
+        "the document must refuse the vendor id explicitly"
+    )
 
 
 # --- the constants it names are the code's -----------------------------------
@@ -260,4 +266,6 @@ def test_the_quickstart_carries_no_credential_shaped_literal() -> None:
     """
     body = text()
     assert not re.search(r"sk-[A-Za-z0-9_-]{8,}", body)
-    assert not re.search(r"eyJ[A-Za-z0-9_-]{10,}", body), "the document contains something JWT-shaped"
+    assert not re.search(r"eyJ[A-Za-z0-9_-]{10,}", body), (
+        "the document contains something JWT-shaped"
+    )
