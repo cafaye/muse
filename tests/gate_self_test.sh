@@ -438,10 +438,25 @@ edit "$b/gate.yml" "match: '^=+ ([0-9]+) passed'" "match: '^=+ [0-9]+ passed'"
 expect_red 'a proof with a floor and no capture group to read the floor from' \
   "$b" 'gate.proof-invalid' --prove
 
+# THE PROMISED FLOOR IS DERIVED, and this is the second time this file's stub count
+# has been a floor the next packet had to re-baseline by hand. The breakage used to
+# raise `suite`'s `minimum: 890` to a literal `999` and expected `gate.floor` — which
+# only fires while the real `core-parity` floor is BELOW 999. It was 973 when this was
+# written and it crossed 999 before anybody ran the self-test again, at which point
+# the stub printed the derived 1022, the declaration promised 999, 1022 cleared 999,
+# and the breakage went green: `1 of 20 cases failed`, on a tree where nothing had
+# changed but the number this packet was supposed to raise.
+#
+# So the promised floor is now computed from the real one — one above it, which is the
+# smallest value a `gate.floor` failure can be about — and `edit` targets the
+# `core-parity` block's own line rather than the first `minimum:` in the file. Which
+# is the same lesson as `parity_floor` above, applied to the breakage instead of the
+# control: a literal in this file is a claim about a number that moves every packet.
 b="$(fresh_copy floor)"
 install_stub "$b" "$(parity_summary)"
-edit "$b/gate.yml" 'minimum: 890' 'minimum: 999'
-expect_red "a gate that proves $(parity_floor) tests where the declaration promised 999" \
+promised="$(( $(parity_floor) + 1 ))"
+edit "$b/gate.yml" "minimum: $(parity_floor)" "minimum: $promised"
+expect_red "a gate that proves $(parity_floor) tests where the declaration promised $promised" \
   "$b" 'gate.floor' --prove
 
 # A gate that ran, printed its proof, and failed. `gate.proof-missing` on its
