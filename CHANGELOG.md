@@ -5,6 +5,100 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-04 — the vendored traces schema had drifted, and a span was paying for it
+
+`master` was red, and had been for several packets, on exactly one test:
+
+```
+tests/test_error_vocabulary.py::test_the_vendored_schema_is_byte_identical_to_core
+```
+
+It only runs when `MUSE_CORE_SCHEMAS` points at a core checkout, so every run that
+skipped the core tier read green. Four resource attributes core added after
+`8ffe575` were never copied across — `service.namespace`, `telemetry.sdk.name`,
+`telemetry.sdk.language`, `telemetry.sdk.version` — leaving muse's copy 203 lines
+against core's 207.
+
+**The drift was not four missing optional keys.** All four sit inside
+`$defs.resource`, which is closed with `additionalProperties: false`, and one of
+them is `service.namespace` — the attribute `muse.telemetry._resource` sets **by
+hand**, and which muse is the only publisher in the fleet to set at all. So muse
+was emitting a resource attribute that muse's own vendored schema forbade, and
+the file that forbade it had been wrong long enough that the wrongness was
+load-bearing.
+
+**Which of the three fates, measured rather than assumed.** The brief asked
+whether such a span is dropped, rejected, or silently unvalidated. It is
+**unvalidated**, and the evidence is that the stale schema *would* have rejected
+it, while nothing ever asked it to:
+
+```
+jsonschema.exceptions.ValidationError: Additional properties are not allowed
+('service.namespace', 'telemetry.sdk.language', 'telemetry.sdk.name',
+'telemetry.sdk.version' were unexpected)
+```
+
+— the rejection, produced on demand against the pre-fix file. The span was not
+being refused, because three separate omissions meant no component ever put a
+resource in front of the schema at all:
+
+- `_core_document` (`tests/test_trace_propagation.py`) projects a span onto a
+  four-key document with **no `resource` key**, so the half of core's schema
+  under `$.resource` was unreachable;
+- `tests/support/tracing.py::payloads` reads `name`, `kind`, `status` and
+  `attributes` and never reads `span.resource`, so no test could have asked;
+- `recording_telemetry` builds `TracerProvider()` with no resource, so the spans
+  under test carried the SDK default rather than the one `_resource` builds.
+
+There is also **no runtime validation at all**: `jsonschema` is a dev-group
+dependency and appears nowhere in `src/muse/`. The vendored schema's only
+production reader is `muse.errortype`, which takes the `error.type` enum out of
+it at import. So a span carrying `service.namespace` reached nobody that could
+have complained — a closed list that nothing reads is indistinguishable from a
+correct one, which is the honest shape of this defect.
+
+**The fix is core's four lines, not muse's code.** `_resource` was right and the
+copy was behind, so the change is one file copied verbatim, descriptions
+included — the descriptions are the reasoning, and paraphrasing them is how a
+fleet loses the argument for why a field exists. sha256
+`101132a6792318670c352a8f61a3231387748eb53ec86d0a23dbac55a71ed576`, which is
+also the sha `caf/caf.lock` already records for the same path, so core's
+current file and the bytes two other fleet consumers hold are one document.
+
+The new test
+`test_the_resource_muse_itself_builds_validates_against_the_schema` reads the
+resource off the provider muse builds rather than writing one out — a hand-built
+dict would be the test's own idea of a resource and would keep passing if
+`_resource` changed — asserts the floor (`service.namespace == "cafaye"`) before
+the validation so it cannot pass vacuously, and carries a control asserting the
+schema *refuses* a namespace it should, because a validator that quietly
+returned success would make the first half meaningless. It was watched failing
+against the stale file, naming all four attributes, and passing after.
+
+The drift guard is untouched. It is the only thing that noticed.
+
+| | before | after |
+|---|---|---|
+| `MUSE_CORE_SCHEMAS=<core>/schemas pytest -q` | `1 failed, 1035 passed`, exit 1 | `1037 passed`, **exit 0** |
+| `pytest -q`, no checkout | `1032 passed, 4 skipped` | `1033 passed, 4 skipped` |
+
+Coverage is 100% with branch coverage on at both ends. `gate.yml`'s parity floor
+moves 1036 -> 1037 in the same commit, and that raise is not arithmetic of the
+usual kind: for the first time on that clause the floor is an integer with **no
+compensating failure** in it, because the `+ 1` every comment above it carries
+stopped existing when this packet made the drift guard green.
+
+**Not done, deliberately.** The three omissions above are left in place — closing
+them means making `payloads()` carry `span.resource` and giving
+`recording_telemetry` muse's real resource, which breaks the four exact-dict
+assertions in `tests/test_telemetry.py` and is a wider change than a packet that
+is one file plus the test that proves the span question should carry. A span
+exported *through the tracer in the test suite* still has its resource dropped
+before validation; what this packet guarantees is that the resource muse builds
+conforms to the schema it ships. vendir was not used — see the handoff for why,
+which is that it copies from `github.com/cafaye/core@master` rather than from
+the checkout the gate measures against.
+
 ### muse-03 — the self-hoster quickstart, because two defects were found by running the service
 
 The new material is documentation: `docs/openai-quickstart.md`, linked from the

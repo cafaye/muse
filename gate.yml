@@ -160,28 +160,54 @@ gate:
       # that drives its own container and its own litellm stand-in.
       #
       # Measured with a core checkout, which the raise above said had never been done:
-      # `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest` reports
-      # `1 failed, 1035 passed`, and the one failure is the same pre-existing
+      # `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest` reported
+      # `1 failed, 1035 passed`, and the one failure was the
       # `test_the_vendored_schema_is_byte_identical_to_core` recorded above. So
-      # 1035 + 1 = 1036, and the arithmetic the earlier raises used by hand is now a
-      # number this repository has watched. With no core checkout the same tree reads
-      # `1032 passed, 4 skipped`, so 1032 + 4 = 1036 holds on both sides.
+      # 1035 + 1 = 1036, and the arithmetic the earlier raises used by hand was from
+      # then on a number this repository had watched.
+      #
+      # RAISED 1036 -> 1037 by muse-04, which added ONE test and, for the first time
+      # on this clause, made the floor an integer with no failure in it. The raise is
+      # not "a packet added a test" — it is that the arithmetic it inherits is now
+      # different arithmetic: muse-04 re-vendored core's `traces.schema.json`, so the
+      # `+ 1` that every comment above carries stops existing. Measured on both sides
+      # rather than counted, because a stale number in this file is the defect rule 23
+      # is about and the number here is the one a reader trusts:
+      #
+      #   MUSE_CORE_SCHEMAS=<core>/schemas uv run pytest   ->  1037 passed, exit 0
+      #   uv run pytest (no checkout)                      ->  1033 passed, 4 skipped
+      #
+      # 1033 + 4 = 1037, so the floor is exact on both sides with no compensating
+      # failure. That is the first time this clause has been able to say that, and it
+      # is worth being explicit about why it matters: every comment above this one
+      # reasons about headroom by subtracting a failure, and a reader checking those
+      # arguments now has to notice that the failure is gone. Leaving 1036 here would
+      # have cleared a run 1 test short — which, at this margin, is the difference
+      # between the drift guard existing and having been deleted, so this is the
+      # fourth time the clause has caught a real possibility rather than a
+      # hypothetical one.
       #
       # RAISED 973 -> 1022 by muse-alias-01, which added 49 tests and no core-gated
       # ones, so the arithmetic is unchanged in kind: the same four cross-repo tests
       # skip without a checkout as before. Measured, not counted — `uv run pytest`
       # reports `1018 passed, 4 skipped` with no `MUSE_CORE_SCHEMAS`, and 1018 + 4 = the
-      # count when all four execute, which is what this floor means. The pre-existing
-      # `test_the_vendored_schema_is_byte_identical_to_core` failure recorded above is
-      # unchanged and still not this packet's to fix.
+      # count when all four execute, which is what this floor meant then. The
+      # `test_the_vendored_schema_is_byte_identical_to_core` failure recorded above was
+      # unchanged through that packet and was muse-04's to fix, not its.
       #
-      # NOT YET OBSERVED WITH A CORE CHECKOUT. There is no `../core` on the machine this
-      # was written on, so the 1018 + 4 arithmetic is the same one every previous raise
-      # used but has not been watched green with `MUSE_CORE_SCHEMAS` set. A successor
-      # with a core checkout should run `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest`
-      # and correct this floor if the total differs — named here rather than left as a
-      # claim, because a floor asserted only against arithmetic is exactly the
-      # "a version pin nobody has executed" defect rule 23 exists for.
+      # NOW OBSERVED WITH A CORE CHECKOUT — muse-04, on a machine that has one. The warning
+      # this paragraph used to carry is discharged: `MUSE_CORE_SCHEMAS=<core>/schemas uv
+      # run pytest` was run, and it reports `1037 passed` with **exit 0** and 100% branch
+      # coverage. So the `+ 4` arithmetic above is no longer the only support the floor
+      # has — it is now a number this repository has watched go green with all four
+      # cross-repo guards executing, which is what the paragraph was asking a successor
+      # for. The raise that carried this number is the one immediately above.
+      #
+      # The clause it replaced is kept above rather than deleted, because the reason it
+      # existed was sound and the thing that changed is the world, not the reasoning:
+      # there *was* no `../core` on the machine that wrote it, and a floor asserted only
+      # against arithmetic is exactly the "a version pin nobody has executed" defect
+      # rule 23 exists for.
       #
       # Left at 973 this would have cleared a run 49 tests short, which is the fourth
       # time this clause has caught a real possibility rather than a hypothetical one:
@@ -191,7 +217,7 @@ gate:
       # plus the guards that had to learn about two new paths: six in
       # `test_openapi.py` for the documents and two enumeration rows in
       # `test_tenant_scoping.py`.
-      minimum: 1036
+      minimum: 1037
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

@@ -462,6 +462,63 @@ async def test_a_mapped_span_validates_against_core_schema() -> None:
     assert all(span["status"] in {"unset", "ok", "error"} for span in payloads(exporter))
 
 
+def test_the_resource_muse_itself_builds_validates_against_the_schema() -> None:
+    """The half of a span nothing was checking.
+
+    `test_a_mapped_span_validates_against_core_schema` above validates the
+    *attributes* half of what muse exports, and did so for the whole life of the
+    vendored schema. It could not check the resource half, and the reason is three
+    separate omissions that each look reasonable:
+
+    - `_core_document` projects the span onto a four-key document with no
+      `resource` key at all, so the half of core's schema under `$.resource` was
+      never reached;
+    - `tests/support/tracing.py::payloads` reads `name`, `kind`, `status` and
+      `attributes` off the finished span and never reads `span.resource`, so a
+      test could not have asked;
+    - `recording_telemetry` builds `TracerProvider()` with no resource, so the
+      spans under test carried the SDK default rather than the one
+      `muse.telemetry._resource` builds.
+
+    Meanwhile `muse.telemetry._resource` sets `service.namespace: cafaye` by
+    hand, and muse is the only publisher in the fleet that does. So muse was
+    emitting a resource attribute that muse's own vendored schema forbade — the
+    resource is closed with `additionalProperties: false`, so this was a
+    rejection waiting for whichever component first validated a real resource —
+    and **no component did**, which is why nothing was red. The span was not
+    dropped and not refused. It was unvalidated, and a closed list that nothing
+    reads is indistinguishable from a correct one.
+
+    The fix is core's four lines, not muse's code: `_resource` was right and the
+    copy was behind. So the resource is read off the provider muse builds rather
+    than written out here, because a hand-written dict would be this test's own
+    idea of a resource and would keep passing if `_resource` changed. Asserting
+    the *floor* first — that the namespace is really there — is what stops the
+    validation below from being vacuous through some future edit that simply
+    stopped setting it.
+
+    The second half is the control this test cannot do without: a resource the
+    schema *should* refuse must be refused, or a validator that quietly returned
+    success would make the first half meaningless. A guard that cannot fail is
+    not a guard, and the way to know this one can is to watch it reject.
+    """
+    from muse.telemetry import build_provider
+
+    resource = dict(build_provider().resource.attributes)
+
+    # The floor, before the validation: muse is the publisher that sets this by hand.
+    assert resource["service.namespace"] == "cafaye"
+
+    document = {"name": "muse.route", "kind": "server", "attributes": {}, "resource": resource}
+    _validator().validate(document)
+
+    # The control. `cafaye` is the only value this attribute takes, so anything else
+    # is a resource the spec does not describe — and the schema's `pattern` is what
+    # refuses it, which is why this asserts a rejection rather than a message.
+    refused = {**document, "resource": {**resource, "service.namespace": "not a namespace"}}
+    assert not _validator().is_valid(refused)
+
+
 def _core_document(span: dict) -> dict:
     """A real exported span, in the shape `traces.schema.json` describes.
 
