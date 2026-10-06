@@ -234,7 +234,11 @@ gate:
       # would have stayed green — which is the exact thing the muse-08 paragraph above
       # records the clause existing to prevent. The margin this floor carries is now
       # exactly zero, on purpose, and the next packet that adds a test moves it again.
-      minimum: 1057
+      # RAISED AGAIN 1057 -> 1077 in the second half of the same packet, for the same
+      # clause and the same reason: `Router.stream` and its 20 tests. Measured on both
+      # sides again — 1077 with a core checkout, `1073 passed, 4 skipped` without —
+      # so 1073 + 4 = 1077, still exact on both sides.
+      minimum: 1077
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
