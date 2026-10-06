@@ -141,6 +141,16 @@ docker compose --project-directory . \
 
 ## Quick start
 
+**Coming to this from an OpenAI client?** Read
+[docs/openai-quickstart.md](docs/openai-quickstart.md). It has the base URL, the
+credential story — including the honest part, which is that a local run cannot get a
+token from `identity` today and what to do instead — a worked `curl`, and the official
+OpenAI Python and Node SDKs pointed at muse. Every command in it has been run against a
+muse built from this repository.
+
+What follows is bringing the service up. It is the same material, ordered by what has to
+happen first.
+
 ```sh
 # 1. A vault key. There is no default and no fallback: muse refuses to start
 #    without one, because a vault that boots with a default key is a vault whose

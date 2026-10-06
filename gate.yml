@@ -149,6 +149,24 @@ gate:
       # muse-08 recorded above and the reason the floor moves in the same commit as
       # the suite rather than the next one.
       #
+      # RAISED 1022 -> 1036 by muse-03, the quickstart packet, which added 14 tests
+      # and no core-gated ones — 12 in `tests/test_quickstart.py` holding
+      # `docs/openai-quickstart.md` to the code, and 2 that a live run turned up:
+      # `test_boot.py::test_the_booted_container_can_serve_a_request` and
+      # `test_providers.py::test_the_adapter_reads_a_real_litellm_model_response`.
+      # Neither of those two is about documentation, which is the point worth keeping:
+      # a documentation packet that ran the service it was documenting found two
+      # defects that made every request impossible, and both were invisible to a suite
+      # that drives its own container and its own litellm stand-in.
+      #
+      # Measured with a core checkout, which the raise above said had never been done:
+      # `MUSE_CORE_SCHEMAS=../core/schemas uv run pytest` reports
+      # `1 failed, 1035 passed`, and the one failure is the same pre-existing
+      # `test_the_vendored_schema_is_byte_identical_to_core` recorded above. So
+      # 1035 + 1 = 1036, and the arithmetic the earlier raises used by hand is now a
+      # number this repository has watched. With no core checkout the same tree reads
+      # `1032 passed, 4 skipped`, so 1032 + 4 = 1036 holds on both sides.
+      #
       # RAISED 973 -> 1022 by muse-alias-01, which added 49 tests and no core-gated
       # ones, so the arithmetic is unchanged in kind: the same four cross-repo tests
       # skip without a checkout as before. Measured, not counted — `uv run pytest`
@@ -173,7 +191,7 @@ gate:
       # plus the guards that had to learn about two new paths: six in
       # `test_openapi.py` for the documents and two enumeration rows in
       # `test_tenant_scoping.py`.
-      minimum: 1022
+      minimum: 1036
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
