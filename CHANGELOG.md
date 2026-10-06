@@ -5,6 +5,51 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### muse-03 — the self-hoster quickstart, because two defects were found by running the service
+
+The new material is documentation: `docs/openai-quickstart.md`, linked from the
+README, with `tests/test_quickstart.py` holding it to the code — paths checked
+against `openapi/v1.yaml` and against the running app, model names against
+`config/routes.yaml`, scopes against the constants. `gate.yml`'s parity floor
+moves 1022 -> 1036 in the same commit, as `AGENTS.md` requires.
+
+The README had a quick start for bringing the stack *up* and nothing at all for
+using it: no base URL, no token flow, no worked request. The gap was checked
+rather than assumed — a reader could finish this repository and still not know how
+to make one completion.
+
+**Why now, and why a docs packet.** Two defects were found by *running* muse
+against a real development stack, and both made it serve nothing at all: a
+container that handed `Telemetry` a `TracerProvider` where a `Tracer` was
+required, so every request failed in middleware before routing or auth; and a
+litellm adapter that guarded every field access with `isinstance(x, dict)`, which
+`acompletion` never returns, so every completion raised `ResponseShapeError`,
+walked the whole fallback chain and ended as a 503 naming every candidate. Both
+are fixed and verified (`687b51c`, `eaeeecf`).
+
+Their shared root cause is the reason this is a documentation packet: **the tests
+exercised shapes that do not occur in production.** A test that asserts against an
+imitation of a dependency's type proves only that the imitation behaves as
+expected. The next person to self-host muse has no such session, so if they meet
+the same class of problem the documentation has to let them find it themselves.
+
+What the new section adds, each pointing at the file that owns the answer:
+
+- the base URL, and why 8000 is a literal rather than a `${KIT_*}` variable
+- the **commented-out `MUSE_IDENTITY_ISSUER`**, named as the first thing to check
+  when every completion is a 503. Unset it falls back to the production issuer,
+  which is indistinguishable from a routing fault at the response
+- the four things muse requires of identity's token, each with the status that
+  refuses it — so a 403 on a correctly signed token reads as a missing capability
+  rather than a broken credential
+- `fast` and `smart` as the only names a caller may ask for, and why `/v1/models`
+  returns route names rather than vendor ids
+- a pasteable `curl` and a stock OpenAI client pointed at muse
+- why `provider`, `route` and `cost_micros` are absent from the alias body,
+  quoted from `ChatCompletionBody`'s own docstring rather than invented
+- `X-Trace-Id` as the trace handle — on every response, including the alias and
+  the errors, which is where the body's missing `trace_id` went
+
 ### Two OpenAI-compatible aliases, which are aliases
 
 `POST /v1/chat/completions` and `GET /v1/models`. `openapi/v1.yaml` goes **1.1.1 →
