@@ -27,7 +27,7 @@
 # FAILURE, and a policy appearing in `migrations` is `tenancy.rls-undeclared`,
 # a FAILURE.
 #
-# WHAT THE SCANNER FINDS IN `src`, AND WHY NONE OF IT IS DECLARABLE. The
+# WHAT THE SCANNER FINDS IN `src`, AND WHY NONE OF IT IS A ROW SCOPE. The
 # entry-point scanner reads `src` and finds the key on fifteen lines:
 #
 #   src/muse/auth.py:6,78,118,160,163,232,289,295,300,303
@@ -35,12 +35,13 @@
 #   src/muse/metering.py:21,31
 #   src/muse/schemas/telemetry/traces.schema.json:203
 #
-# Not one of them is an account-scoped statement, and the scanner says so itself
-# (`tenancy.enumeration-partial`: "could not classify 15 account-scoped site(s)
-# … no statement within 4 lines"). They are three kinds of token-claim mention,
-# and the format's `entryPoints` vocabulary — select/update/delete/call against
-# a subject, scoped at a line, proven by a three-way denial — has no way to
-# declare any of them, because none of them reaches a row:
+# Not one of them is an account-scoped statement — the scanner says so itself
+# (`tenancy.enumeration-partial`: "could not classify … no statement within 4
+# lines") — and each is VOUCHED FOR in `scope.nonRowSites` below with the
+# reason it is not a row predicate. That is what makes the zero expressible
+# in a language this checker cannot read: the declaration says "I know the
+# key is here and it is not a boundary", and the check still fails for any
+# site not named. They are three kinds of token-claim mention:
 #
 #   * claim verification (`auth.py`): `REQUIRED_CLAIMS`, the `Principal`
 #     field, `_account_of`, the claim loop. The account is READ OUT OF a
@@ -51,18 +52,10 @@
 #     (`traces.schema.json`), where `account_id` is a span-attribute
 #     description — and rule 16 forbids putting it on a span anyway.
 #
-# So `tenancy.honest-zero` reports this declaration as a failure: the checker
-# counts every key-carrying line in the declared sources as evidence against a
-# zero, "whether or not this checker could classify the statement it appears
-# in". That is a false red for this service — the zero above is the measured
-# truth (no account-scoped row, statement, migration or parameter exists in
-# this tree, and `tests/test_tenant_scoping.py` proves the negative on all
-# four axes) — and it is a limitation of the text scanner, which cannot tell a
-# token claim from a row scope. Narrowing `scope.sources` to make the scanner
-# miss these lines would hide the only files that mention the key, which is the
-# omission wearing a declaration; the declaration keeps the whole tree and
-# says here what the scanner will find. Full measurement, the checker's output
-# and the recommended core fix are in REPORT-muse-tenancy-01.md.
+# The checker's verdict is then the expected one: `tenancy.honest-zero`
+# passes, `tenancy.enumeration-partial` names the same fifteen lines as the
+# honest residue of a SQL scanner reading a Python service, and
+# `tenancy.scope-key-unused` is the honest "no statement carries the key".
 version: 1
 service: muse
 
@@ -76,6 +69,58 @@ scope:
   key: account_id
   sources:
     - src
+  # Every key-carrying site the scanner reads in `src`, each with the reason
+  # it is not a row scope. An omission here is not a zero: the check fails for
+  # any scanned site not named, and a key this scanner read in a `select` is a
+  # row scope by definition no matter what this list says. None of these
+  # fifteen is a statement at all — they are claim verification, docstrings,
+  # and core's vendored schema — so the zero is true and now vouched for.
+  nonRowSites:
+    - file: src/muse/auth.py
+      line: 6
+      reason: module docstring — the claim is required on the verified token because muse bills per tenant; a caller fact, not a row scope
+    - file: src/muse/auth.py
+      line: 78
+      reason: the required-claims tuple — the account is verified off the bearer token at the edge, never read from a row
+    - file: src/muse/auth.py
+      line: 118
+      reason: field on the frozen Principal dataclass — the verified account travels on the caller object, not on any table
+    - file: src/muse/auth.py
+      line: 160
+      reason: assignment from _account_of(claims) — the value is read out of the verified token payload, never from a query
+    - file: src/muse/auth.py
+      line: 163
+      reason: Principal construction carries the verified claim on the caller; no row is read, written, or scoped by it
+    - file: src/muse/auth.py
+      line: 232
+      reason: the claim-presence loop excludes account_id on purpose — _account_of owns its own check; no row is involved
+    - file: src/muse/auth.py
+      line: 289
+      reason: _account_of docstring — states the claim is required and that muse has no tenancy query; prose, not a predicate
+    - file: src/muse/auth.py
+      line: 295
+      reason: _account_of docstring — a non-string claim is refused; an authorization rule about the token, not a row read
+    - file: src/muse/auth.py
+      line: 300
+      reason: claims.get('account_id') — reads the tenancy off the verified token's claims, never off a database row
+    - file: src/muse/auth.py
+      line: 303
+      reason: the MissingAccount message names the failed check; an error string, not a row predicate
+    - file: src/muse/errors.py
+      line: 269
+      reason: MissingAccount docstring — the refusal when a verified token carries no usable account; a 401, not a scope
+    - file: src/muse/errors.py
+      line: 271
+      reason: MissingAccount docstring — explains the billing reason for the refusal; no row is read or written
+    - file: src/muse/metering.py
+      line: 21
+      reason: module docstring — the account is known since muse-06 but deliberately not written; the named D9 gap
+    - file: src/muse/metering.py
+      line: 31
+      reason: module docstring — names the D9 fix (account_id in core's payload schema); the insert itself carries no key
+    - file: src/muse/schemas/telemetry/traces.schema.json
+      line: 203
+      reason: core's vendored telemetry schema — a resource-attribute description; rule 16 forbids putting it on a span
 
 # Empty, because it is empty. Legal only because `accountScoped` is false; a
 # service that says `true` and lists nothing is the same omission wearing a
