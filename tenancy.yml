@@ -1,0 +1,139 @@
+# tenancy.yml — what muse declares about its own account boundary.
+#
+# Checked by cafaye/core's contract harness:
+#
+#     /Users/kaka/Code/any/wt/core/harness/bin/tenancy-check .
+#
+# THE HONEST ZERO. muse stores no customer rows and scopes nothing by account.
+# Its two tables are the platform's own: `outbox_events` is keyed by the
+# envelope `id` (core's outbox contract, `subject: platform` until D9) and
+# `vault_secrets` is keyed by `provider` — one platform credential per vendor,
+# not a customer's. Neither has an `account_id` column, and no migration adds
+# one; `tests/test_tenant_scoping.py` holds the negative (no query, no
+# migration, no function parameter carries a tenant column).
+#
+# `account_id` DOES appear in this tree — in `src/muse/auth.py` and
+# `src/muse/metering.py` — as a VERIFIED TOKEN CLAIM, not a row scope. muse
+# bills per tenant, so `require_bearer` refuses a token with no usable
+# `account_id` (`MissingAccount`, 401) and the account travels on the metered
+# event's payload. That is an authorization and metering fact about the
+# CALLER, not a discriminator on any row muse reads or writes: no SQL
+# statement in `src/` carries the key, which is what the entry-point scanner
+# measures — and what the suite's negative tests assert (§1.5 of the report).
+#
+# A zero nobody can be caught leaving is not a zero, it is an absence nobody
+# looked for — so both halves are declared and both are CHECKED: an
+# account-scoped statement appearing in `src` is `tenancy.honest-zero`, a
+# FAILURE, and a policy appearing in `migrations` is `tenancy.rls-undeclared`,
+# a FAILURE.
+#
+# WHAT THE SCANNER FINDS IN `src`, AND WHY NONE OF IT IS A ROW SCOPE. The
+# entry-point scanner reads `src` and finds the key on fifteen lines:
+#
+#   src/muse/auth.py:6,78,118,160,163,232,289,295,300,303
+#   src/muse/errors.py:269,271
+#   src/muse/metering.py:21,31
+#   src/muse/schemas/telemetry/traces.schema.json:203
+#
+# Not one of them is an account-scoped statement — the scanner says so itself
+# (`tenancy.enumeration-partial`: "could not classify … no statement within 4
+# lines") — and each is VOUCHED FOR in `scope.nonRowSites` below with the
+# reason it is not a row predicate. That is what makes the zero expressible
+# in a language this checker cannot read: the declaration says "I know the
+# key is here and it is not a boundary", and the check still fails for any
+# site not named. They are three kinds of token-claim mention:
+#
+#   * claim verification (`auth.py`): `REQUIRED_CLAIMS`, the `Principal`
+#     field, `_account_of`, the claim loop. The account is READ OUT OF a
+#     verified token and carried on the caller; it is never a predicate.
+#   * docstrings describing that verification (`auth.py`, `errors.py`,
+#     `metering.py`).
+#   * core's own telemetry schema, vendored byte-identically
+#     (`traces.schema.json`), where `account_id` is a span-attribute
+#     description — and rule 16 forbids putting it on a span anyway.
+#
+# The checker's verdict is then the expected one: `tenancy.honest-zero`
+# passes, `tenancy.enumeration-partial` names the same fifteen lines as the
+# honest residue of a SQL scanner reading a Python service, and
+# `tenancy.scope-key-unused` is the honest "no statement carries the key".
+version: 1
+service: muse
+
+accountScoped: false
+
+scope:
+  # The fleet's vocabulary and muse's token claim, declared so the scanner
+  # reads for it by name. A key that finds no account-scoped STATEMENT earns
+  # `tenancy.scope-key-unused` — the honest "I found nothing", which is the
+  # difference between an honest zero and an unexamined one.
+  key: account_id
+  sources:
+    - src
+  # Every key-carrying site the scanner reads in `src`, each with the reason
+  # it is not a row scope. An omission here is not a zero: the check fails for
+  # any scanned site not named, and a key this scanner read in a `select` is a
+  # row scope by definition no matter what this list says. None of these
+  # fifteen is a statement at all — they are claim verification, docstrings,
+  # and core's vendored schema — so the zero is true and now vouched for.
+  nonRowSites:
+    - file: src/muse/auth.py
+      line: 6
+      reason: module docstring — the claim is required on the verified token because muse bills per tenant; a caller fact, not a row scope
+    - file: src/muse/auth.py
+      line: 78
+      reason: the required-claims tuple — the account is verified off the bearer token at the edge, never read from a row
+    - file: src/muse/auth.py
+      line: 118
+      reason: field on the frozen Principal dataclass — the verified account travels on the caller object, not on any table
+    - file: src/muse/auth.py
+      line: 160
+      reason: assignment from _account_of(claims) — the value is read out of the verified token payload, never from a query
+    - file: src/muse/auth.py
+      line: 163
+      reason: Principal construction carries the verified claim on the caller; no row is read, written, or scoped by it
+    - file: src/muse/auth.py
+      line: 232
+      reason: the claim-presence loop excludes account_id on purpose — _account_of owns its own check; no row is involved
+    - file: src/muse/auth.py
+      line: 289
+      reason: _account_of docstring — states the claim is required and that muse has no tenancy query; prose, not a predicate
+    - file: src/muse/auth.py
+      line: 295
+      reason: _account_of docstring — a non-string claim is refused; an authorization rule about the token, not a row read
+    - file: src/muse/auth.py
+      line: 300
+      reason: claims.get('account_id') — reads the tenancy off the verified token's claims, never off a database row
+    - file: src/muse/auth.py
+      line: 303
+      reason: the MissingAccount message names the failed check; an error string, not a row predicate
+    - file: src/muse/errors.py
+      line: 269
+      reason: MissingAccount docstring — the refusal when a verified token carries no usable account; a 401, not a scope
+    - file: src/muse/errors.py
+      line: 271
+      reason: MissingAccount docstring — explains the billing reason for the refusal; no row is read or written
+    - file: src/muse/metering.py
+      line: 21
+      reason: module docstring — the account is known since muse-06 but deliberately not written; the named D9 gap
+    - file: src/muse/metering.py
+      line: 31
+      reason: module docstring — names the D9 fix (account_id in core's payload schema); the insert itself carries no key
+    - file: src/muse/schemas/telemetry/traces.schema.json
+      line: 203
+      reason: core's vendored telemetry schema — a resource-attribute description; rule 16 forbids putting it on a span
+
+# Empty, because it is empty. Legal only because `accountScoped` is false; a
+# service that says `true` and lists nothing is the same omission wearing a
+# declaration, and the schema refuses that one.
+entryPoints: []
+
+# The database half, and the same argument. muse's migrations create no
+# row-level-security DDL — no `create policy`, no `alter table … row level
+# security` — so `databaseEnforced: false` with an empty list is the truth
+# rather than an omission, and it is checked the same way: a policy anywhere
+# in `migrations` is `tenancy.rls-undeclared`, a FAILURE.
+rls:
+  databaseEnforced: false
+  sources:
+    - migrations
+  tables: []
