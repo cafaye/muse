@@ -3,13 +3,18 @@
 **Packet:** W36 — muse: declare the honest zero
 **Branch:** `worker/muse-w36-tenancy`
 **Date:** 2026-10-07
-**Verdict:** `tenancy.yml` written — the honest zero, `accountScoped: false`.
-The fleet checker reports **1 failure** (`tenancy.honest-zero`) and 2 warnings.
-The failure is a **false red** caused by a limitation of core's text scanner,
-which cannot distinguish a verified token claim from a row scope. The
-declaration is the measured truth and is shipped anyway, with the header
-naming what the scanner finds and why it is not declarable, per the packet's
-safe partial. The gate is green. Details and the recommended core fix below.
+**Verdict:** `tenancy.yml` written — the honest zero, `accountScoped: false`,
+with every key-carrying site vouched for in `scope.nonRowSites`. The fleet
+checker exits **0** with the 2 expected warnings. The gate is green.
+
+**History.** Attempt 1 shipped the honest zero without `nonRowSites` and the
+then-current checker failed it (`tenancy.honest-zero`); attempt 1's report
+argued the failure was a false red and recommended a core fix. The premise
+then changed: **core W41 (`core@4c95ba`) landed** — the checker no longer
+walks `__pycache__` bytecode and gained the field this packet needs,
+`scope.nonRowSites`. This attempt vouches for all 15 sites the scanner
+reads, each with the real reason it is not a row scope, and the checker is
+green. The recommended core fix is the fix that landed.
 
 ---
 
@@ -53,6 +58,10 @@ src/muse/errortype.py:233:    # a cafaye-owned rule (core's `account_id` require
 * **core's own telemetry schema**, vendored byte-identically
   (`traces.schema.json`), where `account_id` is a span-attribute *description*
   — and rule 16 forbids putting it on a span anyway.
+
+Three of the 18 (`auth.py:74`, `auth.py:227`, `errortype.py:233`) are `#`
+comments, which the scanner strips before matching — which is why the
+checker's site list is 15, not 18.
 
 ### 1.2 `account_id` in the migrations
 
@@ -135,13 +144,11 @@ a boundary the service does not have.
 $ /Users/kaka/Code/any/wt/core/harness/bin/tenancy-check .
 WARN tenancy.enumeration-partial: this checker reads SQL statements and account-key predicates, and it could not classify 15 account-scoped site(s): src/muse/auth.py:118 at no statement within 4 lines; src/muse/auth.py:160 at no statement within 4 lines; src/muse/auth.py:163 at no statement within 4 lines; src/muse/auth.py:232 at no statement within 4 lines; src/muse/auth.py:289 at no statement within 4 lines; src/muse/auth.py:295 at no statement within 4 lines; src/muse/auth.py:300 at no statement within 4 lines; src/muse/auth.py:303 at no statement within 4 lines; src/muse/auth.py:6 at no statement within 4 lines; src/muse/auth.py:78 at no statement within 4 lines; src/muse/errors.py:269 at no statement within 4 lines; src/muse/errors.py:271 at no statement within 4 lines; src/muse/metering.py:21 at no statement within 4 lines; src/muse/metering.py:31 at no statement within 4 lines; src/muse/schemas/telemetry/traces.schema.json:203 at a file type this checker does not read. This declaration is NOT proven closed, and this is a warning rather than a failure because no language agnostic text scanner can settle it — read the named files and confirm each one is declared
     fix: read the named files by hand and confirm each one is declared; the checker's scanner reads SQL and account-key predicates only
-FAIL tenancy.honest-zero: the service declares no account scoping and the scan found 15 place(s) carrying its tenancy key in the sources it declared (15 of them at src/muse/auth.py:6). An omission is not a zero, and a key that appears in the source is a key this service is scoping by — whether or not this checker could classify the statement it appears in
-    fix: declare the entry points it has, with the negative assertions it needs; an omission is not a zero
 WARN tenancy.scope-key-unused: no account-scoped statement this scanner can read carries 'account_id'. That is not proof the service has no scoping — it is usually a key spelled differently from the column it is really scoping by, and on a service written in a language this scanner cannot classify it is what an honest 'I cannot see this' looks like
     fix: check scope.key against the column or parameter this service really scopes by; a key nothing matches is either spelled differently or lives in a language this scanner cannot classify
 
-FAIL /Users/kaka/Code/any/wt/muse-w36-tenancy: 1 failure(s), 2 warning(s) — warnings do not move the exit code
-EXIT: 1
+OK /Users/kaka/Code/any/wt/muse-w36-tenancy: 0 failure(s), 2 warning(s) — warnings do not move the exit code
+EXIT: 0
 ```
 
 ### 3.1 The two warnings — the expected verdict, named and not fixed
@@ -150,57 +157,37 @@ EXIT: 1
 saw and could not tie to a SQL statement. This is the expected verdict for a
 Python service and it is correct: the scanner reads SQL and account-key
 predicates, and a Python token claim is neither. The packet says to name it,
-not fix it. It is named here and in the `tenancy.yml` header. The 15 lines are
-enumerated in §1.1 and every one is a token-claim mention (claim
-verification, docstrings, or core's vendored schema description) — none is an
-account-scoped statement, which is what the scanner's own message says
-("could not classify … no statement within 4 lines").
+not fix it. It is named here, in the `tenancy.yml` header, and in
+`scope.nonRowSites`. The 15 lines are enumerated in §1.1 and every one is a
+token-claim mention (claim verification, docstrings, or core's vendored schema
+description) — none is an account-scoped statement, which is what the
+scanner's own message says ("could not classify … no statement within 4
+lines").
 
 **`tenancy.scope-key-unused`** says no account-scoped *statement* the scanner
 can read carries `account_id`. That is exactly true and exactly the honest
 "I found nothing" the field exists to produce. It is the difference between an
 honest zero and an unexamined one.
 
-### 3.2 The failure — a false red, and why the declaration stands anyway
+### 3.2 The failure that was, and how it closed
 
-**`tenancy.honest-zero`** is the one finding this packet did not expect, and it
-is a false positive. The checker counts *every* key-carrying line in the
-declared sources as evidence against a zero — "a key that appears in the source
-is a key this service is scoping by, whether or not this checker could
-classify the statement it appears in". For a SQL service that is right. For a
-Python service whose **token claim** is named `account_id`, it is wrong: the
-15 lines are claim verification, docstrings, and a vendored JSON schema
-description, and the scanner itself classifies none of them as a statement.
+Attempt 1's checker run reported `FAIL tenancy.honest-zero` over the same 15
+sites: the pre-W41 checker counted *every* key-carrying line in the declared
+sources as evidence against a zero, with no way to vouch for a site that was
+not a row scope. For a SQL service that is right; for a Python service whose
+token claim is named `account_id` it made the honest zero undeclarable.
+Attempt 1's report recommended the core fix: let a declaration name the
+key-carrying sites that are not row scopes.
 
-The packet's model of the checker was that a language-neutral service gets the
-`enumeration-partial` warning and **exit 0** — core's own
-`docs/tenancy.md` §"What the scanner reads" promises exactly that ("Those eight
-services get a warning naming every file and line … an exit code of `0`"). The
-code is stricter than the docs: `check_honest_zero` counts unclassified lines
-as evidence. The docs and the code disagree, and muse's true declaration is
-caught in the middle.
-
-**Why the declaration is shipped anyway, rather than narrowed green.** The only
-way to make the scanner miss these 15 lines is to narrow `scope.sources` away
-from the files that carry the key. That would mean excluding `src/muse/auth.py`
-(the claim verification), `src/muse/errors.py`, `src/muse/metering.py` — which
-contains the outbox `insert`, so the narrowing would not even cover all the
-SQL — and the vendored schema. A declaration that points the scanner away from
-the only files that mention the key is the omission wearing a declaration: the
-"darkroom has no routes" defect in miniature, and the one thing this packet
-must not do. The packet's safe partial is explicit: ship the true declaration
-with a header naming what the scanner found and why it is not declarable, and
-report it. That is what `tenancy.yml` does, and what this report does.
-
-**Recommended core fix** (for a core packet, not this one — named, not fixed,
-per the packet's own precedent for checker findings): `check_honest_zero`
-should count *classified sites* (`sites`), not `sites + unclassified`. The
-`unclassified` list is the scanner's honest residue — "I saw the key and could
-not tie it to a statement" — and it is already reported with full names via
-`tenancy.enumeration-partial`. Counting it as evidence against a zero makes
-the honest zero undeclarable for any Python service whose token claim is named
-`account_id`, which is every Python service in this fleet that authenticates.
-The docs promise those services exit 0; the code should keep that promise.
+**Core W41 (`core@4c95ba`) is that fix.** The checker gained
+`scope.nonRowSites` — a list of `{file, line, reason}` vouching for each
+site — and `check_honest_zero` now fails only for scanned sites the
+declaration does *not* name. The field is not an escape hatch: it excuses
+only sites the scanner could not attribute to a statement, and a key the
+scanner read in a `select` is a row scope by definition no matter what the
+list says. This declaration vouches for all 15 sites, each with the reason
+open at that line (claim verification, docstring, or core's vendored schema
+description), and the check passes.
 
 ---
 
@@ -210,8 +197,7 @@ The docs promise those services exit 0; the code should keep that promise.
 $ bin/prime
 ==> syncing (locked)
 Resolved 88 packages in 25ms
-Prepared 86 packages in 2m 38s
-Installed 86 packages in 374ms
+Checked 86 packages in 27ms
 ==> lint
 All checks passed!
 72 files already formatted
@@ -224,10 +210,10 @@ testpaths: tests
 plugins: cov-7.1.0, anyio-4.15.1
 collected 1037 items
 ...
-================================ tests coverage ================================
+=============================== tests coverage ================================
 TOTAL                                1851      0    382      0   100%
 Required test coverage of 100% reached. Total coverage: 100.00%
-======================= 1033 passed, 4 skipped in 45.87s =======================
+======================= 1033 passed, 4 skipped in 26.82s =======================
 ```
 
 Green: ruff clean, 1033 passed / 4 skipped (the four core-parity tests, which
@@ -236,8 +222,8 @@ coverage.
 
 `bin/prime` is `uv sync --locked && ruff && pytest` with a 100% branch-coverage
 floor. It does not run `tenancy-check` (that is core's harness, run outside the
-gate), so the checker's red does not fail the gate. No existing test was
-weakened or skipped; no test was added.
+gate). No existing test was weakened or skipped; no test was added — the
+change is the declaration file and this report only.
 
 ---
 
@@ -245,21 +231,21 @@ weakened or skipped; no test was added.
 
 | File | Change |
 | --- | --- |
-| `tenancy.yml` | New. The honest zero: `accountScoped: false`, `scope.key: account_id`, `scope.sources: [src]`, empty `entryPoints`, `rls.databaseEnforced: false`, `rls.sources: [migrations]`, empty `tables`. Header names the 15 scanner sites and why none is declarable. |
+| `tenancy.yml` | New. The honest zero: `accountScoped: false`, `scope.key: account_id`, `scope.sources: [src]`, `scope.nonRowSites` vouching for all 15 key-carrying sites with per-site reasons, empty `entryPoints`, `rls.databaseEnforced: false`, `rls.sources: [migrations]`, empty `tables`. Header names the 15 scanner sites and why none is a row scope. |
 | `REPORT-muse-tenancy-01.md` | New. This report. |
 
 No source, test, migration, or gate file was changed. The declaration is the
-measured truth; the checker's one failure is a reported false red with a
-recommended core fix.
+measured truth, vouched for site by site; the checker's verdict is exit 0
+with the two expected warnings.
 
 ## 6. Follow-ups (not this packet)
 
-1. **core:** fix `check_honest_zero` to count classified sites only (§3.2), so
-   the docs' promised exit-0 verdict for language-neutral services is real.
-2. **muse:** once the checker is green, add `tenancy-check` to the gate
-   (`gate.yml` + `bin/prime`), per `docs/tenancy.md` §"Adopting it in a
-   service" step 5. Until then it is a second thing to remember, which is how
-   it would be forgotten.
+1. **core:** the `check_honest_zero` fix this report recommended in attempt 1
+   **landed** as core W41 (`core@4c95ba`) — `scope.nonRowSites` plus the
+   `__pycache__` walk removal. Nothing further.
+2. **muse:** add `tenancy-check` to the gate (`gate.yml` + `bin/prime`), per
+   `docs/tenancy.md` §"Adopting it in a service" step 5. Until then it is a
+   second thing to remember, which is how it would be forgotten.
 3. **muse:** optionally guard `tenancy.yml`'s shape with a test in the repo's
    rule-23 pattern (every out-of-suite file is guarded). The underlying
    measurement is already guarded by `tests/test_tenant_scoping.py`'s negative
