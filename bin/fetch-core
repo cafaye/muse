@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# bin/fetch-core — where core is, and the one clone that may be run to get it.
+#
+# THIS USED TO BE gate.yml's SATISFY ARGV, VERBATIM:
+#
+#   git clone --depth 1 git@github.com:cafaye/core.git ../core
+#
+# which is right for a CI runner and wrong twice on a machine that has core:
+# it clones a network copy of something already on disk, and run from a
+# worktree it writes the clone into the directory every worker's worktree
+# shares. The resolution now lives in src/muse/coreloc.py — tested, and walked
+# in this order:
+#
+#   1. CORE_PATH / CORE_SPECS_PATH   the explicit seam, unchanged
+#   2. ../core beside the repository  the main checkout's answer
+#   3. core beside the PRIMARY worktree, through `git worktree list`
+#   4. a clone beside the primary worktree — the CI-runner fallback, explicit,
+#      last, and the only step that touches the network
+#
+# On this machine the clone never runs: the workspace's main checkout sits
+# beside core, and a worktree finds it through git. The second half of
+# satisfying the requirement is still an environment variable — no file in this
+# repository can set one for the gate that runs alongside it — and that is why
+# gate.yml's core-parity PROOF and not this requirement is what makes the
+# cross-repo tier non-optional. This script's job is that a checkout exists at
+# all, wherever the gate runs from; the operator points MUSE_CORE_SCHEMAS at
+# its schemas directory, as the requirement's own text says.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# `--locked` on the `uv run`, for the reason bin/prime's header gives: a bare
+# `uv run` re-resolves and can rewrite uv.lock on the way here.
+resolved="$(uv run --locked python -c 'from muse.coreloc import fetch, repository_root; print(fetch(repository_root()))')"
+
+echo "fetch-core: core is at $resolved"
+echo "fetch-core: set MUSE_CORE_SCHEMAS=$resolved/schemas for the parity tier"

@@ -263,7 +263,23 @@ gate:
       # that is not there -- which is the third because a guard that can pass by
       # finding nothing is not a guard, and an empty scan would agree with any
       # declaration.
-      minimum: 1065
+      #
+      # RAISED 1065 -> 1081 by HZ-2, which added SIXTEEN tests
+      # (tests/test_coreloc.py) holding the new core-resolution module to its
+      # order - the module gate.yml's filesystem requirement now satisfies
+      # itself through, instead of cloning core from GitHub beside whatever
+      # checkout asked. Measured rather than counted by hand, on this worktree:
+      #
+      # MUSE_CORE_SCHEMAS=<core>/schemas ./bin/prime   -> 1081 passed, exit 0
+      # ./bin/prime (no core checkout)                  -> 1077 passed, 4 skipped
+      #
+      # 1077 + 4 = 1081, so the floor is exact on both sides with no compensating
+      # failure. The four are the MUSE_CORE_SCHEMAS-gated parity tests, and they
+      # skip identically from a worktree and from the main checkout - that was
+      # the measurement that said muse's copy of the sibling-read hazard was
+      # loud (a clone in a declaration) rather than silent (a skipped tier),
+      # and the resolution order below is the fix either way.
+      minimum: 1081
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
@@ -303,18 +319,43 @@ external:
         command: [bin/prime]
         unmet: uv cannot resolve or download, and bin/prime exits nonzero before its lint step
     - kind: filesystem
-      name: a cafaye/core checkout at ../core, with MUSE_CORE_SCHEMAS pointing at its schemas directory
+      name: a cafaye/core checkout — CORE_PATH/CORE_SPECS_PATH, ../core beside the repository, or core beside the primary worktree, with MUSE_CORE_SCHEMAS pointing at its schemas directory
       satisfy:
         # The second half of satisfying this one is the environment variable,
         # and no file in this repository can assert it — which is precisely
         # why the `core-parity` proof above, and not this requirement, is what
         # makes the tier non-optional. A requirement says what to get; a proof
         # says the gate may not be green without it.
-        # The `'1'` is quoted because it is an argv element, and a reader that
-        # coerces a bare `1` to an integer hands the checker something that is
-        # not a string — `gate.schema` caught exactly that on the first draft.
-        command: [git, clone, --depth, '1', git@github.com:cafaye/core.git, ../core]
-        unmet: the suite reports `895 passed, 3 skipped` instead of `898 passed`, and the core-parity proof never appears
+        #
+        # THE FIRST HALF USED TO BE A CLONE, VERBATIM
+        # `[git, clone, --depth, '1', git@github.com:cafaye/core.git, ../core]`,
+        # and two things were wrong with it that a worktree made visible. On this
+        # machine core is already on disk — the workspace's main checkout sits
+        # beside it — so the argv reached for a network copy of something present,
+        # a dependency in a gate that should need none (brief: "loudly slow, not
+        # silently wrong"). And run from a worktree, `../core` is the DIRECTORY
+        # EVERY WORKER'S WORKTREE SHARES: two workers proving this requirement
+        # concurrently would each clone into the same place.
+        #
+        # `bin/fetch-core` walks the same resolution order billing's
+        # core_location.rb established (BRK-4R2's fix): the explicit seam, then
+        # `../core` beside the repository, then core beside the PRIMARY worktree
+        # found through `git worktree list --porcelain`. On a machine with a core
+        # checkout — main checkout or worktree — the clone never runs, because
+        # the answer is already there. The clone remains the explicit LAST
+        # fallback for a CI runner with no sibling checkout, it names itself in
+        # its output when it fires, and it aims beside the PRIMARY worktree so a
+        # worktree run and a main run land it in the same place.
+        #
+        # The resolution is `src/muse/coreloc.py`, tested by
+        # `tests/test_coreloc.py` against trees the suite builds — one
+        # implementation with tests, not an argv with a comment.
+        command: [bin/fetch-core]
+        unmet: >-
+          bin/fetch-core exits 3 naming CORE_PATH, ../core and the primary
+          worktree (or fails cloning, naming the destination and the seam), the
+          suite reports the four skipped tests instead of the full count, and
+          the core-parity proof never appears
   # NOT required, and named so nobody goes looking for them: no database, no
   # service, no credential, no secret. `tests/support/fake_database.py` and
   # `tests/support/fake_psycopg.py` mean the suite never opens a socket to
