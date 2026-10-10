@@ -40,6 +40,7 @@ dependencies = [
     # fastapi's pins. See tests/test_dependencies.py.
     "pydantic>=2.13.5",         # the request/response models in api.py and main.py
     "starlette>=1.6.0",         # the ASGI types, headers and HTTPException
+    "nats-py>=2.16.0",
 ]
 
 [project.optional-dependencies]

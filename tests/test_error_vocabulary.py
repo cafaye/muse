@@ -69,6 +69,7 @@ from muse.errors import (
     SigningKeysUnavailable,
     Unauthenticated,
     UnclassifiedError,
+    UnpublishableEvent,
     VaultConfigError,
     VaultDecryptError,
     VaultKeyError,
@@ -99,6 +100,12 @@ EXPECTED: dict[type[BaseException], str] = {
     InvalidSubject: "internal_error",
     InvalidServiceName: "internal_error",
     MeteringError: "internal_error",
+    # An envelope the publisher refuses to put on the bus. Same reasoning as
+    # `MeteringError` — the row is muse's own and the refusal is muse defending a
+    # boundary — with one extra constraint worth stating: *not* `policy_denied`, which
+    # would put a redaction refusal on the same dashboard filter as a refused
+    # capability (AGENTS.md rule 20).
+    UnpublishableEvent: "internal_error",
     VaultDecryptError: "internal_error",
     UnclassifiedError: "internal_error",
     InvalidErrorType: "internal_error",

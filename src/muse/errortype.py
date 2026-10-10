@@ -79,6 +79,7 @@ from muse.errors import (
     SigningKeysUnavailable,
     Unauthenticated,
     UnclassifiedError,
+    UnpublishableEvent,
     VaultConfigError,
     VaultDecryptError,
     VaultKeyError,
@@ -156,6 +157,12 @@ _TABLE: dict[type[BaseException], str] = {
     InvalidServiceName: "internal_error",
     # A completion we cannot turn into a metered event. Our invariant, not a peer's.
     MeteringError: "internal_error",
+    # An envelope muse refuses to put on the bus. Our invariant twice over: the row is
+    # ours, and the refusal is the publisher defending a boundary rather than a caller
+    # being corrected. Not `policy_denied` — no policy of the caller's was applied, and
+    # a span that said otherwise would put a redaction event on the same dashboard view
+    # as a real authorisation refusal (rule 20).
+    UnpublishableEvent: "internal_error",
     # The stored value is unreadable: wrong key, tampered ciphertext, or a row written by
     # a future version. All three mean the same thing to an operator and none of them is
     # the caller's fault.

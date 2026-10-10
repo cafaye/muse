@@ -206,6 +206,26 @@ class MeteringError(MuseError):
     """
 
 
+class UnpublishableEvent(MuseError):
+    """An outbox row describes an event muse refuses to put on the bus.
+
+    Raised by the publisher, before the transport is called, when an envelope
+    carries caller or model text — a prompt, a completion, a message body, tool
+    arguments — or a `Secret`. muse is the service where such a leak would happen:
+    the routed call's *content* passes through it and the outbox is where anything
+    remembered about that call is written down. So the check is not a convention at
+    the call site, it is the publisher's, and it refuses rather than scrubs: a row
+    whose payload muse cannot publish on purpose stays in the table with `attempts`
+    climbing, which is loud, rather than being edited into something lossy on the way
+    to the bus.
+
+    The message names the *field* and never the value. A `Secret` is detected on its
+    type (`muse.redaction.Secret`) and never compared, because a filter with a bypass
+    is no filter; a field name is enough for an operator to act on and is not the
+    thing that must never reach a log.
+    """
+
+
 class VaultDecryptError(MuseError):
     """A stored value could not be decrypted.
 

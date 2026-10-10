@@ -25,8 +25,10 @@ from datetime import UTC, datetime
 
 import pytest
 
+from muse.errors import UnpublishableEvent
 from muse.metering import Meter
 from muse.outbox import (
+    FORBIDDEN_PAYLOAD_FIELDS,
     MAX_BACKOFF_SECONDS,
     STUCK_AFTER_SECONDS,
     InMemoryTransport,
@@ -37,6 +39,7 @@ from muse.outbox import (
     envelope_rows,
 )
 from muse.providers import Completion, Price
+from muse.redaction import Secret
 
 from .support.fake_database import FakeDatabase
 
@@ -291,6 +294,89 @@ async def test_a_batch_is_one_statement_per_row_plus_the_claim() -> None:
 
 
 # --- the backoff -----------------------------------------------------------
+
+
+# --- the redaction boundary ------------------------------------------------
+#
+# muse is the service where a prompt would leak if anywhere would: the routed call's
+# content passes through it on every request, and this table is where anything
+# remembered about that call is written down. The guard is the publisher's, not each
+# call site's, and these assert it refuses rather than scrubs — a row muse will not
+# publish stays in the table with `attempts` climbing, which is an alert.
+
+
+def test_a_prompt_never_reaches_the_bus() -> None:
+    """The exact leak this guard exists for: a future event type that carries the
+    caller's words. The refusal names the field, and never the value."""
+    with pytest.raises(UnpublishableEvent) as refusal:
+        row(data={"model": "gpt-4o-mini", "prompt": "secret orders"}).envelope()
+
+    assert "data.prompt" in str(refusal.value)
+    assert "secret orders" not in str(refusal.value)
+
+
+def test_a_completion_never_reaches_the_bus() -> None:
+    """The other half of the same call. `completion` is what the vendor answered with,
+    and it is the model's output rather than muse's own arithmetic."""
+    with pytest.raises(UnpublishableEvent):
+        row(data={"completion": "answered"}).envelope()
+
+
+def test_message_content_is_refused_at_any_depth() -> None:
+    """A nested payload, because the one that leaks will not be flat: an event type
+    describing a tool call carries the call's arguments, and those are the caller's."""
+    nested = {"model": "gpt-4o-mini", "calls": [{"name": "lookup", "arguments": {...}}]}
+    with pytest.raises(UnpublishableEvent) as refusal:
+        row(data=nested).envelope()
+
+    assert "data.calls.[0].arguments" in str(refusal.value)
+    assert "lookup" not in str(refusal.value)
+
+
+def test_a_credential_is_refused_on_its_type_and_not_its_value() -> None:
+    """A `Secret` is refused on its *type*, so there is no value comparison for a
+    future edit to bypass — and so the message cannot quote what it refused."""
+    with pytest.raises(UnpublishableEvent) as refusal:
+        row(data={"provider": "openai", "api_key": Secret("sk-do-not-log")}).envelope()
+
+    assert "data.api_key" in str(refusal.value)
+    assert "sk-do-not-log" not in str(refusal.value)
+
+
+def test_the_forbidden_field_list_names_what_each_field_carries() -> None:
+    """A frozen set, asserted against the brief's own list, because a field added by a
+    later packet is a decision and not a typo fix."""
+    assert {
+        "prompt",
+        "completion",
+        "messages",
+        "content",
+        "tool_calls",
+        "arguments",
+        "api_key",
+        "credential",
+    } <= FORBIDDEN_PAYLOAD_FIELDS
+    assert isinstance(FORBIDDEN_PAYLOAD_FIELDS, frozenset)
+
+
+async def test_a_row_muse_refuses_is_left_unpublished() -> None:
+    """The refusal is not a drop. The row stays claimable with `attempts` climbing, so
+    a payload muse will never publish is an alert rather than a silent loss."""
+    database = database_with(row(data={"prompt": "secret orders"}))
+    transport = InMemoryTransport()
+
+    assert await publisher(database, transport).publish_batch() == 0
+    assert transport.published == []
+    assert any("attempts = attempts + 1" in statement.sql for statement in database.statements)
+
+
+async def test_a_metered_completion_still_publishes() -> None:
+    """The guard does not refuse the event muse actually emits. Its five fields carry
+    arithmetic — counts and micro-dollars — and none of them is caller text."""
+    database = database_with(row())
+    transport = InMemoryTransport()
+    await publisher(database, transport).publish_batch()
+    assert [subject for subject, _ in transport.published] == ["muse.tokens.consumed"]
 
 
 def test_the_backoff_starts_at_one_second() -> None:

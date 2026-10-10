@@ -33,12 +33,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from muse.db import Database
+from muse.errors import UnpublishableEvent
+from muse.redaction import Secret
 
 logger = logging.getLogger("muse.outbox")
 
@@ -63,6 +65,41 @@ _CAP_EXPONENT = math.ceil(math.log2(MAX_BACKOFF_SECONDS))
 #: vanished is a mystery. This constant exists so the alert has a threshold to be
 #: written against; the loop itself does not delete anything.
 STUCK_AFTER_SECONDS = 3600.0
+
+#: Field names that carry a caller's words or a credential, and may therefore never
+#: appear in a payload muse puts on the bus.
+#:
+#: A denylist rather than an allowlist, and the reason is the one that makes core's
+#: payload schemas closed: muse's event types will not stay at one, and a guard that
+#: has to be edited to admit a new field is a guard that gets edited. What makes the
+#: denylist safe *here* is that it is not the only line — `envelope_for` builds a
+#: closed five-field payload and `tests/test_metering.py` holds that — so this is the
+#: second lock on the same door, aimed at the event type nobody has written yet.
+#:
+#: Matched case-insensitively on the key, and listed by what the field *carries*
+#: rather than by every spelling of it, because the leak this prevents is a
+#: well-meaning `data["messages"] = request.messages` added in six months.
+FORBIDDEN_PAYLOAD_FIELDS = frozenset(
+    {
+        "arguments",
+        "args",
+        "api_key",
+        "apikey",
+        "authorization",
+        "completion",
+        "content",
+        "credential",
+        "input",
+        "message",
+        "messages",
+        "prompt",
+        "secret",
+        "text",
+        "token",
+        "tool_call",
+        "tool_calls",
+    }
+)
 
 #: The attempt count at which the wait has certainly reached the ceiling. Compared
 #: against *before* exponentiating, so a row that has been failing for a month returns
@@ -105,8 +142,11 @@ class OutboxRow:
         The row's own columns, not the `data` payload, for the context attributes. The
         payload is `data` and nothing else — so what goes on the bus is exactly what
         core's schema validates, and the store and the contract cannot drift apart.
+
+        The payload is checked before the envelope is returned, because this is the one
+        place every published event passes through. See `refuse_caller_content`.
         """
-        return {
+        envelope = {
             "specversion": "1.0",
             "id": self.id,
             "type": self.event_type,
@@ -115,6 +155,8 @@ class OutboxRow:
             "time": _rfc3339(self.time),
             "data": dict(self.data),
         }
+        refuse_caller_content(envelope)
+        return envelope
 
 
 @runtime_checkable
@@ -249,6 +291,58 @@ class OutboxPublisher:
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(batch_size={self._batch_size})"
+
+
+def refuse_caller_content(envelope: Mapping[str, Any]) -> None:
+    """Refuse an envelope carrying a caller's words or a credential.
+
+    muse is the one service in this fleet where such a leak would happen. The routed
+    call's prompt and completion pass through it on every request, and the outbox is
+    where anything remembered about that call is written down — so the guard belongs at
+    the single point every published event goes through, and not at each call site
+    where it would be a convention rather than a check.
+
+    Two things are refused, and they fail differently:
+
+    - **A field whose name carries caller text or a credential.** The message names the
+      field and never its value. `data.prompt` is the leak; the prompt itself must not
+      travel into an exception, because that exception is logged.
+    - **A `Secret` anywhere in the envelope.** Detected on its *type*, never by
+      comparing values, because a filter with a bypass is the thing
+      `muse.redaction` exists to argue against. A `Secret` could not be serialised
+      anyway, but the refusal has to be *specific*: "object of type Secret is not JSON
+      serializable" is a stack trace away from a repr.
+
+    Raises `UnpublishableEvent`, which the loop treats as a transport failure: the row
+    stays unpublished, `attempts` climbs, and nothing about the payload reaches the bus.
+    A row muse refuses forever is an alert, not a silent drop — which is the same
+    at-least-once arithmetic the whole module runs on.
+    """
+    for key, value in envelope.items():
+        _refuse(key, value, "")
+
+
+def _refuse(key: Any, value: Any, where: str) -> None:
+    """One node of the envelope: the key's name, the value's type, then its children.
+
+    `where` is the path built so far, and it appears in the exception instead of the
+    value: an operator needs to know *which* field, and a payload's contents are the
+    thing that must never reach a log line.
+    """
+    if isinstance(value, Secret):
+        raise UnpublishableEvent(f"{where}{key} is a Secret; a credential never reaches the bus")
+    if isinstance(key, str) and key.lower() in FORBIDDEN_PAYLOAD_FIELDS:
+        raise UnpublishableEvent(
+            f"{where}{key} carries caller text or a credential, which an outbox "
+            "event may not publish"
+        )
+    if isinstance(value, Mapping):
+        for child, item in value.items():
+            _refuse(child, item, f"{where}{key}.")
+        return
+    if isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _refuse(f"[{index}]", item, f"{where}{key}.")
 
 
 def backoff_seconds(attempts: int) -> float:
