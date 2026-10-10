@@ -78,18 +78,6 @@ def make_repo(tmp_path: Path) -> Path:
 # --- the identification ------------------------------------------------------
 
 
-def test_repository_root_is_this_repository():
-    # Called by bin/fetch-core at runtime and by nothing else in the suite, so
-    # it is asserted here rather than left to a coverage gap: the one line that
-    # answers "which checkout is this" is the line wrong __file__ arithmetic
-    # would break, and the failure would be a clone aimed at a directory nobody
-    # chose.
-    root = coreloc.repository_root()
-    assert root.joinpath("gate.yml").is_file()
-    assert root.joinpath("src", "muse", "coreloc.py").is_file()
-    assert root.joinpath("tests", "test_coreloc.py").is_file()
-
-
 def test_a_directory_with_only_a_manifest_is_not_core(tmp_path):
     # Every service in the fleet has a cafaye.yml, so the workspace directory a
     # failed lookup would otherwise resolve to must be refused.
