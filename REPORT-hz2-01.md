@@ -89,3 +89,34 @@ comments only, which the brief says to leave. Nothing was changed here.
 - **kit, gateway, identity, core** — prose citations, per the brief.
 - **muse's 4 `MUSE_CORE_SCHEMAS` skips** — not a defect to fix; they are the
   deliberate skip for a machine with no core, identical in both environments.
+
+## The after numbers — `bin/fetch-core` is the requirement now
+
+Same commit (`7e8fe89`), two environments, `MUSE_CORE_SCHEMAS` unset in both,
+nothing in the environment naming core:
+
+| environment | gate | runs | skips | coverage | failures | exit |
+|---|---|---|---|---|---|---|
+| worktree `muse-hz2` | `./bin/prime` | 1078 passed | 4 | 100.00% | 0 | 0 |
+| main checkout | `./bin/prime` | 1078 passed | 4 | 100.00% | 0 | 0 |
+
+1076 of the 1078 are the suite this measurement started from (1061) plus the 15
+resolution tests; the four skips are unchanged and are the same four in both
+environments. The counts match, so the clone argv is no longer reached on this
+machine and the resolution is environment-independent.
+
+### The 100% ceiling caught the fix, which is the finding
+
+The first run over the branch was red:
+
+    src/muse/coreloc.py                    50      1     12      0    98%   73
+    FAIL Required test coverage of 100% not reached. Total coverage: 99.96%
+    ====================== 1076 passed, 4 skipped in 25.04s ======================
+
+Line 73 is `repository_root()`'s `return Path(__file__).resolve().parents[2]`.
+Its only caller is `bin/fetch-core`, a script, so no test reached it — and the
+failure it guards is exactly this packet's shape one level quieter: the script
+prints whatever path comes back, so a module moved one directory down resolves
+a root that is not the root, the clone fallback aims beside the wrong checkout,
+and every other test stays green.
+`test_repository_root_is_the_root_of_this_repository` closes it.
