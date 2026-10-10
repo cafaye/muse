@@ -21,6 +21,7 @@ the properties that answer has to carry:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
 import json
@@ -477,6 +478,85 @@ async def test_one_transport_reuses_its_connection() -> None:
     assert broker.sessions == 1  # one connection for the transport's life
     assert broker.closed == 0  # nothing closed it yet, and nothing needed to
     assert "connected=True" in repr(transport)
+
+
+# --- the shape of the wiring -----------------------------------------------
+
+
+def _names_in(tree: ast.AST) -> set[str]:
+    """Every identifier a module refers to, however it refers to it.
+
+    `ast.Name`, `ast.Attribute` **and `ast.alias`** — and the alias half is the one
+    that matters, because the first draft of this guard collected the first two only
+    and was broken on purpose to check it: a bare `from muse.outbox import
+    InMemoryTransport` in `main.py` sailed straight through, since an import binds an
+    `alias` node and not a `Name` one. A guard that cannot see the spelling it is
+    guarding against is not a guard (rule 23's discipline, and the same one that found
+    24 uncollected tests in muse-09).
+    """
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.alias):
+            names.add(node.name)
+            if node.asname:
+                names.add(node.asname)
+    return names
+
+
+def test_no_transport_that_publishes_nowhere_is_wired() -> None:
+    """identity's fifth design point, and muse keeps it more strongly than identity
+    does: there is no no-op publisher here at all.
+
+    The tree is the oracle for a claim about the tree — the same technique as
+    `tests/test_alias_delegation.py`'s AST walk and `test_tenant_scoping.py`'s SQL
+    walk. `InMemoryTransport` is a test double, so its name appearing anywhere in
+    `src/muse/main.py` would mean the shipped wiring had found a way to drain the
+    outbox without a broker.
+
+    Parsed rather than grepped, because a comment explaining why something is *not*
+    wired is exactly where the name would otherwise appear — and collected through
+    `_names_in`, which was wrong once and was fixed by breaking it.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parent.parent / "src" / "muse" / "main.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    assert "InMemoryTransport" not in _names_in(tree)
+    # `NatsTransport` is built in one place, by `outbox_transport`, and that is the
+    # function the lifespan calls. A second construction site would be a second
+    # condition nobody documented.
+    constructions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "NatsTransport"
+    ]
+    assert len(constructions) == 1
+
+
+def test_the_publisher_is_constructed_only_by_the_lifespan() -> None:
+    """A loop in the request path would hold a database transaction open across a
+    network call for every completion muse serves, which is the arrangement the outbox
+    exists to avoid. So exactly one module constructs it, and it is the composition
+    root — `api.py`, the request path, never mentions the publisher at all."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "src" / "muse"
+    builders = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if "OutboxPublisher" in _names_in(tree):
+            builders.append(path.name)
+
+    assert builders == ["main.py"], (
+        f"the outbox publisher is constructed in {builders}; it belongs in the "
+        "composition root's lifespan and nowhere else"
+    )
 
 
 async def test_the_loop_serves_requests_while_it_drains() -> None:

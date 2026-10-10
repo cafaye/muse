@@ -27,11 +27,14 @@ exposes:
     # invoice. Three segments, publisher-prefixed, snake_case after the service name
     # — core's grammar, with no exceptions.
     #
-    # The action `consumed` is NOT in core's v0 action vocabulary, which the brief
-    # for this packet named explicitly. Implemented as specified and flagged for the
-    # manager: either the vocabulary gains `consumed` or this becomes
-    # `muse.usage.recorded`, which is in the list and already used by billing for a
-    # different thing. Both are one-line changes; the vocabulary is core's to decide.
+    # The action `consumed` was flagged as outside core's v0 action vocabulary by the
+    # brief that named this event, and core has since catalogued it: DECISIONS.md D9
+    # rules "`consumed` joins the action vocabulary", on the grounds that the list is
+    # the actions the platform has and not the verbs English has. The alternative was
+    # `muse.usage.recorded`, already in the list and already used by billing for a
+    # different fact on a different subject, and D9 rejected it as a naming collision.
+    # So the type stands, and the run that checked this file against core's catalog
+    # (`test_openapi.py::...fleet_registry`) is what now holds it there.
     #
     # `data` carries exactly five fields — model, provider, tokens_in, tokens_out,
     # cost_micros — because core closes payload schemas with

@@ -230,21 +230,32 @@ gate:
       # deleted, which is the fifth time this clause has caught a real possibility
       # rather than a hypothetical one.
       #
-      # RAISED 1039 -> 1061 by broker/muse-brk3, which started the outbox publisher and
-      # added 22 tests and no core-gated ones. Measured, not counted:
+      # RAISED 1039 -> 1063 by broker/muse-brk3, which started the outbox publisher and
+      # added 24 tests and no core-gated ones. Measured on both sides of the clause,
+      # not counted, and the first pass at this note got it wrong by two: it was
+      # written from the run *before* the two structural guards landed and left a floor
+      # of 1061 over a suite of 1063, which is the ratchet disarmed by exactly the
+      # margin rule 23 exists to catch.
       #
-      #   uv run pytest (no checkout)   -> 1057 passed, 4 skipped
+      #   uv run pytest (no checkout)                     -> 1059 passed, 4 skipped
+      #   MUSE_CORE_SCHEMAS=<core>/schemas uv run pytest  -> 1063 passed, exit 0
       #
-      # 1057 + 4 = 1061. Nine of the 22 are the redaction guard in `test_outbox.py`
+      # 1059 + 4 = 1063, so the floor is exact on both sides with no compensating
+      # failure. Nine of the 24 are the redaction guard in `test_outbox.py`
       # (a prompt, a completion, a nested payload, a credential, the field list, the
       # empty-collection terminal case, the refused row, and the event muse actually
       # emits still publishing); thirteen are `tests/test_outbox_wiring.py`, which
       # asserts delivery against a stand-in broker client rather than against a
       # mocked-out function, and holds the two conditions -- no `NATS_URL` no loop, no
-      # `MUSE_DATABASE_URL` no loop -- plus the shutdown. Left at 1039 it would have
-      # cleared a run 22 tests short, which is the sixth time this clause has caught a
-      # real possibility.
-      minimum: 1061
+      # `MUSE_DATABASE_URL` no loop -- plus the shutdown. Two of the 24 are structural
+      # guards over `src/muse/main.py` that no transport which publishes nowhere is
+      # wired and that the publisher is constructed only by the lifespan; both were
+      # broken on purpose to confirm they go red, and the first draft of the first one
+      # did not, because it collected `ast.Name` and `ast.Attribute` but not
+      # `ast.alias` -- so `from muse.outbox import InMemoryTransport` in main.py sailed
+      # straight through. Left at 1039 it would have cleared a run 24 tests short, which
+      # is the sixth time this clause has caught a real possibility.
+      minimum: 1063
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

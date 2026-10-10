@@ -12,9 +12,12 @@ byte-identical to the schema whenever `MUSE_CORE_SCHEMAS` points at a core
 checkout, so a change on either side fails a test rather than drifting.
 
 `muse.tokens.consumed` follows the grammar — `<service>.<entity>.<action>`, three
-segments, publisher-prefixed. The action `consumed` is not in core's v0 action
-vocabulary; the packet brief names it, so it is used as specified and flagged for
-the manager (see the worker report).
+segments, publisher-prefixed. The action `consumed` **is** in core's action
+vocabulary: the packet brief that named this event flagged it as absent and left the
+verdict open, and core's DECISIONS.md D9 settled it — "`consumed` joins the action
+vocabulary", because the vocabulary is a list of actions the platform has rather than
+a list of verbs English has. The event type therefore stays as it is, and this note
+records where the earlier comment was wrong rather than quietly deleting it.
 """
 
 from __future__ import annotations

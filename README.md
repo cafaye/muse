@@ -79,6 +79,7 @@ can charge for. Defaulting to `sub` would make a user id a tenancy key.
 | `MUSE_JWKS_URL` | `{issuer}/.well-known/jwks.json` | An explicit key-set URL, for a mirror. |
 | `MUSE_JWKS_TTL_SECONDS` | `300` | How long a fetched key set is reused. |
 | `MUSE_JWKS_REFRESH_SECONDS` | `30` | Floor between two forced refreshes. |
+| `NATS_URL` | unset | The broker the outbox publisher drains onto. **Unset is the shipped state**: no loop starts, `outbox_events` accumulates, and the rows drain the moment a broker is configured. Requires `MUSE_DATABASE_URL` too — a broker with no outbox table to drain starts nothing. |
 
 These **default** rather than being required, which is the opposite of `MUSE_VAULT_KEY`
 and deliberate: a wrong issuer or audience cannot make a bad token good, so the worst a

@@ -377,6 +377,19 @@ services:
       # issuer that does exist is a worse failure. Set it when identity is running.
       # MUSE_IDENTITY_ISSUER: http://identity:8080
 
+      # THE OUTBOX PUBLISHER'S BUS, and commented out for the same reason as the
+      # issuer above with a second reason of its own: the broker's compose SERVICE
+      # NAME is kit's to name (BRK-1 installed it), and a URL pointing at a host
+      # that does not exist is worse than one nobody set. With this unset the
+      # publisher loop does not start and `outbox_events` accumulates -- the honest
+      # shape of "not wired yet", which drains the moment this line is set. With it
+      # set, muse publishes every metered completion to the `muse.tokens.consumed`
+      # subject, so the STACK must also define a JetStream stream whose filter
+      # covers `muse.>`; a broker with no such stream refuses every publish, and
+      # the refusal is loud (`attempts` climbs, a warning names it) rather than
+      # silent.
+      # NATS_URL: nats://nats:4222
+
     # The database, and ONLY the database. Not the collector, for the reason at the
     # top of this file. `service_healthy` rather than `service_started` because
     # kit's probe is a real query against the admin database, so `healthy` here
