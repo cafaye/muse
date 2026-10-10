@@ -217,7 +217,19 @@ gate:
       # plus the guards that had to learn about two new paths: six in
       # `test_openapi.py` for the documents and two enumeration rows in
       # `test_tenant_scoping.py`.
-      minimum: 1037
+      # RAISED 1037 -> 1039 by muse-tgc3, which added TWO tests and no core-gated ones.
+      # Measured on both sides of the clause rather than counted by hand, which is what
+      # every paragraph above insists on:
+      #
+      #   uv run pytest (no checkout)                      -> 1035 passed, 4 skipped
+      #   MUSE_CORE_SCHEMAS=<core>/schemas uv run pytest   -> 1039 passed, exit 0
+      #
+      # 1035 + 4 = 1039, so the floor is exact on both sides with no compensating
+      # failure. Left at 1037 it would have cleared a run two tests short — at this
+      # margin that is the difference between a drift guard existing and having been
+      # deleted, which is the fifth time this clause has caught a real possibility
+      # rather than a hypothetical one.
+      minimum: 1039
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
