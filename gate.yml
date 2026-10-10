@@ -229,7 +229,22 @@ gate:
       # margin that is the difference between a drift guard existing and having been
       # deleted, which is the fifth time this clause has caught a real possibility
       # rather than a hypothetical one.
-      minimum: 1039
+      #
+      # RAISED 1039 -> 1061 by broker/muse-brk3, which started the outbox publisher and
+      # added 22 tests and no core-gated ones. Measured, not counted:
+      #
+      #   uv run pytest (no checkout)   -> 1057 passed, 4 skipped
+      #
+      # 1057 + 4 = 1061. Nine of the 22 are the redaction guard in `test_outbox.py`
+      # (a prompt, a completion, a nested payload, a credential, the field list, the
+      # empty-collection terminal case, the refused row, and the event muse actually
+      # emits still publishing); thirteen are `tests/test_outbox_wiring.py`, which
+      # asserts delivery against a stand-in broker client rather than against a
+      # mocked-out function, and holds the two conditions -- no `NATS_URL` no loop, no
+      # `MUSE_DATABASE_URL` no loop -- plus the shutdown. Left at 1039 it would have
+      # cleared a run 22 tests short, which is the sixth time this clause has caught a
+      # real possibility.
+      minimum: 1061
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the

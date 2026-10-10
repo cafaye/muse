@@ -21,15 +21,18 @@ first request.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import time
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
+import nats
 from fastapi import FastAPI, Request
 from opentelemetry import context as context_api
 from opentelemetry.trace import Span
@@ -51,6 +54,8 @@ from muse.jwks import (
     JwksClient,
 )
 from muse.metering import Meter
+from muse.nats import NatsTransport
+from muse.outbox import OutboxPublisher
 from muse.providers import LiteLLMProvider, ProviderRegistry
 from muse.providers.credentials import CredentialResolver, VaultCredentials
 from muse.redaction import Secret
@@ -69,6 +74,8 @@ from muse.vault import Vault, load_vault_key
 APP_TITLE = "muse"
 APP_VERSION = "0.3.0"
 APP_DESCRIPTION = "LLM routing, credentials vault, and token metering for cafaye."
+
+logger = logging.getLogger("muse")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_ROUTES = REPO_ROOT / "config" / "routes.yaml"
@@ -156,6 +163,16 @@ class Settings:
     #: on an unknown `kid`. The second is the amplification control (see `muse.jwks`).
     jwks_ttl_seconds: float = DEFAULT_TTL_SECONDS
     jwks_refresh_interval: float = DEFAULT_REFRESH_INTERVAL_SECONDS
+    #: The broker the outbox publisher publishes to, or `None` for "no bus".
+    #:
+    #: Unset is the *shipped state* and not an error, and the reasoning is identity's
+    #: (`cmd/identity/main.go`): the table, the loop and the transport interface all
+    #: exist, so a deployment that has not wired a broker accumulates rows in
+    #: `outbox_events` and drains them the moment one is configured. The rows are the
+    #: promise. A `NoopPublisher` that marked everything published and drained the
+    #: outbox into nowhere would keep that promise by discarding it, which is worse
+    #: than honest accumulation — so muse has no no-op transport at all.
+    nats_url: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -180,6 +197,7 @@ class Settings:
             jwks_refresh_interval=_positive_float(
                 source, "MUSE_JWKS_REFRESH_SECONDS", DEFAULT_REFRESH_INTERVAL_SECONDS
             ),
+            nats_url=source.get("NATS_URL") or None,
         )
 
 
@@ -314,6 +332,55 @@ async def build_container(settings: Settings) -> Container:
         auth=auth,
         telemetry=telemetry,
     )
+
+
+#: The broker dial. A module-level name rather than a bare default argument so a test
+#: can replace it (AGENTS.md rule 3: no socket in tests) and so the replacement is
+#: visible in one place rather than threaded through a keyword nobody reads.
+logger = logging.getLogger("muse")
+
+
+#: The broker dial. A module-level name rather than a bare default argument so a test
+#: can replace it (AGENTS.md rule 3: no socket in tests) and so the replacement is
+#: visible in one place rather than threaded through a keyword nobody reads.
+nats_connect = nats.connect
+
+
+def outbox_transport(
+    container: Container,
+    *,
+    connect: Callable[[str], Awaitable[Any]] | None = None,
+) -> NatsTransport | None:
+    """The transport the outbox publisher publishes through, or `None` for no bus.
+
+    The whole of the bus wiring, and it is a decision about the deployment rather than
+    about the code: **no `NATS_URL`, no loop.** The rows are the promise and they
+    accumulate until a broker is configured, which is the honest shape of "not started
+    yet" — the alternative is a no-op publisher that marks every event published and
+    drains the outbox into nowhere.
+
+    The second condition is the database, for identity's reason: `NATS_URL` set and no
+    `MUSE_DATABASE_URL` is a misconfiguration, and a loop whose claimer cannot transact
+    would raise on every pass rather than drain anything. There is no outbox table to
+    drain without a store, so the loop does not start and the log says which of the two
+    it is.
+
+    `connect` exists for the suite. Production passes nothing and gets `nats_connect`.
+    """
+    url = container.settings.nats_url
+    if not url:
+        logger.info(
+            "NATS_URL is not set; the outbox publisher is not started, and metered "
+            "events accumulate in outbox_events until a broker is configured"
+        )
+        return None
+    if isinstance(container.database, _UnavailableDatabase):
+        logger.warning(
+            "NATS_URL is set but MUSE_DATABASE_URL is not; there is no outbox table to "
+            "drain, so the publisher loop is not started"
+        )
+        return None
+    return NatsTransport(url, connect=connect or nats_connect)
 
 
 def _build_auth(settings: Settings) -> TokenVerifier:
@@ -520,7 +587,40 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         # request span and the router's spans come from the same tracer — two
         # tracers would produce two disjoint traces under one trace id.
         app.state.telemetry = app.state.container.telemetry
-        yield
+        # THE OUTBOX PUBLISHER — the one piece of process wiring that is not an HTTP
+        # surface, and the reason this packet exists. It moves committed events from
+        # `outbox_events` onto the bus, and it runs for as long as the app does: the
+        # lifespan's shutdown is this process's context, the same one uvicorn's own
+        # drain waits on, so a SIGTERM stops both. `for update skip locked` in the
+        # claim query is what lets N replicas — N workers, or N pods — run this loop
+        # against one table without waiting on each other.
+        #
+        # It is deliberately *not* started unconditionally. See `outbox_transport`: no
+        # `NATS_URL` is the shipped state, and the honest accumulation of rows is the
+        # documented outcome rather than a missing feature.
+        transport = outbox_transport(app.state.container)
+        if transport is None:
+            yield
+            return
+        publisher = OutboxPublisher(app.state.container.database, transport)
+        app.state.outbox_publisher = publisher
+        stop = asyncio.Event()
+        loop = asyncio.create_task(publisher.run(stop=stop), name="muse-outbox-publisher")
+        try:
+            yield
+        finally:
+            # `stop` is the graceful signal — the loop notices it at the next pass
+            # boundary — and the cancel is the escalation: a loop sitting in its
+            # one-second idle sleep would otherwise hold shutdown open for the rest of
+            # that second. A cancel mid-pass is safe by construction, because a
+            # transaction the loop loses is one it rolls back, and a publish it loses
+            # is a row it never marked.
+            stop.set()
+            loop.cancel()
+            with suppress(asyncio.CancelledError):
+                await loop
+            await transport.close()
+            app.state.outbox_publisher = None
 
     app = FastAPI(
         title=APP_TITLE,

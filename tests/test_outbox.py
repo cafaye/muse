@@ -379,6 +379,14 @@ async def test_a_metered_completion_still_publishes() -> None:
     assert [subject for subject, _ in transport.published] == ["muse.tokens.consumed"]
 
 
+def test_an_empty_collection_carries_nothing() -> None:
+    """The walk's terminal case, and the one that matters for a payload with a list that
+    happens to be empty: an empty list carries no caller text, so refusing it would
+    refuse an event that is safe to publish. Asserted because the walk's exit path is
+    only reachable here."""
+    assert row(data={"calls": [], "nested": {"deep": {}}}).envelope()["data"]["calls"] == []
+
+
 def test_the_backoff_starts_at_one_second() -> None:
     assert backoff_seconds(1) == 1.0
 
