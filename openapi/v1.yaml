@@ -146,9 +146,9 @@ info:
     If that event cannot be written, the request fails. The completion has already
     been paid for, and returning it without its record would lose the spend silently.
   license:
-    name: MIT
-    identifier: MIT
-    url: https://opensource.org/license/mit
+    name: Business Source License 1.1
+    identifier: BUSL-1.1
+    url: https://mariadb.com/bsl11/
   contact:
     name: muse
     email: muse@cafaye.com

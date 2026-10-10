@@ -584,11 +584,28 @@ nobody knows is a gate.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). `pyproject.toml` declares the same thing.
+**Business Source Licence 1.1.** See [LICENSE](LICENSE) — the full text, with
+Licensor `Cafaye`, Licensed Work `muse`, Change Date `2030-10-10`, Change
+Licence `Apache-2.0` and no Additional Use Grant. `pyproject.toml` declares the
+same grant by pointing at that file rather than restating it, and
+`openapi/v1.yaml` carries the same one in its `info.license` block, so the
+three surfaces a reader or an SDK generator might look at say one thing.
 
-This was AGPL-3.0-only and is MIT now. The reason is the registry model: muse is
-consumed as one node in a dependency graph looked up through pantry, and
-copyleft would attach an obligation to every downstream consumer of every node
-that reached it. A dependency you can add without your own licensing situation
-changing is the thing the registry is for, and copyleft is the one choice that
-makes it not that.
+**The grant is BSL now. It was MIT, and it was AGPL-3.0-only before that.**
+Both of the earlier grants were published, so anyone who already holds a copy
+of muse keeps the grant that copy was published under — this reversal removes
+nothing from anyone holding one (OPS-D3). It is said here, on the licence
+page, rather than left for a reader to discover by diffing the manifest: a
+grant that changes without being named looks like a bait-and-switch to anyone
+who read the old one, and the ambiguity is worse than either licence. The MIT
+transition itself, and the registry-model reasoning behind it, are recorded in
+the changelog — that entry is history, and it is not rewritten.
+
+Why BSL and not back to MIT: muse is one of the platform's *services*, and the
+services are licensed under a Business Source Licence — free to run, free to
+self-host, never to offer a competing service — while the framework
+repositories stay permissive because their job is adoption (OPS-D2). BSL
+rather than AGPL, because the buyers are teams and AGPL makes their lawyers
+twitchy. The stock terms are the whole grant: there is no Additional Use Grant
+layering production rights on top, so read LICENSE as written. And read the
+clock, because on the Change Date this grant becomes Apache-2.0 for everyone.

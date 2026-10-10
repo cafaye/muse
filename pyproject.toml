@@ -3,13 +3,15 @@ name = "muse"
 version = "0.2.0"
 description = "muse — LLM routing, credentials vault, token metering for cafaye"
 readme = "README.md"
-# MIT, fleet-wide and without exception. This was AGPL-3.0-only until the
-# licence packet: the platforms are consumed as a dependency graph through a
-# service registry, and copyleft would make every downstream consumer inherit
-# an obligation, which defeats the registry model. The LICENSE file at the
-# repository root is the grant; this line is the metadata that travels with the
-# package. They agree, deliberately, and `license-files` below is what carries
-# the file into the wheel.
+# Business Source Licence 1.1 — the grant the platform's services carry
+# (OPS-D2, CAFAYE-OPS.md). The LICENSE file at the repository root is the
+# grant; this line is the metadata that travels with the package, and it points
+# at that file rather than restating the terms, so the two cannot drift. What
+# is in the file now is the BSL text; the earlier grants, and who keeps which,
+# are recorded in README.md#License — stated there and deliberately not here,
+# so this manifest carries no licence string older than the grant it declares.
+# The wheel carries the file with the metadata, which is the one place a reader
+# of the installed package can still find the grant.
 license = { file = "LICENSE" }
 requires-python = ">=3.14"
 dependencies = [

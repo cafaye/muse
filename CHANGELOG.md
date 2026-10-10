@@ -5,6 +5,29 @@ conventional-compat (0.x, so anything may change while pre-1.0).
 
 ## [Unreleased]
 
+### OPS-P1 — the grant is BSL, and the reversal is said out loud
+
+The grant is Business Source Licence 1.1: Licensor `Cafaye`, Licensed Work
+`muse`, Change Date `2030-10-10`, Change Licence `Apache-2.0`, no Additional
+Use Grant. This is a deliberate move down from MIT, not drift (OPS-D2,
+OPS-D3): muse is one of the platform's services, the services carry the BSL,
+and the framework repositories stay permissive because their job is adoption.
+
+`LICENSE` is the BSL text, worded uniformly across the fleet's service grants
+so a reader diffing two repositories sees only the Licensed Work name differ.
+`pyproject.toml` keeps `license = { file = "LICENSE" }` — the metadata points
+at the grant rather than restating it — and `openapi/v1.yaml`'s `info.license`
+moves to the same grant. All of it moves in one commit, because a grant and
+its declarations landing in different commits is exactly the shape OPS-D3
+exists to prevent.
+
+The reversal is stated where a reader will find it: `README.md`#License says
+the grant is now BSL, that it was MIT, that it was AGPL-3.0-only before that,
+and that anyone holding an earlier copy keeps the grant that copy was
+published under — the reversal removes nothing from anyone already holding a
+copy. The earlier licence entry below (the move to MIT) is history and is left
+exactly as written.
+
 ### muse-04 — the vendored traces schema had drifted, and a span was paying for it
 
 `master` was red, and had been for several packets, on exactly one test:
