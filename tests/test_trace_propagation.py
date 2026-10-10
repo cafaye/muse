@@ -22,19 +22,23 @@ the header is added by the adapter and a double would prove nothing about it.
 from __future__ import annotations
 
 import json
+import logging
 from functools import cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from jsonschema import Draft202012Validator
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from muse.breaker import BreakerRegistry
+from muse.errors import ContentPolicyError
 from muse.errortype import SCHEMA_PATH
 from muse.main import Container, Settings, create_app
 from muse.metering import Meter
 from muse.providers import Completion, LiteLLMProvider, Price, ProviderRegistry
 from muse.providers.credentials import StaticCredentials
-from muse.providers.fake import FakeProvider
+from muse.providers.fake import FakeProvider, ScriptedProvider
 from muse.redaction import Secret
 from muse.router import Router
 from muse.routes import RouteTable, routes_from_yaml
@@ -47,6 +51,9 @@ from .support.litellm_stub import make_stub
 from .support.test_app import TEST_KEY, auth_for
 from .support.tracing import by_name, names, payloads, recording_telemetry, rendered
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 pytestmark = [pytest.mark.anyio, pytest.mark.integration]
 
 #: The caller's trace. W3C's own example, so a reader can check it against the spec.
@@ -58,6 +65,13 @@ INBOUND = f"00-{INBOUND_TRACE_ID}-{INBOUND_SPAN_ID}-01"
 #: prompt, in the completion, and — to catch an error path that echoes one into the
 #: other — nowhere else, so a hit in the payload is unambiguous.
 CANARY = "CANARY-9f3a1c7e-DO-NOT-EXPORT"
+
+#: Every word that names content rather than shape. A span attribute named for one of
+#: these is a span attribute somebody will eventually fill with the thing it names, so
+#: the canary asserts their absence over **every** span in the export. The list is the
+#: one `tests/test_telemetry.py` holds the allowlist to, minus the credential words —
+#: the credential has its own canary in `tests/test_auth.py`.
+CONTENT_WORDS = ("prompt", "message", "content", "text", "body", "header", "query")
 
 
 def _table(provider: str = "openai", model: str = "fast") -> RouteTable:
@@ -636,6 +650,66 @@ async def test_the_breaker_state_is_recorded_on_the_provider_span() -> None:
 # --- THE CANARY ------------------------------------------------------------
 
 
+def assert_no_content_reached_a_span(
+    exporter: InMemorySpanExporter,
+    records: Sequence[logging.LogRecord] = (),
+) -> None:
+    """**The redaction boundary, asserted once so every entry point holds to it.**
+
+    The shape the fleet's security notes standardise on, and the reason it is a
+    function rather than three copies of a loop:
+
+    - **The floor first.** `names(exporter)` must be non-empty, because "the canary
+      is absent" is equally true of an export that produced nothing. A boundary that
+      drops all telemetry passes every absence assertion in this file, which is why
+      the positive half — the request really was served — is asserted by each caller
+      before it gets here.
+    - **The rendered payload, as one string.** `repr(payloads(exporter))` holds every
+      attribute of every span, so a leak through a key nobody predicted is caught by
+      a value search rather than missed by a name-by-name walk. This is the half a
+      key-by-key assertion cannot do.
+    - **The attribute-name half, over EVERY span.** Not only the two the first draft
+      of this test knew about: `muse.request` is opened by the middleware
+      (`main.py`) before any route is chosen, and a span whose names nobody checked
+      is a span whose names nobody checks. The words are the ones that name content
+      rather than shape — a span attribute named for one of them is a span attribute
+      somebody will eventually fill with the thing it names.
+    - **The log records.** A span is one destination; a retained log is the other,
+      and `tests/test_auth.py` holds the credential to both. Prompt and completion
+      text is no different in kind.
+
+    Every caller drives a real request through the real app and asserts the canary
+    came back in the response body *first*, so an absence here means something.
+    """
+    spans = payloads(exporter)
+    assert names(exporter), "no spans were exported, so absence proves nothing"
+
+    exported = rendered(exporter)
+    assert CANARY not in exported, (
+        "THE REDACTION BOUNDARY LEAKED.\n\n"
+        f"{CANARY!r} reached an exportable span attribute. It was planted in the prompt "
+        "and in the completion, so whatever route it took is a route by which one "
+        "tenant's prompt reaches a searchable, retained, widely-readable store — and on "
+        "a shared deployment that is a cross-tenant read.\n\nThe whole export:\n"
+        f"{exported}"
+    )
+
+    for span in spans:
+        for name in span["attributes"]:
+            assert not any(word in name.lower() for word in CONTENT_WORDS), (
+                f"the span {span['name']!r} carries an attribute named {name!r}, which "
+                "names content rather than shape. Whatever a future change puts in it "
+                f"would not be caught by the value search above.\n\nThe whole export:\n"
+                f"{exported}"
+            )
+
+    for record in records:
+        assert CANARY not in record.getMessage(), (
+            f"the prompt or the completion reached a log record at "
+            f"{record.levelname}: {record.getMessage()!r}"
+        )
+
+
 async def test_no_span_attribute_carries_prompt_or_completion_text() -> None:
     """The security assertion, end to end, through the real app.
 
@@ -667,16 +741,8 @@ async def test_no_span_attribute_carries_prompt_or_completion_text() -> None:
     # The request really did carry the canary, or the test proves nothing.
     assert response.status_code == 200
     assert CANARY in response.json()["choices"][0]["message"]["content"]
-    assert names(exporter), "no spans were exported, so absence proves nothing"
 
-    # ... and none of it reached a span.
-    assert CANARY not in rendered(exporter)
-    for span in by_name(exporter, "muse.provider.call") + by_name(exporter, "muse.route"):
-        for name in span["attributes"]:
-            assert not any(
-                word in name.lower()
-                for word in ("prompt", "message", "content", "text", "body", "header")
-            )
+    assert_no_content_reached_a_span(exporter)
 
 
 async def test_a_provider_echoing_the_credential_is_not_recorded_on_a_span() -> None:
@@ -748,6 +814,86 @@ async def test_a_held_credential_never_reaches_a_span() -> None:
     assert response.status_code == 503
     assert "sk-live-XYZ" not in rendered(exporter)
     assert "sk-live-XYZ" not in response.headers[TRACEPARENT_HEADER]
+
+
+async def test_the_openai_alias_carries_no_prompt_or_completion_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same boundary, through the second entry point.
+
+    `POST /v1/chat/completions` delegates to `serve_completion`, so the routing, the
+    spans and the metering are the same code — and an assertion that only ever drove
+    `/v1/route` would be proving the property of one path while a second path served
+    the same content. It is the rule 24 lesson again: a second body is not a second
+    implementation, but the path is new, so the guarantee has to be asserted on the
+    new path rather than inferred from the old one.
+
+    The response shape is OpenAI's, so the canary has to come back through
+    `choices[0].message.content` for the absence below to mean anything.
+    """
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        FakeProvider(
+            name="openai",
+            content=f"echoing back: {CANARY}",
+            price=Price(1000, 2000),
+        )
+    )
+    app = _app(registry, _table(), telemetry)
+
+    with caplog.at_level(logging.DEBUG):
+        async with asgi_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=_body(content=f"my prompt contains {CANARY}"),
+                headers={**AUTH_HEADERS, TRACEPARENT_HEADER: INBOUND},
+            )
+
+    # The floor: the alias really did serve a completion carrying the canary.
+    assert response.status_code == 200
+    assert CANARY in response.json()["choices"][0]["message"]["content"]
+
+    assert_no_content_reached_a_span(exporter, caplog.records)
+
+
+async def test_a_content_policy_rejection_records_the_class_and_not_the_quoted_text() -> None:
+    """The failure path, which is where a leak is likeliest.
+
+    A vendor's content-policy rejection quotes the offending content back — that is
+    the whole reason `error.message` is not an allowlisted attribute. The message
+    travels the `CandidateFailure.detail` chain, which is scrubbed text by the time
+    it reaches a caller; this asserts it never reaches a *span* either, and that what
+    does reach it is `provider_rejected`, a class with no content in it.
+    """
+    telemetry, exporter = recording_telemetry()
+    registry = ProviderRegistry()
+    registry.register(
+        ScriptedProvider(
+            name="openai",
+            price=Price(1000, 2000),
+            errors=(ContentPolicyError(f"{CANARY} violates the usage policy"),),
+        )
+    )
+    app = _app(registry, _table(), telemetry)
+
+    async with asgi_client(app) as client:
+        response = await client.post(
+            "/v1/route",
+            json=_body(content=f"my prompt contains {CANARY}"),
+            headers={**AUTH_HEADERS, TRACEPARENT_HEADER: INBOUND},
+        )
+
+    assert response.status_code == 503
+    assert CANARY not in response.json()["detail"]
+
+    # The span recorded the class, and the class is the fleet's vocabulary word for
+    # "the vendor refused the request" rather than muse's own class name.
+    span = by_name(exporter, "muse.provider.call")[0]
+    assert span["status"] == "error"
+    assert span["attributes"]["error.type"] == "provider_rejected"
+
+    assert_no_content_reached_a_span(exporter)
 
 
 def test_a_completion_content_value_is_not_an_allowlisted_attribute() -> None:
