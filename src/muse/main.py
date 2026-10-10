@@ -337,12 +337,6 @@ async def build_container(settings: Settings) -> Container:
 #: The broker dial. A module-level name rather than a bare default argument so a test
 #: can replace it (AGENTS.md rule 3: no socket in tests) and so the replacement is
 #: visible in one place rather than threaded through a keyword nobody reads.
-logger = logging.getLogger("muse")
-
-
-#: The broker dial. A module-level name rather than a bare default argument so a test
-#: can replace it (AGENTS.md rule 3: no socket in tests) and so the replacement is
-#: visible in one place rather than threaded through a keyword nobody reads.
 nats_connect = nats.connect
 
 

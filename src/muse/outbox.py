@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,12 +52,6 @@ DEFAULT_BATCH_SIZE = 100
 #: Past the cap the row is left alone and `attempts` keeps growing, which is the signal
 #: an alert is built on — see the note in `backoff_seconds`.
 MAX_BACKOFF_SECONDS = 300.0
-
-#: The first exponent whose `2 ** n` is already at or past the cap, so the comparison
-#: in `backoff_seconds` can be made *before* the power is taken. Derived from the cap
-#: rather than written as a literal so a changed ceiling cannot leave this stale: with
-#: a 300s cap it is 9, because `2 ** 8` is 256 and `2 ** 9` is 512.
-_CAP_EXPONENT = math.ceil(math.log2(MAX_BACKOFF_SECONDS))
 
 #: A row this old is past every plausible outage. core's guidance is to alert and leave
 #: it alone rather than drop it: an event that is stuck is an incident, an event that
@@ -101,10 +94,20 @@ FORBIDDEN_PAYLOAD_FIELDS = frozenset(
     }
 )
 
-#: The attempt count at which the wait has certainly reached the ceiling. Compared
-#: against *before* exponentiating, so a row that has been failing for a month returns
-#: the cap instead of raising `OverflowError`.
-_CAP_EXPONENT = 64
+#: The attempt count past which taking the power is pointless, because `2 ** n` is
+#: already far past the cap. `backoff_seconds` compares against it *before*
+#: exponentiating, so a row that has been failing for a month returns the cap instead
+#: of raising `OverflowError` — the reason this is a named constant rather than an
+#: inline `min(2 ** n, cap)`.
+#:
+#: 64 rather than a number derived from the cap, and deliberately so: the derived
+#: exponent (9, for a 300s cap) is where `2 ** n` first *reaches* the ceiling, and
+#: using it as the comparison would make the cap apply one attempt earlier than the
+#: arithmetic does. 64 keeps every exponent below it finite without that question
+#: arising, and `2 ** 63` still reports the cap through the `min` below. This constant
+#: was defined twice under this one name for a long time — the second assignment
+#: silently won — and the surviving definition is this one.
+_CAP_ATTEMPTS = 64
 
 #: core's claim query, verbatim in shape. The ordering is `(created_at, id)` rather
 #: than `created_at` alone so the order is total: rows written in one transaction share
@@ -355,7 +358,7 @@ def backoff_seconds(attempts: int) -> float:
     """
     if attempts < 1:
         return 0.0
-    if attempts - 1 >= _CAP_EXPONENT:
+    if attempts >= _CAP_ATTEMPTS:
         return MAX_BACKOFF_SECONDS
     return min(2.0 ** (attempts - 1), MAX_BACKOFF_SECONDS)
 

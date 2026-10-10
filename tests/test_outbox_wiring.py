@@ -27,8 +27,10 @@ import dataclasses
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import nats
 import pytest
 
 from muse.main import Container, Settings, create_app, outbox_transport
@@ -387,7 +389,6 @@ def _original_connect(main: Any) -> Any:
     A test that replaced `main.nats_connect` and left it there would be a test that
     handed every later test in the process a fake broker.
     """
-    import nats
 
     return nats.connect
 
@@ -518,8 +519,6 @@ def test_no_transport_that_publishes_nowhere_is_wired() -> None:
     wired is exactly where the name would otherwise appear — and collected through
     `_names_in`, which was wrong once and was fixed by breaking it.
     """
-    import ast
-    from pathlib import Path
 
     source = Path(__file__).resolve().parent.parent / "src" / "muse" / "main.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -543,8 +542,6 @@ def test_the_publisher_is_constructed_only_by_the_lifespan() -> None:
     network call for every completion muse serves, which is the arrangement the outbox
     exists to avoid. So exactly one module constructs it, and it is the composition
     root — `api.py`, the request path, never mentions the publisher at all."""
-    import ast
-    from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent / "src" / "muse"
     builders = []

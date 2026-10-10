@@ -31,7 +31,7 @@
 # entry-point scanner reads `src` and finds the key on fifteen lines:
 #
 #   src/muse/auth.py:6,78,118,160,163,232,289,295,300,303
-#   src/muse/errors.py:269,271
+#   src/muse/errors.py:289,291
 #   src/muse/metering.py:21,31
 #   src/muse/schemas/telemetry/traces.schema.json:203
 #
@@ -56,6 +56,20 @@
 # passes, `tenancy.enumeration-partial` names the same fifteen lines as the
 # honest residue of a SQL scanner reading a Python service, and
 # `tenancy.scope-key-unused` is the honest "no statement carries the key".
+#
+# THE PINS ARE LINE NUMBERS, AND THAT IS THE FRAGILE PART. An insertion
+# anywhere above a vouched line moves it and silently un-declares it, which
+# is exactly what happened on the first attempt at the broker packet
+# (BRK-3R): a class added to `src/muse/errors.py` moved `MissingAccount`'s
+# docstring from 269 to 289, and nothing in this repository read the
+# declaration, so the suite was green while `tenancy-check` was red. The
+# declaration was audited only from outside the repository that owns it.
+# `tests/test_tenant_scoping.py`'s Guard 3 now closes that: it mirrors core's
+# scan over `src` and asserts the declared pins are the tree's pins, in both
+# directions. It is a mirror and not an import — core is another repository,
+# and a service that vendored the checker would be a service that could edit
+# it — so the authority stays core's checker and this guard's job is to fail
+# a *packet* rather than a *merge*.
 version: 1
 service: muse
 
@@ -107,11 +121,11 @@ scope:
       line: 303
       reason: the MissingAccount message names the failed check; an error string, not a row predicate
     - file: src/muse/errors.py
-      line: 269
-      reason: MissingAccount docstring — the refusal when a verified token carries no usable account; a 401, not a scope
+      line: 289
+      reason: MissingAccount docstring — a verified token carrying no usable account is refused with a 401; an authorization rule about the token, and no row is read or scoped
     - file: src/muse/errors.py
-      line: 271
-      reason: MissingAccount docstring — explains the billing reason for the refusal; no row is read or written
+      line: 291
+      reason: MissingAccount docstring — gives the billing reason for that refusal; prose describing the claim check, not a predicate on any table
     - file: src/muse/metering.py
       line: 21
       reason: module docstring — the account is known since muse-06 but deliberately not written; the named D9 gap
