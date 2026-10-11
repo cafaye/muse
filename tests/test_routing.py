@@ -31,7 +31,7 @@ async def test_unknown_path_returns_problem_json(client) -> None:
 
     assert response.headers["content-type"].startswith("application/problem+json")
     assert response.json() == {
-        "type": "https://errors.cafaye.com/not_found",
+        "type": "https://docs.cafaye.com/errors/not_found",
         "title": "Not found",
         "status": 404,
         "detail": "Not Found",

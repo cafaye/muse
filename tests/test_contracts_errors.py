@@ -129,7 +129,7 @@ async def test_a_bug_in_muse_says_nothing_about_itself() -> None:
 
     assert response.status_code == 500
     assert response.json() == {
-        "type": "https://errors.cafaye.com/internal",
+        "type": "https://docs.cafaye.com/errors/internal",
         "title": "Internal error",
         "status": 500,
         "detail": "an unexpected error occurred",

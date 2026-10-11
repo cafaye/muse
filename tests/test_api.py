@@ -436,7 +436,7 @@ async def test_an_unauthorized_body_is_problem_json() -> None:
     async with asgi_client(app_for(serving())) as client:
         response = await client.post("/v1/route", json=BODY)
     assert response.headers["content-type"].startswith("application/problem+json")
-    assert response.json()["type"] == "https://errors.cafaye.com/unauthorized"
+    assert response.json()["type"] == "https://docs.cafaye.com/errors/unauthorized"
     assert response.json()["status"] == 401
     assert response.json()["instance"] == "/v1/route"
 
@@ -610,7 +610,7 @@ async def test_a_method_error_is_problem_json() -> None:
     body = response.json()
     assert body["status"] == 405
     assert body["code"] == "not_found"
-    assert body["type"] == "https://errors.cafaye.com/not_found"
+    assert body["type"] == "https://docs.cafaye.com/errors/not_found"
 
 
 async def test_an_unknown_path_is_problem_json() -> None:

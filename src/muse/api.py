@@ -56,7 +56,7 @@ from muse.errors import (
 
 #: core's error type URIs. Stable, machine-readable, and the last segment is the same
 #: slug as `code`.
-ERROR_BASE = "https://errors.cafaye.com"
+ERROR_BASE = "https://docs.cafaye.com/errors"
 
 #: The reserved codes from core's openapi conventions, and the title each one gets.
 #: A title is a fixed human-readable summary for the code; it may be reworded without

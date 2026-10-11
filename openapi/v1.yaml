@@ -278,7 +278,7 @@ paths:
                 absent:
                   summary: No credential at all
                   value:
-                    type: https://errors.cafaye.com/unauthorized
+                    type: https://docs.cafaye.com/errors/unauthorized
                     title: Unauthorized
                     status: 401
                     detail: a bearer credential is required
@@ -288,7 +288,7 @@ paths:
                 unverifiable:
                   summary: A forged or expired token
                   value:
-                    type: https://errors.cafaye.com/unauthorized
+                    type: https://docs.cafaye.com/errors/unauthorized
                     title: Unauthorized
                     status: 401
                     detail: token has expired
@@ -298,7 +298,7 @@ paths:
                 no-tenant:
                   summary: A valid token with no account
                   value:
-                    type: https://errors.cafaye.com/unauthorized
+                    type: https://docs.cafaye.com/errors/unauthorized
                     title: Unauthorized
                     status: 401
                     detail: token carries no account_id; muse meters per tenant, so a
@@ -326,7 +326,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/forbidden
+                type: https://docs.cafaye.com/errors/forbidden
                 title: Forbidden
                 status: 403
                 detail: token is missing the completions:write scope
@@ -345,7 +345,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/not_found
+                type: https://docs.cafaye.com/errors/not_found
                 title: Not found
                 status: 404
                 detail: no route is configured for model 'gpt-5-turbo'
@@ -382,7 +382,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/validation_failed
+                type: https://docs.cafaye.com/errors/validation_failed
                 title: Validation failed
                 status: 422
                 detail: 'messages.0.role: Input should be ''user'', ''assistant'' or ''system'''
@@ -408,7 +408,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/internal
+                type: https://docs.cafaye.com/errors/internal
                 title: Internal error
                 status: 500
                 detail: an unexpected error occurred
@@ -440,7 +440,7 @@ paths:
                 providers-down:
                   summary: Every candidate failed
                   value:
-                    type: https://errors.cafaye.com/unavailable
+                    type: https://docs.cafaye.com/errors/unavailable
                     title: Service unavailable
                     status: 503
                     detail: >-
@@ -453,7 +453,7 @@ paths:
                 identity-down:
                   summary: The signing keys could not be retrieved
                   value:
-                    type: https://errors.cafaye.com/unavailable
+                    type: https://docs.cafaye.com/errors/unavailable
                     title: Service unavailable
                     status: 503
                     detail: the signing keys at
@@ -564,7 +564,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/unauthorized
+                type: https://docs.cafaye.com/errors/unauthorized
                 title: Unauthorized
                 status: 401
                 detail: a bearer credential is required
@@ -586,7 +586,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/forbidden
+                type: https://docs.cafaye.com/errors/forbidden
                 title: Forbidden
                 status: 403
                 detail: token is missing the completions:write scope
@@ -605,7 +605,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/not_found
+                type: https://docs.cafaye.com/errors/not_found
                 title: Not found
                 status: 404
                 detail: no route is configured for model 'gpt-5-turbo'
@@ -645,7 +645,7 @@ paths:
                 missing-messages:
                   summary: No messages
                   value:
-                    type: https://errors.cafaye.com/validation_failed
+                    type: https://docs.cafaye.com/errors/validation_failed
                     title: Validation failed
                     status: 422
                     detail: 'messages: Field required'
@@ -658,7 +658,7 @@ paths:
                 unsupported-stream:
                   summary: Streaming asked for on a path that does not do it
                   value:
-                    type: https://errors.cafaye.com/validation_failed
+                    type: https://docs.cafaye.com/errors/validation_failed
                     title: Validation failed
                     status: 422
                     detail: "stream: Extra inputs are not permitted"
@@ -683,7 +683,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/internal
+                type: https://docs.cafaye.com/errors/internal
                 title: Internal error
                 status: 500
                 detail: an unexpected error occurred
@@ -718,7 +718,7 @@ paths:
                 providers-down:
                   summary: Every candidate failed
                   value:
-                    type: https://errors.cafaye.com/unavailable
+                    type: https://docs.cafaye.com/errors/unavailable
                     title: Service unavailable
                     status: 503
                     detail: >-
@@ -731,7 +731,7 @@ paths:
                 identity-down:
                   summary: The signing keys could not be retrieved
                   value:
-                    type: https://errors.cafaye.com/unavailable
+                    type: https://docs.cafaye.com/errors/unavailable
                     title: Service unavailable
                     status: 503
                     detail: the signing keys at
@@ -822,7 +822,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/unauthorized
+                type: https://docs.cafaye.com/errors/unauthorized
                 title: Unauthorized
                 status: 401
                 detail: a bearer credential is required
@@ -845,7 +845,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/forbidden
+                type: https://docs.cafaye.com/errors/forbidden
                 title: Forbidden
                 status: 403
                 detail: token is missing the completions:write scope
@@ -875,7 +875,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/internal
+                type: https://docs.cafaye.com/errors/internal
                 title: Internal error
                 status: 500
                 detail: an unexpected error occurred
@@ -898,7 +898,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
               example:
-                type: https://errors.cafaye.com/unavailable
+                type: https://docs.cafaye.com/errors/unavailable
                 title: Service unavailable
                 status: 503
                 detail: the signing keys at
@@ -1310,7 +1310,7 @@ components:
           type: string
           format: uri
           description: |
-            Stable, machine-readable: `https://errors.cafaye.com/<code>`. The last
+            Stable, machine-readable: `https://docs.cafaye.com/errors/<code>`. The last
             segment is always the same slug as `code`.
         title:
           type: string
