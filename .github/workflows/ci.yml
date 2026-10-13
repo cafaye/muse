@@ -107,11 +107,12 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: check out core's schemas
-        # Cross-repository, and therefore deliberately outside the worktree: the
-        # lockfile guard below is a `git diff`, and a second checkout inside the
-        # repository would put a foreign tree in the way of that assertion (and
-        # inside `ruff`'s scan path). `$RUNNER_TEMP/core` keeps the repository
-        # exactly as muse shipped it.
+        # Cross-repository, into the workspace at `core`: actions/checkout
+        # refuses a `path:` outside the workspace (its `is-under` guard throws
+        # `Repository path '...' is not under '...'`), so `$RUNNER_TEMP/core`
+        # is a red build before any step runs. `core` sits beside this
+        # repository rather than inside it, so the lockfile guard below (a
+        # `git diff`) and `ruff`'s scan path never see a foreign tree.
         #
         # `schemas` only, sparse. Both gated tests read files under
         # `core/schemas/`, and `test_openapi.py` locates core by walking *up* to
@@ -127,7 +128,7 @@ jobs:
         with:
           repository: cafaye/core
           ref: ${{ env.CORE_REF }}
-          path: ${{ runner.temp }}/core
+          path: core
           sparse-checkout: schemas
           persist-credentials: false
 
@@ -160,7 +161,7 @@ jobs:
         # keeps a red suite red through the pipe.
         shell: bash
         env:
-          MUSE_CORE_SCHEMAS: ${{ runner.temp }}/core/schemas
+          MUSE_CORE_SCHEMAS: ${{ github.workspace }}/core/schemas
         run: |
           set -euo pipefail
           bin/prime -q -rs 2>&1 | tee "$RUNNER_TEMP/prime.log"
@@ -228,7 +229,7 @@ jobs:
           set -euo pipefail
           broken="$RUNNER_TEMP/core-mutated"
           mkdir -p "$broken"
-          cp -R "$RUNNER_TEMP/core/schemas" "$broken/schemas"
+          cp -R "${{ github.workspace }}/core/schemas" "$broken/schemas"
           python3 - "$broken/schemas/event-envelope.schema.json" <<'PY'
           import json
           import sys
