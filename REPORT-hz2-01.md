@@ -34,15 +34,15 @@ environment-independent.
 
 ### pantry — the billing family, live
 
-Two sibling reads of `../caf`, and they disagree about it:
+Two sibling reads of `../cafe`, and they disagree about it:
 
-1. `bin/prime`'s manifest-lint tier tests `[[ -f ../caf/go.mod ]]` and skips the
+1. `bin/prime`'s manifest-lint tier tests `[[ -f ../cafe/go.mod ]]` and skips the
    whole tier in the worktree — *even with `PANTRY_CAFAYE_ROOT` pointed at the
    workspace*, because that variable gates the Go tier and this shell tier
    ignores it. The skip prints a message, so it is the honest-skip contract
    working; it is still a tier that ran in one environment and not the other.
 2. `cmd/pantry/datastore_declaration_test.go` reads
-   `filepath.Join(root, "..", "caf")` and `t.Skipf`s
+   `filepath.Join(root, "..", "cafe")` and `t.Skipf`s
    `TestTheGeneratedTelemetryPackageIsStillGenerated` in the worktree. That is
    the measured delta: **177 in the worktree, 178 in the main checkout**, one
    skip's worth.
@@ -75,7 +75,7 @@ the explicit, commented fallback for a CI runner with no sibling.
 
 `bin/ci` runs setup, rubocop, bundler-audit, brakeman, rails test and a seed
 step. Grepped `bin/ script/ lib/ config/ Gemfile Rakefile` for `../core`,
-`../caf`, `../kit`: no hits. Its citations live in `.md` prose and `cafaye.yml`
+`../cafe`, `../kit`: no hits. Its citations live in `.md` prose and `cafaye.yml`
 comments only, which the brief says to leave. Nothing was changed here.
 
 ## What was not changed, and why
