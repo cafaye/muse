@@ -73,7 +73,7 @@ def router_builder() -> ast.FunctionDef:
 #: Which method each path is registered under. Stated rather than inferred, because
 #: `/v1/models` being a GET is a contract fact — a stock client discovers models with
 #: GET — and a walk that derived the method would have nothing to compare a change to.
-METHODS = {"/route": "post", "/chat/completions": "post", "/models": "get"}
+METHODS = {"/route": "post", "/chat/completions": "post", "/decisions": "post", "/models": "get"}
 
 
 def endpoint_handlers() -> dict[str, ast.AsyncFunctionDef]:
@@ -135,7 +135,7 @@ def test_the_router_registers_exactly_three_endpoints():
     against a stated intent, so a path added to both the code and the document — which
     would leave the other test perfectly green — still needs a deliberate edit here.
     """
-    assert sorted(endpoint_handlers()) == ["/chat/completions", "/models", "/route"]
+    assert sorted(endpoint_handlers()) == ["/chat/completions", "/decisions", "/models", "/route"]
 
 
 def test_the_paths_are_registered_under_the_methods_the_contract_says():

@@ -82,6 +82,13 @@ NO_SUCH_ACCOUNT = "01HQ000000000000000000000ZZ"
 MODEL = "gpt-4o-mini"
 PRICE = Price(150, 600)
 BODY = {"model": "fast", "messages": [{"role": "user", "content": "hello"}]}
+# The decisions twin of `BODY`, for the entry point that shares every property of
+# the two above it.
+DECISION_BODY = {
+    "model": "fast",
+    "input": "hello",
+    "questions": [{"type": "noul", "instructions": "is this a refund?"}],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,18 @@ POST_CHAT_COMPLETIONS = EntryPoint(
     "read",
     "ACCOUNT",
     "test_the_alias_carries_no_account_and_emits_the_same_payload",
+)
+#: The decisions path. `ACCOUNT`, and not `PLATFORM`, for the same reason the alias
+#: is: `muse.api.serve_decisions` meters it through the same `Meter.record`, so the
+#: tenancy establishment and the D9 gap are inherited rather than escaped. A decision
+#: is a read of the model, and an unreadable tenant would be a resource — which is
+#: why "read" is the honest axis and not "update".
+POST_DECISIONS = EntryPoint(
+    "POST /v1/decisions",
+    "http",
+    "read",
+    "ACCOUNT",
+    "test_a_decision_names_no_account_and_meters_once",
 )
 #: `PLATFORM`: the route table is configuration, not tenant data.
 GET_MODELS = EntryPoint(
@@ -209,6 +228,7 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
     REQUIRE_SCOPE,
     POST_ROUTE,
     POST_CHAT_COMPLETIONS,
+    POST_DECISIONS,
     GET_MODELS,
     HEALTHZ,
     READYZ,
@@ -224,16 +244,16 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
 #: The ratchet. `gate.yml`'s floor counts *tests*, and a test that stops being collected
 #: keeps it green. This counts *enumerated entry points*, so deleting a row without its
 #: negative test fails here instead.
-ENTRY_POINT_COUNT = 14
+ENTRY_POINT_COUNT = 15
 
 #: Per-operation counts, reported in the packet and asserted so a table that quietly
 #: loses a whole operation cannot pass.
-OPERATION_COUNTS = {"read": 9, "list": 2, "update": 2, "delete": 1}
+OPERATION_COUNTS = {"read": 10, "list": 2, "update": 2, "delete": 1}
 
-#: How many of the fourteen carry a tenant axis. The single most load-bearing number in
+#: How many of the fifteen carry a tenant axis. The single most load-bearing number in
 #: this file, because it is the one that says "muse has almost no tenancy surface", and a
 #: future packet that grows one has to move it deliberately.
-TENANT_SCOPED_COUNT = 4
+TENANT_SCOPED_COUNT = 5
 
 
 def auth(account: str, **claims: object) -> dict[str, str]:
@@ -354,8 +374,8 @@ def test_the_enumeration_covers_every_operation_the_packet_asks_for():
     assert counted == OPERATION_COUNTS
 
 
-def test_only_four_entry_points_carry_a_tenant_axis():
-    """The measurement, pinned: muse's tenant surface is four entry points wide.
+def test_only_five_entry_points_carry_a_tenant_axis():
+    """The measurement, pinned: muse's tenant surface is five entry points wide.
 
     Asserted because a packet that *grows* one should have to change this number on
     purpose, next to the negative test for the thing it added — not leave the old count
@@ -371,6 +391,7 @@ def test_only_four_entry_points_carry_a_tenant_axis():
         "api.require_bearer",
         "POST /v1/route",
         "POST /v1/chat/completions",
+        "POST /v1/decisions",
         "metering.Meter.record",
     ]
     assert len(carrying) == TENANT_SCOPED_COUNT
@@ -638,6 +659,31 @@ async def test_an_edited_tenant_claim_is_refused():
     # The real owner of that account is still served, so the 401 above was the
     # signature and not a broken fixture.
     assert genuine.status_code == 200
+
+
+async def test_a_decision_names_no_account_and_meters_once():
+    """`POST /v1/decisions` — ACCOUNT, read.
+
+    The decisions twin of the alias's negative test, and it asks the same question of
+    three accounts: a served decision names no tenant, and it meters once. Comparing
+    the metered event across accounts is what makes "the same write" checkable — a
+    decision that metered per account, or that carried one into the envelope, would be
+    a tenant surface the suite had silently grown.
+    """
+    database = FakeDatabase()
+    async with asgi_client(app_for(database)) as client:
+        for account in (ACCOUNT, OTHER_ACCOUNT, NO_SUCH_ACCOUNT):
+            response = await client.post(
+                "/v1/decisions", json=DECISION_BODY, headers=auth(account)
+            )
+            assert response.status_code == 200, f"/v1/decisions as {account}"
+            assert account not in response.text, "the decision named the caller's account"
+
+    assert len(database.outbox) == 3
+    envelopes = {event["data"] for event in database.outbox}
+    assert len(envelopes) == 1, (
+        "one decision from three accounts metered three different ways"
+    )
 
 
 async def test_a_token_with_no_tenant_is_refused_rather_than_defaulted():

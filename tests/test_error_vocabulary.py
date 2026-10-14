@@ -65,6 +65,7 @@ from muse.errors import (
     ProviderUnavailable,
     ResponseShapeError,
     RouteConfigError,
+    DecisionRequestRefused,
     RouteNotFound,
     SigningKeysUnavailable,
     Unauthenticated,
@@ -116,6 +117,11 @@ EXPECTED: dict[type[BaseException], str] = {
     VaultConfigError: "invalid_request",
     # --- the caller's request --------------------------------------------------
     RouteNotFound: "invalid_request",
+    # A decision request litellm refuses — a question count out of bound, a
+    # `criteria` map with the wrong shape. Same code as `RouteNotFound` because
+    # both are the caller's mistake and not the fleet's, and the 400-vs-503
+    # distinction is what the router's `DecisionRequestRefused` carries.
+    DecisionRequestRefused: "invalid_request",
     # --- the provider, by what it did -------------------------------------------
     ProviderError: "internal_error",
     ProviderAuthError: "provider_auth",

@@ -57,6 +57,7 @@ from muse.errors import (
     ContentPolicyError,
     ContractError,
     CredentialUnavailable,
+    DecisionRequestRefused,
     InsufficientScope,
     InvalidErrorType,
     InvalidEventType,
@@ -177,6 +178,13 @@ _TABLE: dict[type[BaseException], str] = {
     VaultConfigError: "invalid_request",
     # The caller named a model nothing routes. A 404 and a caller-side correction.
     RouteNotFound: "invalid_request",
+    # The questions themselves are wrong — a count litellm refuses, a `criteria` it
+    # cannot read. A 400 and a caller-side correction, and the same class
+    # `RouteNotFound` reports for the same reason: the caller could fix it. Placed
+    # beside that row rather than near `ProviderInvalidRequest`, because unlike a
+    # provider rejection the rule that was broken is litellm's and no vendor was
+    # ever called.
+    DecisionRequestRefused: "invalid_request",
     # --- the provider, by what it actually did -------------------------------------
     ProviderError: "internal_error",
     # A third party refused our credential. The responder owns the key.

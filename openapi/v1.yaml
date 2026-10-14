@@ -72,7 +72,7 @@ info:
   # The one thing 1.2.0 does NOT add is streaming. A request carrying `stream` is a 422
   # naming the field, not a silently non-streaming answer. See the alias's own
   # description.
-  version: 1.2.0
+  version: 1.3.0
   summary: LLM routing, credentials vault, and token metering for cafaye.
   description: |
     muse routes a chat completion to the first provider that can serve it, holds
@@ -741,6 +741,120 @@ paths:
                     code: unavailable
                     trace_id: 0af7651916cd43dd8448eb211c80319c
 
+  /v1/decisions:
+    post:
+      tags: [llm]
+      operationId: decide
+      summary: Judge an input against named questions
+      description: |
+        The decisions half of the vocabulary. One `input`, judged against 1 to N
+        `questions`, and one answer per question in the order they were asked —
+        answered by the name muse assigned it, `q1`, `q2`, ..., so a question the
+        caller did not name cannot collide with another.
+
+        A question is one of three types, and each answers with a calibrated
+        probability rather than a label the model asserted:
+
+        - `predicate` — yes/no, with a `probability` in [0, 1]
+        - `choice` — one of `choices`, each with a `probability`
+        - `score` — an index into `levels` from lowest to highest, with a `confidence`
+
+        **Streaming is not supported.** A request carrying `stream` is a 422 naming
+        the field, the same refusal and the same status `/v1/chat/completions` gives,
+        because the consequence of ignoring it is identical.
+
+        The answers are litellm's own render, passed through verbatim. Reshaping them
+        would make a client written against litellm's docs have to be taught about
+        muse.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecisionsRequest'
+            examples:
+              one-noul:
+                summary: A yes/no read, calibrated
+                value:
+                  model: fast
+                  input: "Customer wrote: I was charged twice for order #4411 and want one refunded today."
+                  questions:
+                    - type: predicate
+                      name: classification
+                      instructions: Is this a refund request?
+                      criteria:
+                        true: wants money back
+                        false: asks a question
+              one-choice:
+                summary: One label out of several
+                value:
+                  model: fast
+                  input: Please add dark mode.
+                  questions:
+                    - type: choice
+                      name: classification
+                      instructions: What kind of message is this?
+                      choices:
+                        - value: question
+                          description: The sender asks for information.
+                        - value: feature_request
+                          description: The sender asks for something new.
+              one-score:
+                summary: A level on an ordered scale
+                value:
+                  model: fast
+                  input: Everything is broken and work is blocked.
+                  questions:
+                    - type: score
+                      name: weight
+                      instructions: How much should this weigh?
+                      levels:
+                        - label: negligible
+                        - label: minor
+                        - label: moderate
+                        - label: significant
+                        - label: urgent
+      responses:
+        '200':
+          description: The answers, keyed by the name muse assigned each question.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            traceparent:
+              $ref: '#/components/headers/Traceparent'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionsResponse'
+        '400':
+          description: |
+            litellm refused the request itself — a question count out of bound, a
+            `criteria` map with the wrong shape. Caller-fixable, and the fallback
+            chain is not spent on it: a request that is broken is broken for every
+            candidate.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: The caller's credential is missing, invalid, out of scope, or names no account.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No route is configured for the named model.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Every candidate failed transiently.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
   /v1/models:
     get:
       tags: [llm]
@@ -1036,6 +1150,124 @@ components:
             The message text. Must not be empty: an empty message is never what a
             caller meant, and accepting it turns a client bug into a billed response
             with no content.
+
+    DecisionsRequest:
+      type: object
+      additionalProperties: false
+      required: [model, input, questions]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: A route name from this service's `config/routes.yaml`.
+          examples: [fast, smart]
+        input:
+          type: string
+          description: The text being judged. Every question is asked about it.
+        questions:
+          type: array
+          minItems: 1
+          description: |
+            The questions, asked in the order they are answered. The bound is
+            litellm's, not this document's: an out-of-range count reaches the
+            provider and is refused there as a 400, so the caller reads the
+            provider's own reason rather than a paraphrase.
+          items:
+            type: object
+            additionalProperties: false
+            required: [type]
+            properties:
+              type:
+                type: string
+                enum: [predicate, choice, score]
+                description: |
+                  `predicate` takes a `criteria` map of `{true: ..., false: ...}` and
+                  answers with a `probability`. `choice` takes a label map and answers
+                  with one of the labels and a probability per label. `score` takes
+                  `levels` from lowest to highest and answers with an index into them.
+              name:
+                type: string
+                description: |
+                  The name the answer comes back under. muse assigns it when it is not
+                  given — `q1`, `q2`, ... — so two questions with the same label cannot
+                  silently collapse into one answer. Echoed in the matching answer.
+              instructions:
+                type: [string, object]
+                description: The question, in the shape the question type expects.
+              criteria:
+                type: [object, array, string]
+                description: What a criterion *says* is the model's business.
+              choices:
+                type: array
+                minItems: 2
+                description: The options a `choice` question picks from. Values must be unique.
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [value]
+                  properties:
+                    value:
+                      type: [string, boolean]
+                    description:
+                      type: string
+              levels:
+                type: array
+                minItems: 2
+                maxItems: 10
+                description: The scale a `score` question answers into, lowest first.
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [label]
+                  properties:
+                    label:
+                      type: string
+                    description:
+                      type: string
+    DecisionsResponse:
+      type: object
+      additionalProperties: false
+      required: [id, object, created, model, provider, route, answers, usage, cost_micros, trace_id]
+      properties:
+        id:
+          type: string
+          description: muse's own id for the decision.
+        object:
+          type: string
+          enum: [decisions]
+        created:
+          type: integer
+        model:
+          type: string
+        provider:
+          type: string
+          description: Which vendor answered. The caller never chose it.
+        route:
+          type: string
+          description: The route name the caller asked for.
+        answers:
+          type: object
+          description: |
+            The answers, keyed by the name muse assigned each question. One key per
+            question, in the order the questions were asked.
+          additionalProperties:
+            type: object
+            description: litellm's own render of one answer, passed through verbatim.
+        usage:
+          type: object
+          description: The tokens the whole call cost — one usage for N answers.
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+        cost_micros:
+          type: integer
+          description: What the call cost, in micros, from the model's own price.
+        trace_id:
+          type: string
 
     RouteRequest:
       type: object

@@ -1,8 +1,9 @@
 """Providers: the protocol muse routes through, and the three implementations.
 
-`Provider` is a structural protocol with exactly three operations:
+`Provider` is a structural protocol with exactly four operations:
 
 - `complete(request)` — one chat completion.
+- `decide(request)` — one decision over a list of questions.
 - `health()` — can this provider serve a request right now.
 - `cost_per_1k_tokens(model)` — what a thousand tokens of this model cost.
 
@@ -23,6 +24,7 @@ litellm's per-token dollars once, on the way in.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -86,8 +88,8 @@ def _read(container: Any, field: str) -> Any:
     chain. The observable symptom was "every candidate failed", on every request, on
     every vendor.
 
-    One helper rather than an `isinstance` check in each of the four places, because
-    the shapes are not uniform: `ModelResponse` supports `response["choices"]`, so
+    One helper rather than an `isinstance` check in each of the four places, because the
+    shapes are not uniform: `ModelResponse` supports `response["choices"]`, so
     subscripting alone works for the response and fails for `usage` and for the choice,
     and a fix applied at one level would have looked right and been wrong at the next.
 
@@ -97,6 +99,35 @@ def _read(container: Any, field: str) -> Any:
     if isinstance(container, dict):
         return container.get(field)
     return getattr(container, field, None)
+
+
+def _items(container: Any) -> list[tuple[str, Any]]:
+    """The `(key, value)` pairs of a mapping answer set, whatever carried it.
+
+    litellm's `DecisionsResponse.answers` is a `Mapping`, and a pydantic model renders
+    it the same way — but a provider adapter that received it as an object with `.items`
+    rather than as a dict needs the same normalisation `_read` gives one field. One
+    helper here for the same reason `_read` exists at all: the shape litellm returns is
+    not the shape the stub returns, and the adapter was burned by assuming it was.
+    """
+    if isinstance(container, dict):
+        return list(container.items())
+    return [
+        (str(name), value) for name, value in getattr(container, "items", dict().items)()
+    ]
+
+
+def _answer_fields(answer: Any) -> dict[str, Any]:
+    """One answer as a plain mapping, from whatever litellm rendered it as.
+
+    Verbatim pass-through of litellm's own answer object: the response is litellm's
+    vocabulary, and re-declaring it here would be a second model for a litellm upgrade
+    to disagree with.
+    """
+    if isinstance(answer, dict):
+        return dict(answer)
+    return dict(getattr(answer, "__dict__", {}))
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +255,105 @@ class Health:
             object.__setattr__(self, "detail", "ok" if self.healthy else "unhealthy")
 
 
+#: The largest number of questions one decision request may carry. litellm's
+#: `MAX_DECISION_QUESTIONS`, and asserted through it rather than restated here.
+MAX_DECISION_QUESTIONS = 128
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionsQuestion:
+    """One question, as the caller stated it — and where it became litellm's.
+
+    Kept vendor-neutral and *thin*: `instructions` and `criteria` are `object`,
+    because what makes a criterion true is the model's business and litellm already
+    validates it. A pydantic model here would be a second validator agreeing with
+    litellm's, and a second validator is one that drifts — so muse hands litellm
+    the question and surfaces its own refusal (rule: surface litellm's error rather
+    than reimplementing it).
+
+    `name` is the key litellm answers under, and muse assigns it rather than the
+    caller: answers come back in the order asked, and a caller-supplied key is a
+    collision two questions can have silently.
+    """
+
+    name: str
+    type: str
+    instructions: object | None = None
+    criteria: object | None = None
+
+    def as_wire(self) -> dict[str, Any]:
+        """The question as litellm's own `DecisionQuestion` takes it.
+
+        `predicate` is folded onto `noul` here rather than at the wire, because the
+        two are the same yes/no question in the two spellings litellm publishes:
+        `noul` in the TypeSafe vocabulary, `predicate` in the OpenAI-flavoured one.
+        Muse accepts either and answers in whichever one litellm returns, so a
+        caller following litellm's docs against the OpenAI variant is not told a
+        question type it knows nothing about exists in muse but not there.
+        """
+        question: dict[str, Any] = {
+            "type": "noul" if self.type == "predicate" else self.type,
+        }
+        # `exclude_none` semantics mirroring litellm's own model dump: a question
+        # may legitimately state neither field (a `choice` whose criteria *is* the
+        # label list), and sending an explicit null is what a strict provider
+        # rejects with a 400 about the wrong field.
+        if self.instructions is not None:
+            question["instructions"] = self.instructions
+        if self.criteria is not None:
+            question["criteria"] = self.criteria
+        return question
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionsRequest:
+    """A request for one decision, vendor-neutral.
+
+    `input` is the thing being judged and `questions` are asked of it in order;
+    `model` is the client-facing name from `config/routes.yaml`, exactly as on
+    `CompletionRequest` — which vendor answers is the router's decision.
+    """
+
+    model: str
+    input: str
+    questions: tuple[DecisionsQuestion, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    """One served decision: every answer, plus the usage the whole call cost.
+
+    The answers are litellm's own render, keyed by the name muse assigned the
+    question — `q1`, `q2`, ... in the order asked — and passed through verbatim. A
+    second copy of a litellm answer is a second thing for a litellm upgrade to
+    disagree with, and the consumer is written against litellm's docs.
+
+    `tokens_in`/`tokens_out` are on the call rather than on each answer because
+    there is one usage for N answers; a caller reading answer 3 meters the whole
+    call, which is what it paid for.
+
+    `price` is here for the same reason it is on `Completion`: the router resolves
+    it before dispatch and the meter reads it off the result rather than looking a
+    second time at a table that may have moved in between.
+    """
+
+    provider: str
+    model: str
+    answers: Mapping[str, Any]
+    tokens_in: int
+    tokens_out: int
+    price: Price
+
+    def as_wire(self) -> dict[str, Any]:
+        """The answers as litellm rendered them, with none of muse's additions."""
+        return dict(self.answers)
+
+    @property
+    def cost_micros(self) -> int:
+        """What this call cost, in micro-dollars."""
+        return usage_cost_micros(self.tokens_in, self.tokens_out, self.price)
+
+
 def usage_cost_micros(tokens_in: int, tokens_out: int, price: Price) -> int:
     """The cost of a completion, in micro-dollars.
 
@@ -244,7 +374,7 @@ def usage_cost_micros(tokens_in: int, tokens_out: int, price: Price) -> int:
 class Provider(Protocol):
     """What the router needs from a model vendor.
 
-    A protocol, not a base class: an adapter is anything with these three methods,
+    A protocol, not a base class: an adapter is anything with these four methods,
     so a future vendor does not have to inherit from anything muse owns, and the
     router cannot reach a provider's internals by accident.
     """
@@ -253,6 +383,16 @@ class Provider(Protocol):
 
     async def complete(self, request: CompletionRequest) -> Completion:
         """One chat completion, or raise a `ProviderError` subclass."""
+        ...
+
+    async def decide(self, request: DecisionsRequest) -> Decision:
+        """One decision, or raise a `ProviderError` subclass.
+
+        Same contract as `complete` and for the same reason: the router's whole
+        resilience layer — the breaker, the retry budget, the fallback chain — is
+        written once against the error taxonomy, so an operation that raised
+        anything else would be one that bypassed all three.
+        """
         ...
 
     async def health(self) -> Health:
@@ -460,6 +600,71 @@ class LiteLLMProvider:
         except Exception as error:  # a third-party exception taxonomy, mapped below
             raise self._translate(error, key) from error
         return self._to_completion(request.model, response)
+
+    async def decide(self, request: DecisionsRequest) -> Decision:
+        """One decision, or a `ProviderError` subclass describing why not.
+
+        `litellm.adecisions` — the decisions half of the library this service already
+        embeds. The whole point of calling it rather than a completion with a JSON
+        schema bolted on is the vocabulary: a `noul` answer *is* a calibrated
+        probability, and a caller reading `0.93` off this service should get the same
+        sentence litellm's own proxy would have written.
+
+        The questions are handed over keyed by a muse-assigned name rather than as a
+        bare sequence. litellm's decisions endpoint takes a `state` plus a named
+        question map, so the name is where the answer comes back under; assigning it
+        here means two questions with the same label cannot silently collapse into
+        one answer, and the answer order is the question order regardless.
+        """
+        key = await self._key()
+        if not key:
+            # Checked before the call: no request, no spend, no rate-limit counter
+            # spent on a credential that was never going to work.
+            raise CredentialUnavailable(f"no credential is configured for provider {self.name!r}")
+        kwargs: dict[str, Any] = {
+            "model": self.qualified_model(request.model),
+            "state": request.input,
+            "questions": {question.name: question.as_wire() for question in request.questions},
+            "api_key": key.reveal(),
+        }
+        headers = self._outbound_headers()
+        if headers:
+            kwargs["extra_headers"] = headers
+        try:
+            response = await self.litellm.adecisions(**kwargs)
+        except Exception as error:  # a third-party exception taxonomy, mapped below
+            raise self._translate(error, key) from error
+        return self._to_decision(request.model, response)
+
+    def _to_decision(self, model: str, response: Any) -> Decision:
+        """Normalise litellm's decision response, or raise `ResponseShapeError`.
+
+        litellm answers every question it was asked and returns the usage on the
+        call rather than on each answer. Both are checked here for the reason
+        `_to_completion` checks its own: a decision with no answers, or one whose
+        token counts are unknown, cannot be metered — and an unmetered token spend
+        is the one failure this service exists to prevent.
+        """
+        answers = _read(response, "answers")
+        if not answers:
+            raise ResponseShapeError(f"{self.name} returned a decision with no answers")
+        usage = _read(response, "usage")
+        if not usage:
+            raise ResponseShapeError(
+                f"{self.name} returned a decision with no usage; a decision whose "
+                "token counts are unknown cannot be metered"
+            )
+        return Decision(
+            provider=self.name,
+            model=model,
+            answers={str(name): _answer_fields(answer) for name, answer in _items(answers)},
+            tokens_in=int(_read(usage, "input_tokens") or 0),
+            tokens_out=int(_read(usage, "output_tokens") or 0),
+            # The router's price, resolved before dispatch and carried across the
+            # call: `cost_per_1k_tokens` is the one place a price is read, and a
+            # second read here would be a second chance to disagree with it.
+            price=self.cost_per_1k_tokens(model),
+        )
 
     def _outbound_headers(self) -> dict[str, str]:
         """The tracing headers to send with this call.

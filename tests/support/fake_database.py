@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -188,16 +189,28 @@ class FakeDatabase:
 
 
 def _as_driver_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    """The row as psycopg hands it back: `jsonb` decoded, every other column verbatim.
+    """The row as psycopg hands it back.
 
-    The store keeps `data` as the JSON text the insert wrote, because surviving the
-    round trip through the database is the property the metering test asserts. A *reader*
-    gets a dict, though — so a publisher that forgets that fails at runtime with
-    `dict("...")` on a string, which is exactly the kind of thing a fake that agrees
-    with the code instead of the driver hides.
+    Two columns do not round-trip verbatim, and both are modelled here because a fake
+    that agrees with the code instead of the driver hides exactly the bugs this
+    service exists to catch:
+
+    - `data` is `jsonb`. The store keeps the JSON text the insert wrote, because
+      surviving the round trip through the database is the property the metering test
+      asserts. A *reader* gets a dict, though — so a publisher that forgets that fails
+      at runtime with `dict("...")` on a string.
+    - `time` is `timestamptz`. The meter inserts an RFC3339 string, postgres parses it
+      into the column's type, and a driver hands back a `datetime`. A reader therefore
+      gets a `datetime`, and a publisher calling `.tzinfo` on the string the store kept
+      is a publisher that only ever ran against the fake.
     """
     payload = row.get("data")
-    return {**row, "data": json.loads(payload) if isinstance(payload, str) else payload}
+    moment = row.get("time")
+    return {
+        **row,
+        "data": json.loads(payload) if isinstance(payload, str) else payload,
+        "time": datetime.fromisoformat(moment) if isinstance(moment, str) else moment,
+    }
 
 
 #: The parameter order the outbox insert is written in, so the fake can turn a
