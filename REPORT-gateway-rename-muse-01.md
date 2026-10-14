@@ -128,7 +128,7 @@ assumed:
   a dependency name**. It reads the manifest for the shared cluster and for stale
   container copies.
 - `core`'s `fleet.yml` is an **event registry**, and its own header says so: *"NOT
-  HERE: which repositories exist. That is `caf`'s business."*
+  HERE: which repositories exist. That is `cafe`'s business."*
 - `pantry` is the resolver, and the packet notes a rename worker is live there.
 
 So `tests/test_openapi.py` held the only check in the fleet on a line that
@@ -146,7 +146,7 @@ to catch.
 
 The third is the one that could have caught this packet, and I have written down its
 **limit** rather than leaving it to be discovered: `fleet.yml` records the services
-that *publish events*, so a future dependency on a non-publisher (`kit`, `caf`)
+that *publish events*, so a future dependency on a non-publisher (`kit`, `cafe`)
 fails there on a perfectly good name. The failure message names both readings
 instead of guessing, because guessing in the other direction is how a real rename
 gets waved through as a registry gap. It also asserts its own floor before its
@@ -180,7 +180,7 @@ behind ['identity', 'gateway']. Add a dependency here AND in the pin above, in
 the same commit …
 
 AssertionError: ['guard'] — core's fleet.yml records ['billing', 'courier',
-'gateway', 'identity', 'muse'], and a dependency `caf dev` and `pantry` cannot
+'gateway', 'identity', 'muse'], and a dependency `cafe dev` and `pantry` cannot
 resolve is one no registry holds. Two readings, and this message refuses to pick
 for you …
 
@@ -425,7 +425,7 @@ Reverted from a byte copy; `git diff --stat` empty after.
    `fleet.yml` is by design not a service registry. So the fleet has no shared place
    where "this manifest names a service that does not exist" is caught once for all
    nine repositories. The check I added is per-repository and needs a core checkout;
-   a fleet-wide one belongs in `kit` or `caf`. **That is the successor's first real
+   a fleet-wide one belongs in `kit` or `cafe`. **That is the successor's first real
    task**, and it is the only place this defect class gets caught by construction
    rather than by a sweep remembering to visit every repository.
 
@@ -436,7 +436,7 @@ Reverted from a byte copy; `git diff --stat` empty after.
 1. Merge, then open the `docs` patch in §7 item 1 — two deletions.
 2. Fix `core`'s vendored schema drift, or re-vendor muse's copy, so the core-parity
    tier is demonstrably green and the `973` floor is verifiable rather than argued.
-3. Put the dependency-name check in `kit` or `caf`, where one implementation covers
+3. Put the dependency-name check in `kit` or `cafe`, where one implementation covers
    every repository and a missed sweep is caught by construction.
 4. If a `cafaye` service is ever renamed again, the two blind spots are the whole
    lesson: grep case-insensitively **and** for capitalised subjects, and read the

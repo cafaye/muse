@@ -85,7 +85,7 @@ copy was behind, so the change is one file copied verbatim, descriptions
 included — the descriptions are the reasoning, and paraphrasing them is how a
 fleet loses the argument for why a field exists. sha256
 `101132a6792318670c352a8f61a3231387748eb53ec86d0a23dbac55a71ed576`, which is
-also the sha `caf/caf.lock` already records for the same path, so core's
+also the sha `cafe/caf.lock` already records for the same path, so core's
 current file and the bytes two other fleet consumers hold are one document.
 
 The new test
@@ -303,7 +303,7 @@ for it. `GET /v1/models` is `PLATFORM`: a route table is configuration, not tena
 **`cafaye.yml` declared `dependencies[].name: guard`.** The service was renamed
 to `gateway` fleet-wide in m39 — eight repositories were swept and this one was
 missed, so the last reference to the old name in the fleet was a line that
-*resolves*: `caf dev`, `caf gen` and `pantry` look the name up in the fleet's
+*resolves*: `cafe dev`, `cafe gen` and `pantry` look the name up in the fleet's
 registry. A manifest that parses, validates against core's schema and starts
 nothing has been on master since.
 
@@ -315,7 +315,7 @@ nothing has been on master since.
 ```
 
 **Not a caller-visible break.** No request, response or wire format changed. The
-cost was that `caf dev` and `pantry` would look for a service no registry holds.
+cost was that `cafe dev` and `pantry` would look for a service no registry holds.
 
 **And the guard was inside the guard.** `tests/test_openapi.py` held the only
 check in the fleet on that line, and it read
@@ -343,7 +343,7 @@ Three assertions now, in increasing order of what they can see:
 
 The third is the one that could have caught this. Its limit is stated in its own
 docstring rather than left to be discovered: `fleet.yml` records the services that
-*publish events*, so a future dependency on a non-publisher (`kit`, `caf`) fails
+*publish events*, so a future dependency on a non-publisher (`kit`, `cafe`) fails
 there on a perfectly good name, and the failure message names both readings
 instead of guessing.
 
@@ -374,7 +374,7 @@ The 26 in this file are history and stay: the changelog records what was true.
 
 **BREAKING, on one field, with no deprecation window.** `temperature` was
 `type: number` and is now `type: string` carrying a plain decimal in [0, 2].
-`caf contract breaking --tiers all` reports it at all three tiers and all three
+`cafe contract breaking --tiers all` reports it at all three tiers and all three
 are honest:
 
 ```
@@ -814,7 +814,7 @@ with no `account_id`.
   that page.
 - **`identity` is now a required dependency** in `cafaye.yml`. Not because muse needs
   more of it — because it can no longer serve anything without it, and a soft
-  dependency is how `caf dev` starts a service that answers 503 to everything.
+  dependency is how `cafe dev` starts a service that answers 503 to everything.
 - **`joserfc` and `httpx` are now runtime dependencies.** `httpx` was already in the
   runtime closure through `litellm`, so the image gains nothing.
 
