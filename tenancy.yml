@@ -31,7 +31,7 @@
 # entry-point scanner reads `src` and finds the key on fifteen lines:
 #
 #   src/muse/auth.py:6,78,118,160,163,232,289,295,300,303
-#   src/muse/errors.py:289,291
+#   src/muse/errors.py:305,307
 #   src/muse/metering.py:21,31
 #   src/muse/schemas/telemetry/traces.schema.json:203
 #
@@ -121,10 +121,10 @@ scope:
       line: 303
       reason: the MissingAccount message names the failed check; an error string, not a row predicate
     - file: src/muse/errors.py
-      line: 289
+      line: 305
       reason: MissingAccount docstring — a verified token carrying no usable account is refused with a 401; an authorization rule about the token, and no row is read or scoped
     - file: src/muse/errors.py
-      line: 291
+      line: 307
       reason: MissingAccount docstring — gives the billing reason for that refusal; prose describing the claim check, not a predicate on any table
     - file: src/muse/metering.py
       line: 21

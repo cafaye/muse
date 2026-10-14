@@ -55,10 +55,21 @@ RESPONSE: dict[str, Any] = {
 #: A test asserting the adapter's shape check has to be able to ask for a null.
 DEFAULT = object()
 
+#: A well-formed decision response, shaped like the dict form of litellm's
+#: `DecisionsResponse`: the answers keyed by the name muse passed through, and the
+#: usage on the call rather than on each answer. Every test overrides what it cares
+#: about.
+DECISION_RESPONSE: dict[str, Any] = {
+    "model": "gpt-4o-mini",
+    "answers": {"1": {"type": "noul", "noul": 0.93}},
+    "usage": {"input_tokens": 12, "output_tokens": 8},
+}
+
 
 def make_stub(
     *,
     response: Any = DEFAULT,
+    decision: Any = DEFAULT,
     raises: str | None = None,
     error_message: str = "",
     model_info: dict[str, dict[str, Any]] | None = None,
@@ -82,6 +93,10 @@ def make_stub(
     `model_info` overrides the price table, and a model missing from it raises
     `KeyError` — what the real `get_model_info` does, and what `PriceUnavailable`
     exists to translate.
+
+    `decision` overrides the decision response the same way `response` overrides the
+    completion one, and `decision=None` is honoured as a null rather than replaced by
+    the default, which is what a test asserting the decisions shape check needs.
     """
     module = types.ModuleType("litellm_stub")
     captured: dict[str, Any] = {}
@@ -89,6 +104,10 @@ def make_stub(
     #: How many times `acompletion` was entered. The counter a "no request was
     #: issued" assertion needs, and the last statement before a socket would exist.
     module.acompletion_calls = 0  # type: ignore[attr-defined]
+    #: The same for `adecisions`. A separate counter because the counter says which
+    #: half of litellm a test reached, and sharing one would make "no completion was
+    #: issued" true of a decisions request and of nothing else.
+    module.adecisions_calls = 0  # type: ignore[attr-defined]
 
     for name in LITELLM_ERROR_NAMES:
         module.__dict__[name] = type(name, (Exception,), {})
@@ -103,6 +122,25 @@ def make_stub(
             raise error
         return RESPONSE if response is DEFAULT else response
 
+    async def adecisions(**kwargs: Any) -> Any:
+        """The decisions half, in the shape `litellm.adecisions` really returns.
+
+        `DecisionsResponse` as a mapping rather than a pydantic model, because the
+        adapter's `_read` handles both and the stub states which one it is testing.
+        The answers are keyed by the name muse passed through, so a test asserting
+        the names survive the call has a real mapping to read.
+        """
+        module.adecisions_calls += 1  # type: ignore[attr-defined]
+        captured.update(kwargs)
+        if raises is not None:
+            error = module.__dict__[raises](error_message)
+            if status_code is not None:
+                error.status_code = status_code
+            raise error
+        if decision is not DEFAULT:
+            return decision
+        return DECISION_RESPONSE
+
     def get_model_info(model: str) -> dict[str, Any]:
         table = PRICES if model_info is None else model_info
         if model not in table:
@@ -110,5 +148,7 @@ def make_stub(
         return table[model]
 
     module.acompletion = acompletion  # type: ignore[attr-defined]
+    module.adecisions = adecisions  # type: ignore[attr-defined]
     module.get_model_info = get_model_info  # type: ignore[attr-defined]
     return module
+

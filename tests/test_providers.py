@@ -35,11 +35,15 @@ from muse.errors import (
     ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
+    ProviderUnavailable,
     ResponseShapeError,
 )
 from muse.providers import (
     Completion,
     CompletionRequest,
+    Decision,
+    DecisionsQuestion,
+    DecisionsRequest,
     Health,
     LiteLLMProvider,
     Message,
@@ -54,6 +58,7 @@ from muse.providers.fake import FakeProvider, ScriptedProvider
 from muse.redaction import Secret
 
 from .support.litellm_stub import make_stub
+from .support.tracing import recording_telemetry
 
 pytestmark = [pytest.mark.anyio, pytest.mark.unit]
 
@@ -97,17 +102,45 @@ def make_provider(
     return LiteLLMProvider(name=name, api_key=api_key, litellm=make_stub(**stub_kwargs))
 
 
+def decide_ask(**kwargs) -> DecisionsRequest:
+    """A valid decision request, with fields overridden per test."""
+    return DecisionsRequest(
+        model=MODEL,
+        input="I was charged twice and want one refunded.",
+        questions=(DecisionsQuestion(name="q1", type="predicate", instructions="refund?"),),
+        **kwargs,
+    )
+
+
+def decision(**overrides) -> Decision:
+    """A valid decision, with fields overridden per test."""
+    return Decision(
+        **{
+            "provider": OPENAI,
+            "model": MODEL,
+            "answers": {"q1": {"type": "predicate", "predicate": 0.93}},
+            "tokens_in": 12,
+            "tokens_out": 4,
+            "price": Price(1500, 3000),
+            **overrides,
+        }
+    )
+
+
 # --- the protocol ----------------------------------------------------------
 
 
-def test_a_provider_only_needs_the_three_protocol_methods() -> None:
-    """Structural, not nominal: a provider is anything with the three operations,
+def test_a_provider_only_needs_the_four_protocol_methods() -> None:
+    """Structural, not nominal: a provider is anything with the four operations,
     so a future adapter does not inherit from anything muse owns."""
 
     class Minimal:
         name = "minimal"
 
         async def complete(self, request):  # pragma: no cover - never called
+            raise NotImplementedError
+
+        async def decide(self, request):  # pragma: no cover - never called
             raise NotImplementedError
 
         async def health(self):  # pragma: no cover - never called
@@ -745,6 +778,200 @@ async def test_the_adapter_rejects_empty_usage() -> None:
     )
     with pytest.raises(ResponseShapeError, match="no usage"):
         await provider.complete(ask())
+
+
+# --- the decisions half of the adapter ---------------------------------------
+
+
+async def test_a_decision_response_is_normalised_through_the_same_shape_checks() -> None:
+    """The twin of the completion tests above, and for the reason they exist.
+
+    A decision is read by the meter, and a decision whose answers or usage is
+    missing is an unmetered spend — which is the one failure this service exists
+    to prevent. So both are checked here, at the adapter, before anything
+    downstream can act on a partial result.
+    """
+    provider = make_provider(
+        decision={"answers": {"q1": {"type": "predicate", "predicate": 0.93}}, "usage": {"input_tokens": 12, "output_tokens": 4}}
+    )
+    served = await provider.decide(decide_ask())
+
+    assert served.answers == {"q1": {"type": "predicate", "predicate": 0.93}}
+    assert served.tokens_in == 12
+    assert served.tokens_out == 4
+
+
+async def test_the_adapter_rejects_a_decision_with_no_answers() -> None:
+    provider = make_provider(decision={"usage": {"input_tokens": 12, "output_tokens": 4}})
+    with pytest.raises(ResponseShapeError, match="no answers"):
+        await provider.decide(decide_ask())
+
+
+async def test_the_adapter_rejects_a_decision_with_no_usage() -> None:
+    """Exactly as a completion: a decision whose token counts are unknown cannot be
+    metered, and this is the last place it can be caught."""
+    provider = make_provider(decision={"answers": {"q1": {"type": "predicate", "predicate": 0.9}}})
+    with pytest.raises(ResponseShapeError, match="no usage"):
+        await provider.decide(decide_ask())
+
+
+async def test_the_adapter_rejects_empty_decision_usage() -> None:
+    provider = make_provider(decision={"answers": {"q1": {}}, "usage": {}})
+    with pytest.raises(ResponseShapeError, match="no usage"):
+        await provider.decide(decide_ask())
+
+
+async def test_the_adapter_rejects_a_decision_response_that_is_not_a_mapping() -> None:
+    """`None` in place of a decision response, the same case the completion adapter
+    refuses: it cannot be subscripted, so treating it as the shape error it is is
+    the only alternative to a TypeError three frames down."""
+    provider = make_provider(decision=None)
+    with pytest.raises(ResponseShapeError, match="no answers"):
+        await provider.decide(decide_ask())
+
+
+async def test_a_decision_answer_that_is_not_a_mapping_is_read_as_fields() -> None:
+    """A provider answering with an object rather than a dict. The adapter reads its
+    fields rather than refusing, because litellm's own answer objects are the
+    common case and a consumer written against litellm's docs expects to read
+    `predicate` off it either way."""
+    provider = make_provider(decision={"answers": {"q1": object()}, "usage": {"input_tokens": 1, "output_tokens": 1}})
+    served = await provider.decide(decide_ask())
+
+    assert served.answers == {"q1": {}}
+
+
+async def test_a_scripted_decision_answers_every_question_with_the_same_answer() -> None:
+    """The scripted double's decision path, and the shape it produces is the one the
+    real adapter produces — so a routing test asserting on it sees what the fleet
+    serves rather than a convenient fiction.
+
+    `answers` is consumed in order and each is keyed by the name muse assigned the
+    question, which is the mapping the real adapter returns.
+    """
+    provider = ScriptedProvider(
+        name=OPENAI,
+        answers=({"type": "predicate", "predicate": 0.93}, {"type": "predicate", "predicate": 0.4}),
+    )
+    ask = decide_ask()
+    served = await provider.decide(ask)
+
+    assert served.answers == {"q1": {"type": "predicate", "predicate": 0.93}}
+    assert provider.decisions[0] is ask
+
+    # The second scripted answer, so the ordering is real and not a constant.
+    assert (await provider.decide(ask)).answers == {"q1": {"type": "predicate", "predicate": 0.4}}
+
+
+async def test_a_scripted_decision_replays_its_last_answer_rather_than_exhausting() -> None:
+    """The other side of the ordering: an exhausted script is not a test failure
+    about the double. A router retrying a candidate does not need a second scripted
+    entry, so the decisions half reuses the last answer exactly as the completions
+    half does."""
+    # `ScriptedProvider` with an empty script: the decisions half takes the same
+    # "no more scripted answers" branch the completions half does.
+    provider = ScriptedProvider(name=OPENAI)
+    ask = decide_ask()
+
+    for _ in range(2):
+        served = await provider.decide(ask)
+        assert list(served.answers) == ["q1"]
+
+    # The last scripted answer is replayed rather than exhausted, so a router
+    # retrying a candidate needs no second entry.
+    provider = ScriptedProvider(name=OPENAI, answers=({"type": "predicate", "predicate": 0.3},))
+    for _ in range(3):
+        assert (await provider.decide(ask)).answers == {
+            "q1": {"type": "predicate", "predicate": 0.3}
+        }
+
+
+async def test_a_scripted_decision_error_is_raised_before_the_answer() -> None:
+    """`errors` first, as for completions: a script reads as "this, then that", which
+    is how the fallback tests are written — so the decisions half honours the same
+    order the completions half does."""
+    provider = ScriptedProvider(
+        name=OPENAI, errors=(ProviderUnavailable("primary is down"),), answers=({"type": "predicate", "predicate": 0.9},)
+    )
+    ask = decide_ask()
+
+    with pytest.raises(ProviderUnavailable, match="primary is down"):
+        await provider.decide(ask)
+    assert (await provider.decide(ask)).answers == {"q1": {"type": "predicate", "predicate": 0.9}}
+
+
+def test_a_question_that_states_no_criteria_sends_neither_field() -> None:
+    """`exclude_none`, mirroring litellm's own dump.
+
+    A `choice` question's criteria *is* its label list, so a question may
+    legitimately state neither field — and sending an explicit null is what a
+    strict provider rejects with a 400 about the wrong field."""
+    # The name is the mapping key the answer comes back under, not a wire field.
+    bare = DecisionsQuestion(name="q1", type="choice", instructions="pick one")
+    assert bare.as_wire() == {"type": "choice", "instructions": "pick one"}
+
+    # `predicate` folds onto `noul` at the wire: the two are the same yes/no
+    # question in the two spellings litellm publishes.
+    stated = DecisionsQuestion(name="q1", type="predicate", instructions="refund?")
+    assert stated.as_wire() == {"type": "noul", "instructions": "refund?"}
+
+    withcriteria = DecisionsQuestion(
+        name="q1", type="predicate", instructions="refund?", criteria={"true": "yes", "false": "no"}
+    )
+    assert withcriteria.as_wire()["criteria"] == {"true": "yes", "false": "no"}
+
+    # And neither: a question whose criteria *is* the instruction states no second field.
+    neither = DecisionsQuestion(name="q1", type="choice")
+    assert neither.as_wire() == {"type": "choice"}
+
+
+async def test_a_decision_answer_that_arrives_as_an_object_is_read_as_items() -> None:
+    """The provider answering with objects rather than dicts, which is what litellm
+    really returns and what the stub deliberately does not. The adapter normalises
+    both through `_items` rather than assuming, because assuming is how it was burned
+    the first time."""
+    class Answers:
+        def items(self):
+            return [("q1", {"type": "predicate", "predicate": 0.9})]
+
+    provider = make_provider(
+        decision={"answers": Answers(), "usage": {"input_tokens": 1, "output_tokens": 1}}
+    )
+    served = await provider.decide(decide_ask())
+
+    assert served.answers == {"q1": {"type": "predicate", "predicate": 0.9}}
+
+
+def test_a_decision_renders_litellm_answers_and_nothing_of_muse() -> None:
+    """`as_wire` drops every muse addition.
+
+    A consumer reading a decision should read litellm's answer verbatim; a
+    muse-only field on the wire is a field litellm's own docs cannot explain."""
+    assert decision().as_wire() == {"q1": {"type": "predicate", "predicate": 0.93}}
+
+
+async def test_a_decision_is_refused_before_the_call_when_no_credential_is_held() -> None:
+    """The same check `complete` makes, on the decisions path: no key means no
+    request, no spend and no rate-limit counter spent on a credential that was
+    never going to work."""
+    provider = LiteLLMProvider(name=OPENAI, credentials=StaticCredentials({}), litellm=make_stub())
+    with pytest.raises(CredentialUnavailable, match="no credential is configured"):
+        await provider.decide(decide_ask())
+
+
+async def test_a_decision_carries_the_traceparent_when_something_is_tracing() -> None:
+    """The ambient trace, propagated on the decisions path exactly as on the
+    completion's: muse's spans join the caller's trace, and a decision that
+    dropped it would be a second, disconnected trace for one request."""
+    stub = make_stub()
+    provider = LiteLLMProvider(name=OPENAI, api_key="sk-test", litellm=stub)
+    tracer, _ = recording_telemetry()
+    with tracer.span("muse.decide"):
+        await provider.decide(decide_ask())
+
+    # The stub keeps every kwarg it was handed, so what the adapter sent on the
+    # wire is readable without a second double that agrees with the code.
+    assert "traceparent" in stub.captured["extra_headers"]
 
 
 async def test_the_adapter_rejects_a_message_with_null_content() -> None:

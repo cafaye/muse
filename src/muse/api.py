@@ -34,7 +34,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -45,6 +45,7 @@ from muse.auth import SCOPE, Principal, TokenVerifier, bearer_token, require_sco
 from muse.errors import (
     AllCandidatesFailed,
     AuthError,
+    DecisionRequestRefused,
     InsufficientScope,
     MissingAccount,
     MuseError,
@@ -52,6 +53,10 @@ from muse.errors import (
     RouteNotFound,
     SigningKeysUnavailable,
     Unauthenticated,
+)
+from muse.providers import (
+    DecisionsQuestion,
+    DecisionsRequest,
 )
 
 #: core's error type URIs. Stable, machine-readable, and the last segment is the same
@@ -336,6 +341,73 @@ class ModelList(BaseModel):
     data: list[ModelEntry]
 
 
+#: One question, as a caller states it on the wire for `POST /v1/decisions`.
+#:
+#: `instructions` and `criteria` are `object`, not typed, deliberately. What a
+#: criterion *says* is the model's business — litellm validates it, and its error is
+#: the one surfaced. Typing them here would be a second validator agreeing with
+#: litellm's today and disagreeing with it after an upgrade, and the disagreement
+#: would show up as a 422 where the caller deserves litellm's own 400.
+class DecisionQuestionBody(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["noul", "choice", "score", "predicate"]
+    instructions: object | None = None
+    criteria: object | None = None
+
+
+class DecisionsRequestBody(BaseModel):
+    """One `input`, judged against 1 to N questions.
+
+    `extra="forbid"`, exactly as on `RouteRequestBody` and for the same reason: a
+    typo'd `safety_identifier` that is silently ignored leaves a caller believing
+    they sent a stable end-user id when nothing was. `stream` is one of those typos
+    — a request carrying it is a 422 naming the field, the same refusal and the same
+    status the `/chat/completions` alias gives, because the consequence of ignoring
+    it is identical: a caller who asked for a stream and got a whole response with no
+    way to tell.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(description="The route to use, as named in config/routes.yaml.")
+    input: str = Field(description="The text being judged.")
+    questions: list[DecisionQuestionBody] = Field(
+        min_length=1,
+        description=(
+            "The questions, asked in the order they are answered. `noul` takes "
+            'criteria `{"true": ..., "false": ...}`; `choice` takes a label map; '
+            "`score` takes the levels from lowest to highest."
+        ),
+    )
+
+
+class DecisionsResponseBody(BaseModel):
+    """The answers, in the order they were asked.
+
+    `answers` is a mapping keyed by the name muse assigned each question, because
+    that is the shape litellm's decisions response is and a client written against
+    litellm's docs reads it as one. Python dicts preserve insertion order, so the
+    mapping *is* the answer order: `q1`, `q2`, ... in question order.
+
+    muse's own fields — `provider`, `route`, `cost_micros` and `trace_id` — are here
+    the way they are on `/v1/route`'s body, because a decision spends tokens and a
+    caller who cannot see what it cost cannot reconcile an invoice. This is not an
+    alias, so unlike `/chat/completions` it does not drop them.
+    """
+
+    id: str
+    object: Literal["decisions"]
+    created: int
+    model: str
+    provider: str
+    route: str
+    answers: dict[str, dict[str, Any]]
+    usage: dict[str, int]
+    cost_micros: int
+    trace_id: str
+
+
 #: A served completion, before any response shape is chosen.
 #:
 #: One type for both endpoints because there is one served completion: the alias and
@@ -466,6 +538,135 @@ async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
     )
 
 
+async def serve_decision(request: Request) -> ServedDecision | JSONResponse:
+    """Authenticate, validate, route, meter — the decisions path, in that order.
+
+    The order is `serve_completion`'s order and deliberately so, because each step
+    is there for the reason it is there on the completion path:
+
+    1. **Authenticate first**, before the body is read and before any provider is
+       contacted. An unauthenticated request must not be able to spend money, and
+       it must not be able to learn whether a model name routes at all.
+    2. **Validate**, so a typo'd field is a 422 naming the field rather than a bill
+       for a request nobody meant.
+    3. **Route**, through `container.router` — the one router, with the one fallback
+       chain and the one breaker registry. A decision gets the same reliability a
+       completion does, which is the whole reason this is a method on the router
+       rather than a bare litellm call in a handler.
+    4. **Meter, before the response is built and not inside a `try`.** A decision
+       costs tokens exactly as a completion does, so it is metered by the same
+       `Meter.record` in the same transaction. A caller must not be able to read a
+       decision for free, and one that was paid for must not lose its record
+       silently.
+
+    The two operations share every step but the request shape, which is why this
+    function exists rather than a branch inside `serve_completion`: one is a list of
+    `Message` and a temperature, the other an `input` and a question list, and the
+    responses have nothing in common either way. Everything *around* the payload —
+    the auth, the router, the meter, the outbox, the error envelope — is the same
+    code, so a failure mode here is a failure mode there by construction rather than
+    by two pieces of code agreeing.
+
+    A `JSONResponse` return is a `problem+json` failure, and it is produced by the
+    same helpers `/v1/route` uses.
+    """
+    try:
+        await require_bearer(request)
+    except AuthError as error:
+        return auth_problem(request, error)
+
+    try:
+        body = DecisionsRequestBody.model_validate(await request.json())
+    except ValidationError as error:
+        return problem(request, "validation_failed", 422, _describe(error), fields=_fields(error))
+    except ValueError:
+        return problem(request, "validation_failed", 422, "the request body is not valid JSON")
+
+    container = request.app.state.container
+    try:
+        result = await container.router.route_decisions(
+            body.model,
+            DecisionsRequest(
+                model=body.model,
+                input=body.input,
+                questions=tuple(
+                    DecisionsQuestion(
+                        name=f"q{index}",
+                        type=question.type,
+                        instructions=question.instructions,
+                        criteria=question.criteria,
+                    )
+                    for index, question in enumerate(body.questions, start=1)
+                ),
+            ),
+            secrets=container.credentials_held(),
+        )
+    except RouteNotFound as error:
+        return problem(
+            request, "not_found", 404, f"no route is configured for model {error.model!r}"
+        )
+    except DecisionRequestRefused as error:
+        # 400, not a 422: the body parsed as a decision request, and what is wrong
+        # is something only a model can tell — the question count, the shape of a
+        # `criteria` map. litellm refuses it before any model is called, so naming
+        # it costs the caller nothing and the fallback chain is not spent on it.
+        return problem(request, "validation_failed", 400, str(error))
+    except AllCandidatesFailed as error:
+        return problem(request, "unavailable", 503, _chain(error))
+
+    await container.meter.record(result)
+
+    decision = result.decision
+    answers = dict(decision.answers)
+    return ServedDecision(
+        id=f"decision-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=result.model,
+        provider=decision.provider,
+        route=result.route,
+        answers=answers,
+        tokens_in=decision.tokens_in,
+        tokens_out=decision.tokens_out,
+        cost_micros=result.cost_micros,
+        trace_id=trace_id_for(request),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ServedDecision:
+    """A decision, before the response shape is chosen.
+
+    One object rather than the pieces, so the endpoint hands the caller the answers,
+    the usage and the cost from the one result that was metered — the same discipline
+    `ServedCompletion` holds, and for the same reason: two copies of the counts is
+    two things to keep in agreement.
+    """
+
+    id: str
+    created: int
+    model: str
+    provider: str
+    route: str
+    answers: dict[str, dict[str, Any]]
+    tokens_in: int
+    tokens_out: int
+    cost_micros: int
+    trace_id: str
+
+    @property
+    def usage(self) -> dict[str, int]:
+        """`total_tokens` computed here rather than taken from a provider.
+
+        Same rule as `ServedCompletion.usage`: a provider that reports its two
+        counts consistently must not be able to make the three disagree.
+        """
+        return {
+            "prompt_tokens": self.tokens_in,
+            "completion_tokens": self.tokens_out,
+            "total_tokens": self.tokens_in + self.tokens_out,
+        }
+
+
 def build_router() -> APIRouter:
     """The versioned surface. A separate router so the probes and the API can be
     mounted, tested and reasoned about independently."""
@@ -575,6 +776,53 @@ def build_router() -> APIRouter:
         return JSONResponse(
             content=response.model_dump(),
             headers={TRACE_HEADER: trace_id_for(request)},
+        )
+
+    @api.post(
+        "/decisions",
+        response_model=DecisionsResponseBody,
+        status_code=200,
+        summary="Ask questions about an input (litellm's decisions API)",
+        description=(
+            "Judges an `input` against 1 to N questions and returns the answers in "
+            "the same order. The response shape is litellm's own decisions shape, so "
+            "a client written against litellm's docs works against muse unchanged. "
+            "Question types are litellm's: **noul** (a calibrated probability that "
+            "the answer is yes, with `criteria` distinguishing true from false), "
+            "**choice** (one label out of a `criteria` map, with confidence and "
+            "probabilities) and **score** (an index into the `criteria` levels, with "
+            "confidence and probabilities). A question asking `predicate` is the same "
+            "yes/no question in the OpenAI-flavoured spelling and is answered as a "
+            "`noul`, which is how litellm names it.\n\n"
+            "Served by the same routing, authentication, authorization, metering and "
+            "outbox path as `POST /v1/route`: one auth check, one fallback chain, one "
+            "breaker registry and one metered event. A decision costs tokens, and a "
+            "caller who reads one for free is a caller nobody is charged for.\n\n"
+            "**Streaming is not supported** — a request carrying `stream` is a 422 "
+            "naming the field, not a silently non-streaming answer, exactly as on "
+            "`/v1/chat/completions`."
+        ),
+    )
+    async def create_decision(request: Request) -> Response:
+        served = await serve_decision(request)
+        if isinstance(served, JSONResponse):
+            return served
+
+        response = DecisionsResponseBody(
+            id=served.id,
+            object="decisions",
+            created=served.created,
+            model=served.model,
+            provider=served.provider,
+            route=served.route,
+            answers=served.answers,
+            usage=served.usage,
+            cost_micros=served.cost_micros,
+            trace_id=served.trace_id,
+        )
+        return JSONResponse(
+            content=response.model_dump(),
+            headers={TRACE_HEADER: response.trace_id},
         )
 
     return api

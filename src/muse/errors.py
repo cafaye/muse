@@ -197,6 +197,22 @@ class ResponseShapeError(ProviderError):
     """
 
 
+class DecisionRequestRefused(MuseError):
+    """A decision request the questions themselves make invalid.
+
+    Raised by the router when the provider — litellm, whose validation this service
+    surfaces rather than reimplements — refuses the request before any model is
+    called. The caller's question count or a question's `criteria` is wrong, and no
+    provider would have answered it, so the router stops instead of spending the
+    fallback chain on a request that is broken everywhere.
+
+    A `MuseError` and not a `ProviderError` on purpose: the taxonomy splits on
+    "would the identical call succeed a moment later", and this one would not. It
+    would if it were a candidate failure, so it is not one, and the endpoint turns
+    it into the 400 a caller can fix.
+    """
+
+
 class MeteringError(MuseError):
     """A completion cannot be turned into a metered event.
 

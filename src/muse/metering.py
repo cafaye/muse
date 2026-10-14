@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 from muse.contracts import SERVICE_NAME, TOKENS_CONSUMED, validate_event_type, validate_subject
 from muse.db import Database
 from muse.errors import MeteringError
-from muse.router import RoutedCompletion
+from muse.router import RoutedCompletion, RoutedDecision
 
 #: RFC3339, UTC, `Z`-suffixed. Not an epoch and not a local time: the column is
 #: `timestamptz` and a value with an offset would be read back as a different instant
@@ -104,28 +104,44 @@ class UsageEvent:
         }
 
 
-def envelope_for(result: RoutedCompletion, *, now: str | None = None) -> UsageEvent:
-    """Build the envelope for one routed completion.
+def envelope_for(
+    result: RoutedCompletion | RoutedDecision, *, now: str | None = None
+) -> UsageEvent:
+    """Build the envelope for one routed call — a completion or a decision.
 
     `now` is injectable so a test can assert an exact string; production leaves it
     alone and gets the wall clock. It is the time the *call* happened, not the time
     the row is inserted — a publisher that batched an hour of events would otherwise
     report them all as published at once, and a consumer reconstructing usage over a
     period would be reading a lie.
+
+    One function for both operations, and not a second envelope for decisions. The
+    event is `muse.tokens.consumed` and its five fields are the five facts billing
+    cannot reconstruct on its own — which vendor, which model, how many tokens each
+    way, what it cost — and a decision has all five exactly as a completion does.
+    A second type would be a second contract for a consumer to parse and a second
+    place for the money to be computed differently, which is the failure this
+    module exists to prevent.
+
+    So both result types answer the same three questions, and `RoutedDecision`
+    exposes them the same way `RoutedCompletion` does: the usage on the decision,
+    the cost as a property read from the price resolved at dispatch.
     """
-    completion = result.completion
+    if isinstance(result, RoutedCompletion):
+        model, provider = result.completion.model, result.completion.provider
+        tokens_in, tokens_out = result.completion.tokens_in, result.completion.tokens_out
+    else:
+        model, provider = result.decision.model, result.decision.provider
+        tokens_in, tokens_out = result.decision.tokens_in, result.decision.tokens_out
     moment = now if now is not None else _utc_now()
     if not _RFC3339.match(moment):
         raise MeteringError(f"{moment!r} is not an RFC3339 UTC timestamp")
-    # The usage is checked before the cost, so the error names the field that is
-    # actually wrong. Computing the cost first would raise from `usage_cost_micros`
+    # The usage is checked before the cost is computed, so the error names the field
+    # that is actually wrong. `usage_cost_micros` refuses a negative count too, but
     # with the same numbers and none of this module's context — and the difference
     # matters, because a negative count means a provider adapter is misreporting.
-    if completion.tokens_in < 0 or completion.tokens_out < 0:
-        raise MeteringError(
-            f"refusing to meter negative usage: {completion.tokens_in} in, "
-            f"{completion.tokens_out} out"
-        )
+    if tokens_in < 0 or tokens_out < 0:
+        raise MeteringError(f"refusing to meter negative usage: {tokens_in} in, {tokens_out} out")
     return UsageEvent(
         id=_new_id(),
         type=validate_event_type(TOKENS_CONSUMED),
@@ -133,11 +149,11 @@ def envelope_for(result: RoutedCompletion, *, now: str | None = None) -> UsageEv
         subject=validate_subject(SUBJECT),
         time=moment,
         data={
-            "model": completion.model,
-            "provider": completion.provider,
-            "tokens_in": completion.tokens_in,
-            "tokens_out": completion.tokens_out,
-            "cost_micros": completion.cost_micros,
+            "model": model,
+            "provider": provider,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_micros": result.cost_micros,
         },
     )
 
@@ -162,12 +178,14 @@ class Meter:
         """
         return self._now()
 
-    async def record(self, result: RoutedCompletion) -> UsageEvent:
-        """Meter one completion.
+    async def record(self, result: RoutedCompletion | RoutedDecision) -> UsageEvent:
+        """Meter one routed call — a completion or a decision.
 
         In a transaction, and without catching anything. The caller of the router
         gets this error: the call was paid for, so losing its record silently is the
-        one outcome that must not happen.
+        one outcome that must not happen. A decision that returned without its
+        record would be exactly the same loss with a different name on it, which is
+        why the parameter is both types and the insert below is one statement.
         """
         event = envelope_for(result, now=self._now())
         async with self._db.transaction() as tx:

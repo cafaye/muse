@@ -70,9 +70,11 @@ from muse.errors import (
     AllCandidatesFailed,
     CandidateFailure,
     CircuitOpen,
+    DecisionRequestRefused,
     PriceUnavailable,
     ProviderError,
     ProviderIndeterminate,
+    ProviderInvalidRequest,
     RouteNotFound,
     is_retryable,
     trips_breaker,
@@ -80,6 +82,9 @@ from muse.errors import (
 from muse.providers import (
     Completion,
     CompletionRequest,
+    Decision,
+    DecisionsQuestion,
+    DecisionsRequest,
     Message,
     ProviderRegistry,
 )
@@ -158,15 +163,58 @@ class RoutedCompletion:
 
 
 @dataclass(frozen=True, slots=True)
+class RoutedDecision:
+    """A decision plus how it was obtained — the decisions counterpart of
+    `RoutedCompletion`, and shaped like it for the same reason.
+
+    The counters are there for the same dashboard: a decision route whose
+    `candidates_tried` is climbing is falling back, and one whose `attempts` is
+    climbing is being retried, and a caller cannot tell those apart from one
+    number.
+
+    A separate type rather than a `RoutedCompletion` with the answers parked in a
+    field, because `Completion` is one chat completion: it carries `content`, a
+    `finish_reason` and a price per direction, and none of those mean anything
+    here. Putting a decision in one would be a shape every meter, every span and
+    every caller would have to hold two meanings for at once.
+    """
+
+    decision: Decision
+    #: The route the client asked for, exactly as on `RoutedCompletion`.
+    route: str
+    model: str
+    #: How many distinct candidates were tried. 1 means the primary worked.
+    candidates_tried: int
+    #: How many provider calls were made in total, including retries.
+    attempts: int
+
+    @property
+    def cost_micros(self) -> int:
+        """What the call cost, in micro-dollars.
+
+        Read from the decision rather than recomputed, exactly as on
+        `RoutedCompletion`: the decision carries the price resolved at dispatch
+        time, and re-deriving it here could read a different row of a table that
+        moved in between.
+        """
+        return self.decision.cost_micros
+
+
+@dataclass(frozen=True, slots=True)
 class _Attempt:
     """What one candidate did.
 
-    Either a completion or a failure, never both and never neither. Returning this
+    Either a result or a failure, never both and never neither. Returning this
     rather than raising keeps "a candidate failed" on the normal path through a
     fallback chain instead of making it exceptional.
+
+    Two result shapes — a `Completion` and a `Decision` — because the two
+    operations return different things and forcing one into the other would mean
+    a `Decision` carrying a `content` string it does not have.
     """
 
     completion: Completion | None = None
+    decision: Decision | None = None
     failure: CandidateFailure | None = None
     calls: int = 0
 
@@ -300,14 +348,105 @@ class Router:
                 failures.append(outcome.failure)
         raise AllCandidatesFailed(route.model, tuple(failures))
 
+    async def route_decisions(
+        self,
+        model: str,
+        ask: DecisionsRequest,
+        *,
+        secrets: Sequence[Secret | str] = (),
+    ) -> RoutedDecision:
+        """Serve `model`, or raise. The decisions path, and deliberately not a second
+        router.
+
+        Same `RouteTable`, same breaker registry, same retry policy, same span and
+        the same failure taxonomy as `route`. Written separately only because the
+        *payload* differs — the questions go out as a decision request and come back
+        as answers — and everything around that is the code `route` already runs.
+
+        Raises `RouteNotFound` for a model nothing routes, exactly as `route` does, so
+        an unrouted decision is a 404 a caller can act on. Raises
+        `DecisionRequestRefused` when litellm rejects the request itself — a
+        question that does not validate is a caller-fixable mistake and must not
+        consume the fallback chain, which exists for a provider being *down*, not
+        for a request that is wrong everywhere.
+
+        Raises `AllCandidatesFailed` when every candidate was tried and each failed
+        transiently, which is the 503 that means muse is up and the models are not.
+        """
+        route = self._routes.find(model)
+        if route is None:
+            raise RouteNotFound(model)
+
+        # Named before dispatch, and here rather than in the provider: the answers
+        # come back under these keys, and two questions the caller did not name
+        # would collide silently and drop an answer.
+        named = tuple(
+            DecisionsQuestion(
+                name=f"q{index}",
+                type=question.type,
+                instructions=question.instructions,
+                criteria=question.criteria,
+            )
+            for index, question in enumerate(ask.questions, start=1)
+        )
+        request = DecisionsRequest(model=model, input=ask.input, questions=named)
+
+        failures: list[CandidateFailure] = []
+        attempts = 0
+        with self._telemetry.span("muse.route", muse_route=route.model) as span:
+            for index, candidate in enumerate(route.candidates):
+                outcome = await self._attempt(
+                    candidate=candidate,
+                    route=route,
+                    decisions=request,
+                    secrets=secrets,
+                    index=index,
+                )
+                attempts += outcome.calls
+                if outcome.decision is not None:
+                    result = RoutedDecision(
+                        decision=outcome.decision,
+                        route=route.model,
+                        model=outcome.decision.model,
+                        candidates_tried=len(failures) + 1,
+                        attempts=attempts,
+                    )
+                    record(
+                        span,
+                        muse_model=result.model,
+                        muse_provider=result.decision.provider,
+                        muse_candidates_tried=result.candidates_tried,
+                        muse_attempts=result.attempts,
+                        muse_tokens_in=result.decision.tokens_in,
+                        muse_tokens_out=result.decision.tokens_out,
+                    )
+                    return result
+                assert outcome.failure is not None, (
+                    "an attempt produced neither a result nor a failure"
+                )
+                # A request litellm refuses is wrong for every candidate, so
+                # advancing to the next one would report a fleet outage for a
+                # caller-fixable mistake. Raised here rather than after the loop so
+                # the first refusal is the one the caller reads.
+                # `failure.error` is already the exception *class* — `_attempt`
+                # records `type(error)` so the failure is re-raisable and nameable
+                # (see the chain render in api.py, which reads `.__name__`). Comparing
+                # `type(...)` of it here would ask for the metaclass and match nothing,
+                # quietly turning every caller-fixable refusal into a 503.
+                if outcome.failure.error is ProviderInvalidRequest:
+                    raise DecisionRequestRefused(str(outcome.failure.detail))
+                failures.append(outcome.failure)
+        raise AllCandidatesFailed(route.model, tuple(failures))
+
     async def _attempt(
         self,
         *,
         candidate: Candidate,
         route: Route,
-        messages: tuple[Message, ...],
-        max_tokens: int | None,
-        temperature: float | None,
+        messages: tuple[Message, ...] = (),
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        decisions: DecisionsRequest | None = None,
         secrets: Sequence[Secret | str],
         index: int,
     ) -> _Attempt:
@@ -316,6 +455,11 @@ class Router:
         The registry lookup is deliberately outside the retry: a name that resolves
         to nothing is a configuration error, not a provider that was briefly
         unavailable, and retrying it would just delay the same error.
+
+        One method for both operations rather than two, and the price lookup, the
+        breaker, the retry budget and the backoff are exactly the code the
+        completion path runs. A decisions path that carried its own copy of them
+        would be a second router with its own idea of when to fall through.
         """
         provider = self._registry.get(candidate.provider)
         model = candidate.model or route.model
@@ -368,17 +512,21 @@ class Router:
                 )
             )
 
-        request = CompletionRequest(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
+        request = (
+            DecisionsRequest(model=model, input=decisions.input, questions=decisions.questions)
+            if decisions is not None
+            else CompletionRequest(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         )
         policy = route.retry
         calls = 0
         started = self._clock()
 
-        async def call() -> Completion:
+        async def call() -> Completion | Decision:
             nonlocal calls
             calls += 1
             with self._telemetry.span(
@@ -391,7 +539,11 @@ class Router:
             ) as span:
                 began = self._clock()
                 try:
-                    completion = await provider.complete(request)
+                    outcome = (
+                        await provider.decide(request)  # type: ignore[arg-type]
+                        if decisions is not None
+                        else await provider.complete(request)  # type: ignore[arg-type]
+                    )
                 except ProviderError as error:
                     # The fleet's class for this failure, never the message. A
                     # vendor's message is third-party text and a content-policy
@@ -403,23 +555,43 @@ class Router:
                     record(span, muse_latency_ms=int((self._clock() - began) * 1000))
                     record_error(span, error)
                     raise
+                # `muse_cost_micros` is on the completion path only. A decision
+                # carries its token counts but not a price — the decision's cost is
+                # the meter's business, and putting it here would be a second place
+                # money is computed for the same call.
                 record(
                     span,
-                    muse_tokens_in=completion.tokens_in,
-                    muse_tokens_out=completion.tokens_out,
-                    muse_cost_micros=completion.cost_micros,
+                    muse_tokens_in=outcome.tokens_in,
+                    muse_tokens_out=outcome.tokens_out,
+                    **(
+                        {"muse_cost_micros": outcome.cost_micros}
+                        if isinstance(outcome, Completion)
+                        else {}
+                    ),
                     muse_latency_ms=int((self._clock() - began) * 1000),
                 )
-            return Completion(
-                provider=completion.provider,
-                model=completion.model,
-                content=completion.content,
-                tokens_in=completion.tokens_in,
-                tokens_out=completion.tokens_out,
-                # The price resolved before dispatch, carried onto the result rather
-                # than looked up again: a second lookup could read a different row.
+            if isinstance(outcome, Completion):
+                return Completion(
+                    provider=outcome.provider,
+                    model=outcome.model,
+                    content=outcome.content,
+                    tokens_in=outcome.tokens_in,
+                    tokens_out=outcome.tokens_out,
+                    # The price resolved before dispatch, carried onto the result rather
+                    # than looked up again: a second lookup could read a different row.
+                    price=price,
+                    finish_reason=outcome.finish_reason,
+                )
+            # The same rule for the other result type: the price is already resolved,
+            # so it rides along rather than being looked up a second time on the way
+            # to the meter.
+            return Decision(
+                provider=outcome.provider,
+                model=outcome.model,
+                answers=dict(outcome.answers),
+                tokens_in=outcome.tokens_in,
+                tokens_out=outcome.tokens_out,
                 price=price,
-                finish_reason=completion.finish_reason,
             )
 
         # One jitter draw per attempt, memoised. tenacity computes the wait *before*
@@ -474,9 +646,11 @@ class Router:
         try:
             async for attempt in retrying:
                 with attempt:
-                    result = _Attempt(completion=await call(), calls=calls)
+                    outcome = await call()
                     breaker.record_success()
-                    return result
+                    if isinstance(outcome, Decision):
+                        return _Attempt(decision=outcome, calls=calls)
+                    return _Attempt(completion=outcome, calls=calls)  # type: ignore[arg-type]
         except ProviderError as error:
             if trips_breaker(error):
                 # One candidate failing is one strike, however many attempts it took:
