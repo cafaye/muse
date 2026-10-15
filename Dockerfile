@@ -24,7 +24,12 @@ WORKDIR /app
 # --no-dev on every sync is load-bearing rather than tidiness. The dev group carries
 # the OTLP exporter because the suite imports it, and the image must not inherit it.
 # Asserted by tests/test_dependencies.py::test_the_exporter_stays_out_of_the_image.
-COPY pyproject.toml uv.lock README.md ./
+# `LICENSE` is in this COPY and it is not tidiness: `pyproject.toml` declares
+# `license = { file = "LICENSE" }`, so hatchling reads the file when the second
+# `uv sync` below installs the project itself. Without it the image build fails
+# with `OSError: License file does not exist` — from the build backend, three
+# frames below anything that names a Dockerfile.
+COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
