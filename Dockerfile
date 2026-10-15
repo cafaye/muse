@@ -52,6 +52,13 @@ ENV PATH="/opt/venv/bin:$PATH" \
 COPY --from=builder --chown=muse:muse /opt/venv /opt/venv
 
 WORKDIR /app
+# `config/routes.yaml` is not optional. `create_app` reads it at startup and
+# refuses to boot without it — which is the correct behaviour for a file the
+# whole routing table lives in, and a boot failure that names the path. The
+# Dockerfile copied `src/` and nothing else, so the image came up, answered
+# its build, and then exited with `FileNotFoundError: /app/config/routes.yaml`
+# on every start. Nothing ran the image; the suite never starts a server.
+COPY --chown=muse:muse config/ ./config/
 COPY --chown=muse:muse src/ ./src/
 
 USER muse
