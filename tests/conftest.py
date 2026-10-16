@@ -16,8 +16,10 @@ import httpx
 import pytest
 import yaml
 
-from muse.main import create_app
+from muse.main import VENDORS, create_app
 
+from muse.providers import ProviderRegistry
+from muse.providers.fake import FakeProvider
 from .support.jwks import token
 from .support.test_app import IDENTITY
 
@@ -88,3 +90,18 @@ async def client(app) -> AsyncIterator[httpx.AsyncClient]:
     """HTTP client bound to `app` via ASGI transport."""
     async with asgi_client(app) as c:
         yield c
+
+
+@pytest.fixture
+def fleet_registry() -> ProviderRegistry:
+    """A registry holding every vendor this build declares an adapter for.
+
+    Derived from `muse.main.VENDORS` rather than written out, so a vendor added
+    to the build is a vendor the suite validates the committed routes file
+    against — and a routes file naming a vendor with no adapter fails here
+    instead of on the first request.
+    """
+    registry = ProviderRegistry()
+    for vendor in VENDORS:
+        registry.register(FakeProvider(vendor))
+    return registry

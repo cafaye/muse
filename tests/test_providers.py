@@ -1298,6 +1298,31 @@ def test_every_declared_vendor_has_a_prefix_and_a_probe_model(vendor: str) -> No
     assert PROBE_MODELS[vendor]
 
 
+def test_an_aggregator_is_priced_by_the_model_underneath() -> None:
+    """`openrouter/openai/gpt-4o-mini` is priced as `openai/gpt-4o-mini`.
+
+    litellm's cost map is keyed by the vendor that owns the model and has no
+    entry for an aggregator's spelling of it, so pricing the qualified name
+    would raise `PriceUnavailable` for a model that has a perfectly good
+    published price. The aggregator's own price is a markup on the vendor's
+    rather than a fact litellm publishes.
+    """
+    provider = make_provider(name="openrouter")
+    assert provider.priceable_model("openai/gpt-4o-mini") == "openai/gpt-4o-mini"
+    # A bare model under an aggregator names no vendor underneath: the strip
+    # leaves the model as it was, and neither it nor the qualified name is a
+    # model litellm can price. `PriceUnavailable` is the honest answer rather
+    # than a wrong price invented for a model nobody can place.
+    assert provider.priceable_model("gpt-4o-mini") == "gpt-4o-mini"
+
+
+def test_a_model_vendor_is_priced_by_its_own_qualified_name() -> None:
+    """The strip only applies to an aggregator. `anthropic/claude-haiku-4-5`
+    is priced as itself, because that name is the one litellm's map holds."""
+    provider = make_provider(name=ANTHROPIC)
+    assert provider.priceable_model("claude-haiku-4-5") == "anthropic/claude-haiku-4-5"
+
+
 def test_openrouter_keeps_its_models_vendor_qualified() -> None:
     """`openrouter/openai/gpt-4o-mini`, not `openrouter/gpt-4o-mini`.
 

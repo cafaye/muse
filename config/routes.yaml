@@ -73,32 +73,57 @@ defaults:
   budget_seconds: 20.0
 
 routes:
-  # The everyday route. A small model on a cheap vendor, with a same-tier fallback
-  # rather than a bigger one: when the cheap model is unavailable, the caller wanted
-  # a cheap answer, not a different expensive one.
+  # The house model for completions: DeepSeek v4.1 Flash behind opencode's
+  # OpenAI-compatible gateway. `fast` is what an answer, a receipt and a
+  # draft are served by — the prose work.
   - model: fast
     description: Small, cheap, for classification, extraction and routing.
+    # Three candidates, in order of preference, and each one is a DIFFERENT way
+    # to reach a model. That is the point of a fallback chain: a gateway being
+    # down, an aggregator having no capacity, and the vendor itself being
+    # unreachable are three different failures, and one credential reaching the
+    # vendor directly survives all three.
     candidates:
-      - provider: openai
-        model: gpt-4o-mini
-      - provider: anthropic
-        model: claude-haiku-4-5
+      - provider: opencode
+        model: deepseek-v4.1-flash
+      - provider: openrouter
+        model: deepseek/deepseek-chat
+      - provider: deepseek
+        model: deepseek-chat
     timeout_seconds: 20.0
 
-  # The capable route. Retries twice: a *connect* failure or a 5xx on a long
-  # completion is common enough that one attempt would surface an error the second
-  # attempt would have answered, and 0.25s of backoff is cheap against a request that
-  # costs cents. A read timeout is deliberately NOT retried here even though it was
-  # retried before muse-03 — see `retry_indeterminate` above. The fallback still
-  # answers, so the cost of this decision is a 503 on a genuinely ambiguous timeout
-  # rather than a possible duplicate charge on a Sonnet-priced request.
+  # The most capable model available, for reasoning and long output. Same
+  # gateway; opencode routes to a larger model behind the same credential, so
+  # the house stack needs one key rather than one per vendor.
   - model: smart
     description: The most capable model available, for reasoning and long output.
     candidates:
-      - provider: anthropic
-        model: claude-sonnet-4-5
-      - provider: openai
-        model: gpt-4o
+      - provider: opencode
+        model: deepseek-v4.1
+      # The aggregator is a different way to reach a larger model, and the
+      # vendor itself is a third. A reasoning turn is the one that must not
+      # fail, so the chain is three deep here as well.
+      - provider: openrouter
+        model: deepseek/deepseek-chat
+      - provider: deepseek
+        model: deepseek-reasoner
     max_attempts: 3
     budget_seconds: 30.0
     timeout_seconds: 60.0
+
+  # Decisions are a DIFFERENT operation from a completion, and they go to a
+  # different vendor: TypeSafe's Jev, which answers calibrated questions
+  # rather than generating prose. `POST /v1/decisions` names this route.
+  #
+  # Why not `fast`: litellm ships a decisions transformation for a specific
+  # set of vendors (openai, azure_ai, cloudflare, hosted_vllm, perplexity,
+  # strands_decider, typesafe) and none for anthropic or deepseek. A decision
+  # route naming a vendor with no transformation reaches litellm, is refused,
+  # and surfaces as a 503 for every request — so the route names the vendor
+  # whose decisions endpoint exists.
+  - model: decide
+    description: "Calibrated decisions about an input: classification, disposition, weight."
+    candidates:
+      - provider: typesafe
+        model: jev-latest
+    timeout_seconds: 20.0

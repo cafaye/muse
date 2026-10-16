@@ -39,6 +39,7 @@ import json
 
 import pytest
 
+from muse.api import DecisionQuestionBody, _criteria_for
 from muse.errors import ProviderTimeout
 from muse.outbox import InMemoryTransport, OutboxPublisher
 from muse.providers import LiteLLMProvider, Price, ProviderRegistry
@@ -116,6 +117,11 @@ def question(**overrides) -> dict:
         "criteria": {"true": "wants money back", "false": "asks a question"},
         **overrides,
     }
+
+
+def _question(**overrides) -> DecisionQuestionBody:
+    """One question body, so a test states only what it varies."""
+    return DecisionQuestionBody(**{"type": "noul", "instructions": "x", **overrides})
 
 
 def bearer() -> dict[str, str]:
@@ -530,6 +536,50 @@ async def test_every_candidate_failing_is_the_same_503() -> None:
 
 
 # --- the response shape, asserted whole ------------------------------------
+
+
+# --- the two question dialects, and the seam between them --------------------
+
+
+def test_a_choice_question_sent_in_the_openai_dialect_reaches_litellm_as_criteria() -> None:
+    """`choices` is a list of `{value, description}`; litellm's `DecisionQuestion`
+    takes `criteria` as a MAP of label to description.
+
+    This is the shape a caller following litellm's proxy docs sends, and the
+    shape muse hand-off used to pass straight through — which pydantic accepted
+    and litellm refused with `choice.criteria: Field required`, a 400 naming a
+    field the caller never sent.
+    """
+    criteria = _criteria_for(
+        _question(type="choice", choices=[{"value": "question"}, {"value": "feedback", "description": "an opinion"}])
+    )
+
+    assert criteria == {"question": None, "feedback": "an opinion"}
+
+
+def test_a_score_question_sent_in_the_openai_dialect_reaches_litellm_as_criteria() -> None:
+    """`levels` is a list of labels or `{label, description}`; litellm takes
+    `criteria` as a SEQUENCE of labels."""
+    criteria = _criteria_for(
+        _question(type="score", levels=[{"label": "minor"}, {"label": "urgent", "description": "blocked"}])
+    )
+
+    assert criteria == ["minor", "urgent"]
+
+
+def test_a_question_already_in_litellm_dialect_is_passed_through_untouched() -> None:
+    """`criteria` is litellm's own field, and a caller using it needs no
+    translation — re-shaping it would be a second opinion about a shape the
+    caller already got right."""
+    stated = {"true": "wants money back", "false": "asks a question"}
+
+    assert _criteria_for(_question(type="predicate", criteria=stated)) is stated
+
+
+def test_a_question_with_no_options_at_all_returns_none() -> None:
+    """A `noul` needs only its instructions, so there is nothing to build. `None`
+    rather than an empty map, because an empty map is a shape litellm refuses."""
+    assert _criteria_for(_question(type="predicate", instructions="refund?")) is None
 
 
 async def test_the_decision_body_has_exactly_the_documented_shape() -> None:

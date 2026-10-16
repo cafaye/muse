@@ -26,7 +26,7 @@ import base64
 import pytest
 
 from muse.errors import CredentialUnavailable, RouteConfigError
-from muse.main import Container, Settings, create_app
+from muse.main import VENDORS, Container, Settings, create_app
 from muse.metering import Meter
 from muse.providers import LiteLLMProvider, ProviderRegistry
 from muse.providers.credentials import StaticCredentials, VaultCredentials
@@ -260,7 +260,7 @@ async def test_the_lifespan_builds_a_container_when_none_was_supplied(
     async with app.router.lifespan_context(app):
         container = app.state.container
     assert container is not None
-    assert container.registry.names() == ("anthropic", "openai")
+    assert container.registry.names() == tuple(sorted(VENDORS))
     assert container.routes.models() == ("fast",)
     assert container.router.routes is container.routes
     assert isinstance(container.vault, Vault)

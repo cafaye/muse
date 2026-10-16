@@ -98,7 +98,12 @@ DEFAULT_IDENTITY_AUDIENCE = "muse"
 #: The vendors this build ships adapters for. Named in one place because the routes
 #: file is validated against the registry at boot, and a file naming a fourth vendor
 #: must fail there rather than at the first request.
-VENDORS = ("openai", "anthropic")
+#:
+#: Four, and two of them are aggregators rather than model vendors. An aggregator
+#: serves several vendors' models behind one credential, which is the shape a
+#: developer's key ring actually has — and the reason muse can run on a laptop
+#: with one OpenRouter key is that it is listed here.
+VENDORS = ("openai", "anthropic", "openrouter", "deepseek", "opencode", "typesafe")
 
 #: Overall verdict reported by ``/readyz``.
 ReadinessStatus = Literal["ok", "degraded", "unavailable"]

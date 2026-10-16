@@ -169,7 +169,7 @@ def test_every_model_the_quickstart_offers_is_in_the_committed_route_table() -> 
     against the committed file is what makes the assertion a guard: rename a route and
     this goes red in the same commit rather than in a reader's terminal.
     """
-    offered = {"fast", "smart"}
+    offered = {"fast", "smart", "decide"}
     assert offered == set(route_models())
 
 

@@ -59,6 +59,12 @@ ROLES = ("system", "user", "assistant")
 #: litellm's model-name prefix per vendor. Without it litellm infers the vendor
 #: from the model name, which is how a request meant for one vendor gets billed to
 #: another.
+#: The vendors that serve OTHER vendors' models, priced by the model
+#: underneath rather than by their own spelling. litellm's cost map is keyed by
+#: the vendor that owns the model, so `openrouter/openai/gpt-4o-mini` is looked
+#: up as `openai/gpt-4o-mini`.
+AGGREGATORS = frozenset({"openrouter"})
+
 VENDOR_PREFIXES = {
     "openai": "openai",
     "anthropic": "anthropic",
@@ -69,6 +75,31 @@ VENDOR_PREFIXES = {
     # the vendor's own name and the model keeps its vendor-qualified form.
     "openrouter": "openrouter",
     "deepseek": "deepseek",
+    # An OpenAI-compatible gateway in front of DeepSeek. The prefix is
+    # `openai` because that is the wire format its `/chat/completions` speaks,
+    # and the base URL (VENDOR_API_BASES) is what stops the request going to
+    # OpenAI's endpoint with a key opencode issued.
+    "opencode": "openai",
+    # ABSENT on purpose, and its absence is the statement: there is no
+    # `typesafe/` prefix, because typesafe is not an OpenAI-shaped completion
+    # vendor at all. Its endpoint is a decisions endpoint, its models are
+    # decision models (`jev-latest`), and prefixing it would ask litellm to
+    # call a completions path that does not exist for it.
+}
+
+#: The vendors that serve no completions, only decisions. `qualified_model`
+#: leaves their model name alone, and cost_per_1k_tokens prices them from the
+#: decision's own reported usage rather than from litellm's completion price
+#: table — which has no entry for a decision model because it is not one.
+DECISIONS_VENDORS = frozenset({"typesafe"})
+
+#: The base URL a vendor is reached at, where it is not litellm's default for
+#: the model's vendor prefix. opencode is an OpenAI-compatible gateway in front
+#: of DeepSeek, and without this the request would go to OpenAI's endpoint with
+#: a key opencode issued — a 401 that reads as a wrong key rather than a
+#: missing base.
+VENDOR_API_BASES = {
+    "opencode": "https://opencode.ai/zen/go/v1",
 }
 
 #: The cheapest model each vendor will serve, used as the health probe. Per vendor
@@ -81,6 +112,9 @@ PROBE_MODELS = {
     # openai's model here would report a healthy aggregator as broken.
     "openrouter": "openai/gpt-4o-mini",
     "deepseek": "deepseek-chat",
+    # The house model behind the gateway. Spelled the way the gateway spells
+    # it, which is not the way DeepSeek's own API spells it.
+    "opencode": "deepseek-v4.1-flash",
 }
 
 #: Micro-dollars per dollar.
@@ -496,10 +530,16 @@ class LiteLLMProvider:
         *,
         credentials: CredentialResolver | None = None,
     ) -> None:
-        if name not in VENDOR_PREFIXES:
+        # Two kinds of vendor and two tables to be in: a completion vendor is in
+        # `VENDOR_PREFIXES`, and a decisions-only vendor is in
+        # `DECISIONS_VENDORS` instead — deliberately absent from the prefix map,
+        # because prefixing a decisions vendor would build a completions path
+        # that does not exist for it. Validating against one table only is what
+        # made a decisions-only vendor unconstructible.
+        if name not in VENDOR_PREFIXES and name not in DECISIONS_VENDORS:
             raise ValueError(
                 f"{name!r} is not a supported vendor; supported: "
-                f"{', '.join(sorted(VENDOR_PREFIXES))}"
+                f"{', '.join(sorted(set(VENDOR_PREFIXES) | DECISIONS_VENDORS))}"
             )
         if api_key is None and credentials is None:
             # Neither: a provider with no way to get a key would fail on its first
@@ -563,10 +603,36 @@ class LiteLLMProvider:
         name that already carries a slash is exactly the aggregator's case. The
         one exemption is a model already carrying THIS vendor's own prefix.
         """
+        if self.name in DECISIONS_VENDORS:
+            # A decisions vendor's model is not a completion model, so there is
+            # no `vendor/` path to build — `jev-latest` is the whole name.
+            return model
         prefix = VENDOR_PREFIXES[self.name]
         if model.startswith(f"{prefix}/"):
             return model
         return f"{prefix}/{model}"
+
+    def priceable_model(self, model: str) -> str:
+        """The name to look a model's price up under.
+
+        An aggregator is priced by the model it is serving, not by its own
+        spelling of it: litellm's model-cost map has `openai/gpt-4o-mini` in it
+        and has no entry for `openrouter/openai/gpt-4o-mini`, because the
+        aggregator's own price is a markup on the vendor's rather than a fact
+        litellm publishes. So the vendor prefix is stripped and the lookup is
+        made against the model underneath.
+
+        A model vendor looks up under its own qualified name, which is what it
+        always did — the strip only applies when THIS vendor is an aggregator,
+        and the set of those is declared rather than inferred.
+        """
+        if self.name not in AGGREGATORS:
+            return self.qualified_model(model)
+        qualified = self.qualified_model(model)
+        _, _, underlying = qualified.partition("/")
+        # A bare model with no vendor in it stays as it is: there is nothing to
+        # strip, and quoting the unqualified name is the honest answer.
+        return underlying if underlying else qualified
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         """The published price of `model`, in micro-dollars per 1k tokens.
@@ -575,8 +641,15 @@ class LiteLLMProvider:
         dollars per token, and this converts once, on the way in, to the integer
         unit everything else uses.
         """
+        if self.name in DECISIONS_VENDORS:
+            # litellm's cost map is a COMPLETION price table and has no entry for
+            # a decision model. Pricing one from it would raise
+            # `PriceUnavailable` for a call that cost a known amount — the
+            # decision's own reported usage is the price, and the meter reads it
+            # off the response rather than looking it up here.
+            return Price(0, 0)
         try:
-            info = self.litellm.get_model_info(self.qualified_model(model))
+            info = self.litellm.get_model_info(self.priceable_model(model))
             price = Price(
                 input_micros=_per_1k_micros(info["input_cost_per_token"]),
                 output_micros=_per_1k_micros(info["output_cost_per_token"]),
@@ -601,6 +674,8 @@ class LiteLLMProvider:
             "messages": [message.as_wire() for message in request.messages],
             "api_key": key.reveal(),
         }
+        if self.name in VENDOR_API_BASES:
+            kwargs["api_base"] = VENDOR_API_BASES[self.name]
         headers = self._outbound_headers()
         if headers:
             kwargs["extra_headers"] = headers
@@ -646,6 +721,8 @@ class LiteLLMProvider:
             "questions": {question.name: question.as_wire() for question in request.questions},
             "api_key": key.reveal(),
         }
+        if self.name in VENDOR_API_BASES:
+            kwargs["api_base"] = VENDOR_API_BASES[self.name]
         headers = self._outbound_headers()
         if headers:
             kwargs["extra_headers"] = headers

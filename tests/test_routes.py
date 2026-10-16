@@ -427,13 +427,11 @@ def test_validation_names_every_unregistered_provider() -> None:
     assert "vertex" in str(excinfo.value)
 
 
-def test_the_committed_file_validates_against_its_providers() -> None:
+def test_the_committed_file_validates_against_its_providers(fleet_registry) -> None:
     """The file that ships is validated in the suite. `openai` and `anthropic` are
     the two adapters this packet ships, so this is the real check — a fourth vendor
     added to the file without an adapter fails here."""
-    routes_from_yaml(COMMITTED.read_text()).validate(
-        ProviderRegistry().register(FakeProvider("openai")).register(FakeProvider("anthropic"))
-    )
+    routes_from_yaml(COMMITTED.read_text()).validate(fleet_registry)
 
 
 # --- immutability ----------------------------------------------------------

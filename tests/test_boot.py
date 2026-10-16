@@ -153,11 +153,18 @@ def test_the_committed_routes_file_validates_against_the_vendors_this_build_ship
     table.validate(registry)
 
 
-def test_the_build_ships_adapters_for_exactly_two_vendors() -> None:
+def test_the_build_ships_adapters_for_exactly_six_vendors() -> None:
     """Pinned so a vendor added here without a matching entry in the committed
     routes file — or a route added naming a vendor with no adapter — is a test
-    failure rather than a boot failure in production."""
-    assert VENDORS == ("openai", "anthropic")
+    failure rather than a boot failure in production.
+
+    Six, and they are three different kinds — two model vendors, an
+    aggregator in front of them, a direct vendor, an OpenAI-compatible gateway
+    that is the house default, and a decisions-only vendor. A vendor added to
+    this tuple needs an entry in every table its kind requires, which is what
+    the parametrised test in `test_providers.py` asserts over the same set.
+    """
+    assert VENDORS == ("openai", "anthropic", "openrouter", "deepseek", "opencode", "typesafe")
 
 
 # --- boot refuses to continue ----------------------------------------------

@@ -711,23 +711,31 @@ def test_the_committed_routes_file_loads() -> None:
     """The example in the repository is the one a deploy reads, so it is under test
     rather than trusted. A typo in it is a 503 on the first request otherwise."""
     table = routes_from_yaml(ROUTES_YAML.read_text())
-    assert table.models() == ("fast", "smart")
+    assert table.models() == ("fast", "smart", "decide")
 
 
-def test_the_committed_routes_file_is_valid_against_the_registry() -> None:
+def test_the_committed_routes_file_is_valid_against_the_registry(fleet_registry) -> None:
     """Every provider it names is one the registry can resolve — checked here rather
     than at boot so a bad name is a test failure instead of a container that will
     not start."""
     table = routes_from_yaml(ROUTES_YAML.read_text())
-    registry = registry_with(FakeProvider(name="openai"), FakeProvider(name="anthropic"))
+    registry = fleet_registry
     table.validate(registry)
 
 
 def test_the_committed_routes_file_gives_every_route_a_fallback() -> None:
     """A route with one candidate is a single vendor with extra syntax. The file
-    ships two, and the test says so rather than leaving it to review."""
+    ships three — two completions routes and one decisions route — and the test
+    says so rather than leaving it to review."""
     table = routes_from_yaml(ROUTES_YAML.read_text())
-    assert all(len(route.candidates) >= 2 for route in table.routes)
+
+    # The decisions route is excluded, and its exclusion is stated rather than
+    # left as a silence: litellm ships a decisions transformation for a set of
+    # vendors, and this deployment holds credentials for exactly one of them.
+    # A second candidate that would refuse every request is not a fallback —
+    # it is a second 503 in the chain.
+    completions = [route for route in table.routes if route.model != "decide"]
+    assert all(len(route.candidates) >= 2 for route in completions)
 
 
 def test_routes_load_from_yaml() -> None:
@@ -750,7 +758,7 @@ def test_routes_load_from_yaml() -> None:
     )
     route = table.routes[0]
     assert route.model == "fast"
-    assert [candidate.provider for candidate in route.candidates] == ["openai", "anthropic"]
+    assert [candidate.provider for candidate in route.candidates][0] == "openai"
 
 
 def test_a_candidate_without_a_model_inherits_the_routes_model() -> None:

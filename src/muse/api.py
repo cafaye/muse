@@ -538,6 +538,47 @@ async def serve_completion(request: Request) -> ServedCompletion | JSONResponse:
     )
 
 
+def _criteria_for(question: "DecisionQuestionBody") -> object | None:
+    """The `criteria` litellm's own `DecisionQuestion` takes, from what the caller sent.
+
+    Two dialects, and the boundary between them is the whole of this function:
+
+      the CALLER speaks the OpenAI-flavoured dialect litellm's proxy publishes —
+      `choices` as a list of `{value, description}`, `levels` as a list of labels.
+      litellm's own `DecisionQuestion` model takes ONE field, `criteria`, whose
+      shape depends on the question type: a MAP of label to description for
+      `choice`, and a SEQUENCE of labels for `score`.
+
+    Passing the caller's `choices` straight through is what happens when the two
+    are conflated: pydantic accepts the request (the body model is
+    `extra="allow"` precisely so a caller can use either spelling) and litellm
+    refuses it with `choice.criteria: Field required` — a 400 naming a field the
+    caller never sent.
+
+    So the translation happens here, once, at the seam. A caller who sent
+    `criteria` directly already speaks litellm's dialect and is passed through
+    untouched.
+    """
+    if question.criteria is not None:
+        return question.criteria
+
+    if question.type == "choice" and question.choices is not None:
+        return {
+            choice["value"]: choice.get("description")
+            for choice in question.choices
+            if isinstance(choice, dict) and choice.get("value")
+        }
+
+    if question.type == "score" and question.levels is not None:
+        return [
+            level["label"] if isinstance(level, dict) else level
+            for level in question.levels
+            if (isinstance(level, dict) and level.get("label")) or isinstance(level, str)
+        ]
+
+    return None
+
+
 async def serve_decision(request: Request) -> ServedDecision | JSONResponse:
     """Authenticate, validate, route, meter — the decisions path, in that order.
 
@@ -594,7 +635,7 @@ async def serve_decision(request: Request) -> ServedDecision | JSONResponse:
                         name=f"q{index}",
                         type=question.type,
                         instructions=question.instructions,
-                        criteria=question.criteria,
+                        criteria=_criteria_for(question),
                     )
                     for index, question in enumerate(body.questions, start=1)
                 ),
