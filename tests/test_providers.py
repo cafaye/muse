@@ -1323,6 +1323,47 @@ def test_a_model_vendor_is_priced_by_its_own_qualified_name() -> None:
     assert provider.priceable_model("claude-haiku-4-5") == "anthropic/claude-haiku-4-5"
 
 
+def test_a_decisions_vendor_keeps_its_model_name_whole() -> None:
+    """`jev-latest`, not `typesafe/jev-latest`.
+
+    A decisions vendor is not an OpenAI-shaped completion vendor, so there is
+    no `vendor/model` path to build. Prefixing it would ask litellm to call a
+    completions path that does not exist for it.
+    """
+    provider = make_provider(name="typesafe")
+    assert provider.qualified_model("jev-latest") == "jev-latest"
+
+
+def test_a_decisions_vendor_is_priced_from_the_decision_not_the_price_table() -> None:
+    """litellm's cost map is a COMPLETION price table and holds no entry for a
+    decision model. Pricing one there would raise `PriceUnavailable` for a call
+    whose cost is known — the meter reads it off the decision's own usage."""
+    provider = make_provider(name="typesafe")
+    assert provider.cost_per_1k_tokens("jev-latest") == Price(0, 0)
+
+
+async def test_a_gateway_carries_its_own_base_url() -> None:
+    """`opencode.ai`, not `api.openai.com`.
+
+    The gateway is OpenAI-compatible, so without the base the request goes to
+    OpenAI's endpoint with a key opencode issued — a 401 that reads as a wrong
+    key rather than a missing base.
+    """
+    provider = make_provider(name="opencode")
+    await provider.complete(ask())
+
+    assert provider.litellm.captured["api_base"] == "https://opencode.ai/zen/go/v1"
+
+
+async def test_a_decision_through_a_gateway_carries_the_same_base() -> None:
+    """The decisions half, because a base that applies to completions and not
+    to decisions is a base that half-works."""
+    provider = make_provider(name="opencode")
+    await provider.decide(decide_ask())
+
+    assert provider.litellm.captured["api_base"] == "https://opencode.ai/zen/go/v1"
+
+
 def test_openrouter_keeps_its_models_vendor_qualified() -> None:
     """`openrouter/openai/gpt-4o-mini`, not `openrouter/gpt-4o-mini`.
 
