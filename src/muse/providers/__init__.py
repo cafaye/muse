@@ -604,9 +604,13 @@ class LiteLLMProvider:
         one exemption is a model already carrying THIS vendor's own prefix.
         """
         if self.name in DECISIONS_VENDORS:
-            # A decisions vendor's model is not a completion model, so there is
-            # no `vendor/` path to build — `jev-latest` is the whole name.
-            return model
+            # `typesafe/jev-latest`, not `jev-latest`: the prefix is how litellm
+            # knows WHICH provider to call, and without it the request fails
+            # with `LLM Provider NOT provided` — an error naming a model rather
+            # than naming the missing qualifier. This is still not a completions
+            # path: the call is `adecisions`, and the prefix qualifies the
+            # provider rather than the operation.
+            return f"{self.name}/{model}"
         prefix = VENDOR_PREFIXES[self.name]
         if model.startswith(f"{prefix}/"):
             return model
@@ -717,7 +721,9 @@ class LiteLLMProvider:
             raise CredentialUnavailable(f"no credential is configured for provider {self.name!r}")
         kwargs: dict[str, Any] = {
             "model": self.qualified_model(request.model),
-            "state": request.input,
+            # `input=`, not the deprecated `state=` — same value, and the
+            # older spelling emits a UserWarning naming the newer one.
+            "input": request.input,
             "questions": {question.name: question.as_wire() for question in request.questions},
             "api_key": key.reveal(),
         }

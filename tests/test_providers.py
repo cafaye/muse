@@ -1323,15 +1323,17 @@ def test_a_model_vendor_is_priced_by_its_own_qualified_name() -> None:
     assert provider.priceable_model("claude-haiku-4-5") == "anthropic/claude-haiku-4-5"
 
 
-def test_a_decisions_vendor_keeps_its_model_name_whole() -> None:
-    """`jev-latest`, not `typesafe/jev-latest`.
+def test_a_decisions_vendor_is_qualified_by_its_own_name() -> None:
+    """`typesafe/jev-latest`, not `jev-latest` alone.
 
-    A decisions vendor is not an OpenAI-shaped completion vendor, so there is
-    no `vendor/model` path to build. Prefixing it would ask litellm to call a
-    completions path that does not exist for it.
+    The prefix is how litellm knows WHICH provider to call — without it the
+    request fails with `LLM Provider NOT provided`, an error that names the
+    model and not the missing qualifier. It is not a completions path: the call
+    is `adecisions`, so the prefix qualifies the provider rather than the
+    operation.
     """
     provider = make_provider(name="typesafe")
-    assert provider.qualified_model("jev-latest") == "jev-latest"
+    assert provider.qualified_model("jev-latest") == "typesafe/jev-latest"
 
 
 def test_a_decisions_vendor_is_priced_from_the_decision_not_the_price_table() -> None:
