@@ -279,7 +279,22 @@ gate:
       # the measurement that said muse's copy of the sibling-read hazard was
       # loud (a clone in a declaration) rather than silent (a skipped tier),
       # and the resolution order below is the fix either way.
-      minimum: 1081
+      #
+      # RAISED 1081 -> 1135 by the backend-adoption packet. Only 3 of the 54 are
+      # this packet's - `tests/test_ci_backend.py` (the backend name kit ships,
+      # the one-token shape, and the executable pipeline) - and the other 51 had
+      # already landed on this branch while the floor stayed at 1081. Same
+      # ratchet clause as every raise above: the floor moves in the same commit
+      # as the suite, or it is a detector that has stopped detecting. Measured
+      # with a core checkout, which is what this floor means:
+      #
+      # MUSE_CORE_SCHEMAS=<core>/schemas uv run --locked pytest -q -rs
+      #                                                 -> 1135 passed, exit 0
+      #
+      # 1135 tests executed with all four core-gated ones among them, and 100%
+      # branch coverage. The three this packet adds are not core-gated, so they
+      # count on both sides: 1131 + 4 = 1135.
+      minimum: 1135
     #
     # NOT asserted here, because the checker cannot see it: that CI sets
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
