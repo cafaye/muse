@@ -62,6 +62,13 @@ ROLES = ("system", "user", "assistant")
 VENDOR_PREFIXES = {
     "openai": "openai",
     "anthropic": "anthropic",
+    # An aggregator, and the reason it is here rather than an afterthought: it
+    # serves both vendors' models behind one credential, which is what a
+    # developer without an OpenAI key and an Anthropic key both actually has.
+    # `openrouter/openai/gpt-4o-mini` is litellm's spelling, so the prefix is
+    # the vendor's own name and the model keeps its vendor-qualified form.
+    "openrouter": "openrouter",
+    "deepseek": "deepseek",
 }
 
 #: The cheapest model each vendor will serve, used as the health probe. Per vendor
@@ -70,6 +77,10 @@ VENDOR_PREFIXES = {
 PROBE_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
+    # The cheapest model each will serve. A probe is a real request, so naming
+    # openai's model here would report a healthy aggregator as broken.
+    "openrouter": "openai/gpt-4o-mini",
+    "deepseek": "deepseek-chat",
 }
 
 #: Micro-dollars per dollar.
@@ -539,15 +550,23 @@ class LiteLLMProvider:
         return self._litellm
 
     def qualified_model(self, model: str) -> str:
-        """`gpt-4o-mini` -> `openai/gpt-4o-mini`.
+        """`gpt-4o-mini` -> `openai/gpt-4o-mini`, under whichever vendor this is.
 
         The prefix is what tells litellm which vendor to call. Without it litellm
         infers the vendor from the model name, so a model name that happens to be
         routable by two vendors goes to whichever one litellm guessed.
+
+        It is THIS vendor's prefix, not a check for any slash. An aggregator
+        serves several vendors' models behind one credential, and
+        `openai/gpt-4o-mini` under openrouter is a request for openrouter's
+        endpoint — litellm's spelling is `openrouter/openai/gpt-4o-mini`, and a
+        name that already carries a slash is exactly the aggregator's case. The
+        one exemption is a model already carrying THIS vendor's own prefix.
         """
-        if "/" in model:
+        prefix = VENDOR_PREFIXES[self.name]
+        if model.startswith(f"{prefix}/"):
             return model
-        return f"{VENDOR_PREFIXES[self.name]}/{model}"
+        return f"{prefix}/{model}"
 
     def cost_per_1k_tokens(self, model: str) -> Price:
         """The published price of `model`, in micro-dollars per 1k tokens.

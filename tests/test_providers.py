@@ -39,6 +39,8 @@ from muse.errors import (
     ResponseShapeError,
 )
 from muse.providers import (
+    PROBE_MODELS,
+    VENDOR_PREFIXES,
     Completion,
     CompletionRequest,
     Decision,
@@ -1276,6 +1278,36 @@ async def test_the_adapter_probes_health_with_a_one_token_completion() -> None:
     sent = provider.litellm.captured
     assert sent["max_tokens"] == 1
     assert sent["messages"] == [{"role": "user", "content": "ping"}]
+
+
+@pytest.mark.parametrize("vendor", ["openai", "anthropic", "openrouter", "deepseek"])
+def test_every_declared_vendor_has_a_prefix_and_a_probe_model(vendor: str) -> None:
+    """Both tables, and every entry in them.
+
+    A vendor with no prefix has litellm inferring the vendor from the model
+    name, which is how a request meant for one vendor gets billed to another.
+    A vendor with no probe model sends its own endpoint another vendor's model
+    and reports a healthy provider as broken. The router validates its config
+    against the registry at boot, so a new vendor that landed in
+    `routes.yaml` and not here is a boot failure — which is the right outcome,
+    but this is what names the two tables.
+    """
+    assert vendor in VENDOR_PREFIXES
+    assert vendor in PROBE_MODELS
+    assert VENDOR_PREFIXES[vendor] == vendor or vendor in ("openai", "anthropic")
+    assert PROBE_MODELS[vendor]
+
+
+def test_openrouter_keeps_its_models_vendor_qualified() -> None:
+    """`openrouter/openai/gpt-4o-mini`, not `openrouter/gpt-4o-mini`.
+
+    The aggregator's whole value is serving several vendors' models behind one
+    credential, and the vendor-qualified name is how litellm knows which
+    upstream a model belongs to. A route whose candidate names a bare
+    `gpt-4o-mini` under openrouter is a request litellm cannot place.
+    """
+    provider = make_provider(name="openrouter")
+    assert provider.qualified_model("openai/gpt-4o-mini") == "openrouter/openai/gpt-4o-mini"
 
 
 async def test_the_adapter_probes_with_a_model_its_own_vendor_serves() -> None:
