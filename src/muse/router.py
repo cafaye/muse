@@ -61,7 +61,7 @@ import asyncio
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tenacity import AsyncRetrying, retry_if_exception
 
@@ -380,12 +380,16 @@ class Router:
         # Named before dispatch, and here rather than in the provider: the answers
         # come back under these keys, and two questions the caller did not name
         # would collide silently and drop an answer.
+        # Every field the caller's question carried, not four of them. A
+        # reconstruction here that dropped `choices` or `levels` was a second
+        # place questions get built — and it is what made a caller's `choices`
+        # reach this point and stop, with litellm then refusing a question whose
+        # options the caller HAD sent. The only thing the router owns is the
+        # name.
         named = tuple(
-            DecisionsQuestion(
+            replace(
+                question,
                 name=f"q{index}",
-                type=question.type,
-                instructions=question.instructions,
-                criteria=question.criteria,
             )
             for index, question in enumerate(ask.questions, start=1)
         )

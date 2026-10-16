@@ -908,23 +908,72 @@ def test_a_question_that_states_no_criteria_sends_neither_field() -> None:
     A `choice` question's criteria *is* its label list, so a question may
     legitimately state neither field — and sending an explicit null is what a
     strict provider rejects with a 400 about the wrong field."""
-    # The name is the mapping key the answer comes back under, not a wire field.
+    # The name is a wire FIELD on this path, not the key a map is built under.
     bare = DecisionsQuestion(name="q1", type="choice", instructions="pick one")
-    assert bare.as_wire() == {"type": "choice", "instructions": "pick one"}
+    assert bare.as_wire() == {"name": "q1", "type": "choice", "instructions": "pick one"}
 
-    # `predicate` folds onto `noul` at the wire: the two are the same yes/no
-    # question in the two spellings litellm publishes.
+    # `predicate` goes through as itself: it is the OpenAI dialect's own spelling
+    # of the yes/no question, not a synonym to fold.
     stated = DecisionsQuestion(name="q1", type="predicate", instructions="refund?")
-    assert stated.as_wire() == {"type": "noul", "instructions": "refund?"}
+    assert stated.as_wire() == {"name": "q1", "type": "predicate", "instructions": "refund?"}
 
     withcriteria = DecisionsQuestion(
         name="q1", type="predicate", instructions="refund?", criteria={"true": "yes", "false": "no"}
     )
     assert withcriteria.as_wire()["criteria"] == {"true": "yes", "false": "no"}
 
-    # And neither: a question whose criteria *is* the instruction states no second field.
+    # The OpenAI dialect's own two option fields, carried through untouched.
+    withchoices = DecisionsQuestion(
+        name="q1", type="choice", instructions="pick one",
+        choices=[{"value": "a"}, {"value": "b"}],
+    )
+    assert withchoices.as_wire()["choices"] == [{"value": "a"}, {"value": "b"}]
+
+    withlevels = DecisionsQuestion(
+        name="q1", type="score", instructions="how much?",
+        levels=["minor", "urgent"],
+    )
+    assert withlevels.as_wire()["levels"] == ["minor", "urgent"]
+
+    # And neither: a question whose options are its instructions states no second
+    # field, because an explicit null is what a strict provider rejects.
     neither = DecisionsQuestion(name="q1", type="choice")
-    assert neither.as_wire() == {"type": "choice"}
+    assert neither.as_wire() == {"name": "q1", "type": "choice"}
+
+
+async def test_a_decision_answer_that_arrives_as_a_sequence_is_read_as_items() -> None:
+    """The OpenAI dialect answers as a TUPLE of named answers.
+
+    The other shape an answer set arrives in, and the one `_items` used to fall
+    through on: it asked for `.items`, a tuple has none, and the fallback
+    returned `dict().items` — nothing. Every answer was dropped, no error was
+    raised, and the caller received `answers: {}` for a decision that had been
+    answered. A read that silently returns nothing is the worst shape a helper
+    can have.
+    """
+    
+    from litellm.types.decisions import OpenAIChoiceAnswer, OpenAIChoiceProbability
+
+    provider = make_provider(
+        decision={
+            "answers": (
+                OpenAIChoiceAnswer(
+                    name="q1",
+                    choice="bug",
+                    confidence=0.9,
+                    probabilities=(
+                        OpenAIChoiceProbability(value="bug", probability=0.9),
+                        OpenAIChoiceProbability(value="feature", probability=0.1),
+                    ),
+                ),
+            ),
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+    served = await provider.decide(decide_ask())
+
+    assert list(served.answers) == ["q1"]
+    assert served.answers["q1"]["choice"] == "bug"
 
 
 async def test_a_decision_answer_that_arrives_as_an_object_is_read_as_items() -> None:

@@ -24,7 +24,7 @@ litellm's per-token dollars once, on the way in.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -157,6 +157,17 @@ def _items(container: Any) -> list[tuple[str, Any]]:
     """
     if isinstance(container, dict):
         return list(container.items())
+
+    # A SEQUENCE is the other shape an answer set arrives in, and it is the
+    # OpenAI-flavoured dialect's: `OpenAIDecisionResponse.answers` is a tuple of
+    # answer objects, each carrying the name it was asked under. Falling back
+    # to `dict().items` for it yields nothing at all — so every answer is
+    # dropped, no error is raised, and the caller receives `answers: {}` for a
+    # decision that was answered. A read that silently returns nothing is the
+    # worst shape a helper can have.
+    if isinstance(container, Sequence):
+        return [(str(_read(answer, "name")), answer) for answer in container]
+
     return [
         (str(name), value) for name, value in getattr(container, "items", dict().items)()
     ]
@@ -325,19 +336,29 @@ class DecisionsQuestion:
     type: str
     instructions: object | None = None
     criteria: object | None = None
+    # The OpenAI dialect's own options fields, carried through untouched.
+    # `choices` for a `choice` and `levels` for a `score`, sent exactly as the
+    # caller stated them — litellm validates them, and a second copy of that
+    # validation here would be a second thing to drift.
+    choices: object | None = None
+    levels: object | None = None
 
     def as_wire(self) -> dict[str, Any]:
-        """The question as litellm's own `DecisionQuestion` takes it.
+        """The question as litellm's OpenAI-flavoured decisions endpoint takes it.
 
-        `predicate` is folded onto `noul` here rather than at the wire, because the
-        two are the same yes/no question in the two spellings litellm publishes:
-        `noul` in the TypeSafe vocabulary, `predicate` in the OpenAI-flavoured one.
-        Muse accepts either and answers in whichever one litellm returns, so a
-        caller following litellm's docs against the OpenAI variant is not told a
-        question type it knows nothing about exists in muse but not there.
+        The name is IN the dict rather than being the key a map is built under,
+        because `litellm.adecisions` takes questions as a SEQUENCE of named
+        questions on that path — a caller following litellm's docs reads the
+        same shape. The map form litellm also accepts is its deprecated
+        `systemone` spelling, and it emits a UserWarning naming the newer one.
+
+        `predicate` is not folded onto `noul` here either: `predicate` IS the
+        OpenAI dialect's spelling of the same yes/no question, so it goes
+        through as itself.
         """
         question: dict[str, Any] = {
-            "type": "noul" if self.type == "predicate" else self.type,
+            "name": self.name,
+            "type": self.type,
         }
         # `exclude_none` semantics mirroring litellm's own model dump: a question
         # may legitimately state neither field (a `choice` whose criteria *is* the
@@ -347,6 +368,10 @@ class DecisionsQuestion:
             question["instructions"] = self.instructions
         if self.criteria is not None:
             question["criteria"] = self.criteria
+        if self.choices is not None:
+            question["choices"] = self.choices
+        if self.levels is not None:
+            question["levels"] = self.levels
         return question
 
 
@@ -721,10 +746,12 @@ class LiteLLMProvider:
             raise CredentialUnavailable(f"no credential is configured for provider {self.name!r}")
         kwargs: dict[str, Any] = {
             "model": self.qualified_model(request.model),
-            # `input=`, not the deprecated `state=` — same value, and the
-            # older spelling emits a UserWarning naming the newer one.
+            # `input=` and a LIST of named questions: litellm's OpenAI-flavoured
+            # decisions dialect. The map form is its deprecated `systemone`
+            # spelling and emits a UserWarning per call, on a path that runs on
+            # every mention.
             "input": request.input,
-            "questions": {question.name: question.as_wire() for question in request.questions},
+            "questions": [question.as_wire() for question in request.questions],
             "api_key": key.reveal(),
         }
         if self.name in VENDOR_API_BASES:

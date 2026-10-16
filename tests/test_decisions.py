@@ -39,7 +39,7 @@ import json
 
 import pytest
 
-from muse.api import DecisionQuestionBody, _criteria_for
+from muse.api import DecisionQuestionBody
 from muse.errors import ProviderTimeout
 from muse.outbox import InMemoryTransport, OutboxPublisher
 from muse.providers import LiteLLMProvider, Price, ProviderRegistry
@@ -117,6 +117,45 @@ def question(**overrides) -> dict:
         "criteria": {"true": "wants money back", "false": "asks a question"},
         **overrides,
     }
+
+
+def test_a_choice_question_sent_with_choices_reaches_the_provider_with_them() -> None:
+    """The caller's `choices` must reach litellm's `choices`.
+
+    This is the shape a caller following litellm's proxy docs sends, and the one
+    the suite never exercised: every test POSTed `criteria` instead. The
+    provider received a question with no `choices`, litellm validated it as an
+    `OpenAIChoiceQuestion`, and refused it with
+    `questions.0.choice.choices: Field required` — a 400 naming a field the
+    caller DID send, on a path every test said was green.
+
+    Asserted on the provider's own record of what it was handed, so the claim is
+    about the wire and not about the response.
+    """
+    provider = answering()
+    body = {
+        **BODY,
+        "questions": [
+            {
+                "type": "choice",
+                "name": "classification",
+                "instructions": "what kind of message is this?",
+                "choices": [{"value": "question"}, {"value": "feedback"}],
+            }
+        ],
+    }
+
+    import asyncio
+
+    async def go() -> None:
+        async with asgi_client(app_for(provider)) as client:
+            await client.post(ROUTE, json=body, headers=AUTH_HEADERS)
+
+    asyncio.run(go())
+
+    (request,) = provider.decisions
+    assert request.questions[0].choices == [{"value": "question"}, {"value": "feedback"}]
+    assert request.questions[0].as_wire()["choices"] == [{"value": "question"}, {"value": "feedback"}]
 
 
 def _question(**overrides) -> DecisionQuestionBody:
@@ -536,50 +575,6 @@ async def test_every_candidate_failing_is_the_same_503() -> None:
 
 
 # --- the response shape, asserted whole ------------------------------------
-
-
-# --- the two question dialects, and the seam between them --------------------
-
-
-def test_a_choice_question_sent_in_the_openai_dialect_reaches_litellm_as_criteria() -> None:
-    """`choices` is a list of `{value, description}`; litellm's `DecisionQuestion`
-    takes `criteria` as a MAP of label to description.
-
-    This is the shape a caller following litellm's proxy docs sends, and the
-    shape muse hand-off used to pass straight through — which pydantic accepted
-    and litellm refused with `choice.criteria: Field required`, a 400 naming a
-    field the caller never sent.
-    """
-    criteria = _criteria_for(
-        _question(type="choice", choices=[{"value": "question"}, {"value": "feedback", "description": "an opinion"}])
-    )
-
-    assert criteria == {"question": None, "feedback": "an opinion"}
-
-
-def test_a_score_question_sent_in_the_openai_dialect_reaches_litellm_as_criteria() -> None:
-    """`levels` is a list of labels or `{label, description}`; litellm takes
-    `criteria` as a SEQUENCE of labels."""
-    criteria = _criteria_for(
-        _question(type="score", levels=[{"label": "minor"}, {"label": "urgent", "description": "blocked"}])
-    )
-
-    assert criteria == ["minor", "urgent"]
-
-
-def test_a_question_already_in_litellm_dialect_is_passed_through_untouched() -> None:
-    """`criteria` is litellm's own field, and a caller using it needs no
-    translation — re-shaping it would be a second opinion about a shape the
-    caller already got right."""
-    stated = {"true": "wants money back", "false": "asks a question"}
-
-    assert _criteria_for(_question(type="predicate", criteria=stated)) is stated
-
-
-def test_a_question_with_no_options_at_all_returns_none() -> None:
-    """A `noul` needs only its instructions, so there is nothing to build. `None`
-    rather than an empty map, because an empty map is a shape litellm refuses."""
-    assert _criteria_for(_question(type="predicate", instructions="refund?")) is None
 
 
 async def test_the_decision_body_has_exactly_the_documented_shape() -> None:
