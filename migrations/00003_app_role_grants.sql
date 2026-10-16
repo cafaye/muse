@@ -1,0 +1,107 @@
+-- 00003_app_role_grants.sql — DML for the application's login role.
+--
+-- THE TWO ROLES, AND WHY THERE ARE TWO. kit's `10-cluster.sh` provisions two
+-- roles for every name in `KIT_POSTGRES_DATABASES`:
+--
+--   muse       the OWNER. LOGIN, owns the database and every table in it, and
+--              the role migrations in this directory are applied as.
+--   muse_app   the LOGIN the application's pool uses. Owns NOTHING. This
+--              migration is the whole of what it may do.
+--
+-- WHAT THE SECOND ROLE BUYS, AND IT IS BLAST RADIUS RATHER THAN TENANT
+-- ISOLATION. muse holds no customer rows and scopes nothing by account:
+-- `tenancy.yml` declares that honest zero, `outbox_events` is keyed by the
+-- envelope `id` and `vault_secrets` by `provider`. So the reason the application
+-- must not log in as the owner is not that the owner would read another tenant's
+-- rows — there are no tenant rows to read. It is that the owner can DDL. As
+-- `muse`, the running process can `drop table vault_secrets` and take every
+-- provider credential muse holds, and can `alter table … disable row level
+-- security` / `drop policy` on any table a future change protects. As
+-- `muse_app` it cannot do any of that: `has_table_privilege` for the DDL verbs
+-- is false, because ownership and grants are the two things Postgres checks and
+-- this file gives it neither.
+--
+-- NO POLICIES HERE, AND THIS IS NOT AN UNFINISHED JOB. There is nothing to
+-- protect: neither table has an `account_id` column, no migration adds one, and
+-- `tests/test_tenant_scoping.py` holds that negative. `cafaye.protect_table` is
+-- the fleet's RLS installer and calling it here would be a category error — it
+-- raises `undefined_column` on a table with no `account_id`, and its own hint
+-- says a service holding no customer rows needs none of this. So a reader who
+-- finds privileges granted and no policy written has found the finished shape
+-- rather than half of one: the GRANT is what the application needs, and the
+-- policies the substrate installs are what this service does not.
+--
+-- WHAT THE APPLICATION'S STATEMENTS ACTUALLY ISSUE, read out of `src/`:
+--
+--   outbox_events  `insert into outbox_events …` (src/muse/metering.py), the
+--                  publisher's claim — `select … where published_at is null
+--                  order by created_at, id limit $1 for update skip locked` —
+--                  and its acknowledgement, `update outbox_events set
+--                  published_at = now()` / `attempts = attempts + 1`
+--                  (src/muse/outbox.py). That is INSERT, SELECT and UPDATE.
+--                  DELETE is deliberately NOT granted: no statement in this tree
+--                  removes an outbox row, because a row is spent by being
+--                  published (`published_at is not null`) rather than by being
+--                  deleted, and core's docs/event-outbox.md makes retention "a
+--                  service's call" — a scheduled, batched delete that does not
+--                  exist yet. Granting the verb before the statement that uses
+--                  it would hand a compromised pool the ability to destroy
+--                  metering events that have never been published, and core's
+--                  contract says those are not retention material. The migration
+--                  that implements retention adds `, delete` to the line below.
+--   vault_secrets  the upsert in src/muse/vault.py —
+--                  `insert … on conflict (provider) do update` needs BOTH INSERT
+--                  and UPDATE, the pair a table grant gets wrong by granting
+--                  only one — plus the select by provider, the provider list,
+--                  and `delete from vault_secrets where provider = $1`.
+--
+-- DML AND NOTHING ELSE: no ownership, no DDL, no TRUNCATE, no
+-- REFERENCES/TRIGGER. kit's `10-cluster.sh` states that rule for the whole
+-- cluster — the login role gets "no ownership, no DDL, no ability to alter a
+-- policy" — and this is the file in muse where it is enforced.
+--
+-- WHY THERE IS NO SEQUENCE GRANT. An INSERT reads its sequence BEFORE it writes
+-- the row, and `USAGE` on a sequence is a separate grant from the table grant,
+-- so a table with a `serial`/identity column needs both or the write fails at
+-- the first insert. These two tables have no sequence to need one:
+-- `outbox_events.id` is a uuid the caller mints and `vault_secrets.provider` is
+-- the caller's provider name, so both primary keys are values in the INSERT
+-- rather than defaults calling `nextval`. Measured rather than reasoned — on the
+-- cluster this migration was first applied to:
+--
+--   select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+--    where n.nspname = 'public' and c.relkind = 'S';
+--    0
+--
+-- The migration that adds a generated key is the migration that has to add
+-- `grant usage, select on sequence <name> to muse_app`.
+--
+-- APPLY AS THE OPERATOR, like its two predecessors, from a shell that holds the
+-- owner's URL and not the application's:
+--
+--   psql "$MUSE_MIGRATION_DATABASE_URL" -f migrations/00003_app_role_grants.sql
+--
+-- `muse_app` is provisioned by kit's cluster, not by this file: a role is
+-- created in exactly one place and a migration that created it would be a second
+-- one. On a cluster whose provisioning predates the two-role split this file
+-- fails loudly with `role "muse_app" does not exist`, which is the right
+-- failure — the fix is to provision the role, never to fall back to the owner.
+--
+-- Every statement is a GRANT, so re-running is a no-op.
+
+grant select, insert, update on table outbox_events to muse_app;
+grant select, insert, update, delete on table vault_secrets to muse_app;
+
+-- ----------------------------------------------------------------------------
+-- Down
+--
+-- COMMENTED OUT RATHER THAN EXECUTABLE, because this tree applies migrations
+-- with `psql -f` and there is no runner that knows what a down section is: an
+-- executable down would be applied immediately after the up, leaving a database
+-- that has run its migration and grants nothing. (The same trap is measured in
+-- darkroom's 0004_account_isolation.sql, which is why the shape is copied rather
+-- than invented.) Uncomment these two lines to unwind the grant by hand; the
+-- role itself belongs to the cluster and is not this file's to drop.
+--
+-- revoke all on table outbox_events  from muse_app;
+-- revoke all on table vault_secrets from muse_app;

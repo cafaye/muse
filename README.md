@@ -158,14 +158,21 @@ happen first.
 #    keys are readable by anyone who has read this repository.
 uv run python -m muse.vault
 
-# 2. Apply the migrations. The DATABASE and the ROLE are provisioned by kit's init
-#    script on a fresh volume; it creates no TABLES, so this is not optional.
+# 2. Apply the migrations, AS THE OWNER (`-U muse`). The DATABASE and the two
+#    ROLES are provisioned by kit's init script on a fresh volume; it creates no
+#    TABLES, so this is not optional — and the owner is the only one of the two
+#    roles that can create one. The service itself runs as `muse_app`, which owns
+#    nothing; `MUSE_MIGRATION_DATABASE_URL` below is the owner's URL for a
+#    host-side `psql -f`, and it is deliberately not in the service's environment.
 docker compose --project-directory . \
   -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml \
   exec -T postgres psql -U muse -d muse < migrations/00001_outbox_events.sql
 docker compose --project-directory . \
   -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml \
   exec -T postgres psql -U muse -d muse < migrations/00002_vault_secrets.sql
+docker compose --project-directory . \
+  -f "$KIT_COMPOSE_DIR/docker-compose.yml" -f ./docker-compose.yml \
+  exec -T postgres psql -U muse -d muse < migrations/00003_app_role_grants.sql
 
 # 3. Store a credential. `muse` has no admin API in v1; this is a psql session.
 MUSE_VAULT_KEY=<the key from step 1> uv run python - <<'PY'
@@ -184,11 +191,14 @@ asyncio.run(main())
 PY
 
 # 4. Run it outside compose. The port is kit's, not the 5433 this file used to
-#    publish, and the password is the CLUSTER's — `muse` is a NOSUPERUSER role that
-#    owns one database on a cluster the rest of the fleet shares, and is refused at
-#    the door of every other one.
+#    publish, and the password is the CLUSTER's. `muse` is a NOSUPERUSER role that
+#    owns one database on a cluster the rest of the fleet shares and is refused at
+#    the door of every other one; the process below does not log in as it. The
+#    URL is `muse_app`, which owns nothing and holds only the DML
+#    `migrations/00003_app_role_grants.sql` grants it — it cannot drop a table or
+#    disable row level security on one.
 MUSE_VAULT_KEY=<key> \
-  MUSE_DATABASE_URL=postgres://muse:cafaye@localhost:15500/muse \
+  MUSE_DATABASE_URL=postgres://muse_app:cafaye@localhost:15500/muse \
   uv run uvicorn --factory muse.main:create_app --reload
 ```
 

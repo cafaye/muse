@@ -61,6 +61,23 @@ def migration_text(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def sql_only(name: str) -> str:
+    """The executable lines of a migration, comments dropped and lower-cased.
+
+    A migration's comments are its argument to a reader, and they name the SQL
+    they argue about — `00003_app_role_grants.sql` says "no TRUNCATE" and "no
+    policy" in prose while granting neither. An assertion about what a migration
+    GRANTS has to read the statements, or it reds on the sentence explaining why
+    the statement is absent. Every executable line is kept, including a trailing
+    comment on one, so a privilege cannot hide behind a `--`.
+    """
+    return "\n".join(
+        line
+        for line in migration_text(name).lower().splitlines()
+        if not line.lstrip().startswith("--")
+    )
+
+
 def columns_of(create_table_sql: str) -> dict[str, tuple[str, bool]]:
     """Parse `name type [not null | primary key]` out of a CREATE TABLE body.
 
@@ -92,7 +109,51 @@ def assert_table(sql: str, table: str, expected: list[tuple[str, str, bool]]) ->
 def test_every_migration_is_numbered_and_ordered() -> None:
     """Deploys apply files in name order; a gap or a duplicate is a surprise."""
     names = sorted(path.name for path in MIGRATIONS.glob("*.sql"))
-    assert names == ["00001_outbox_events.sql", "00002_vault_secrets.sql"]
+    assert names == [
+        "00001_outbox_events.sql",
+        "00002_vault_secrets.sql",
+        "00003_app_role_grants.sql",
+    ]
+
+
+def test_the_app_role_migration_grants_the_verbs_the_code_issues() -> None:
+    """`muse_app` gets DML on the two tables and nothing more.
+
+    The role is provisioned by kit's cluster (`10-cluster.sh` creates `<svc>` and
+    `<svc>_app` for every name in `KIT_POSTGRES_DATABASES`); the GRANT is the
+    service's business, which is why it is a migration here. Read the other way,
+    this is the test that fails if a future edit widens the application's
+    privilege to `all` — TRUNCATE, REFERENCES and TRIGGER are the verbs `all`
+    would add, and none of them is a verb muse's statements use.
+    """
+    sql = sql_only("00003_app_role_grants.sql")
+    assert "grant select, insert, update on table outbox_events to muse_app;" in sql
+    assert "grant select, insert, update, delete on table vault_secrets to muse_app;" in sql
+    assert "truncate" not in sql, (
+        "TRUNCATE is not a verb any statement in src/ issues, and `grant all` would "
+        "add it along with REFERENCES and TRIGGER — the login role holds DML and "
+        "nothing else"
+    )
+
+
+def test_the_app_role_migration_carries_no_policies() -> None:
+    """The honest zero, asserted where the next reader would look for policies.
+
+    muse holds no account-scoped rows: neither table has an `account_id` column,
+    and `tests/test_tenant_scoping.py` holds the same negative for `src/`. So the
+    grant migration must not grow a policy, and `cafaye.protect_table` is not
+    called here — it raises `undefined_column` on a table with no `account_id`,
+    and its hint says a service holding no customer rows needs none of this. This
+    test exists so that "finish the job by adding RLS" is a red test rather than a
+    well-meant edit.
+    """
+    sql = sql_only("00003_app_role_grants.sql")
+    assert "policy" not in sql, (
+        "this migration grants privileges to the login role and writes no policy: "
+        "muse holds no account-scoped rows, so there is no predicate for one to "
+        "carry — and protect_table cannot be called on a table with no account_id"
+    )
+    assert "row level security" not in sql
 
 
 def test_outbox_table_matches_core() -> None:

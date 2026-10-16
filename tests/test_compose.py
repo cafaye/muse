@@ -264,9 +264,9 @@ def test_muses_database_is_declared_once_and_is_overridable() -> None:
 
 
 def test_the_service_reaches_the_cluster_by_service_name() -> None:
-    """`postgres:5432/muse`, with the password interpolated and the scheme unchanged.
+    """`muse_app@postgres:5432/muse`, password interpolated, scheme unchanged.
 
-    Three properties, and the last is the one a well-meaning edit breaks:
+    Four properties, and the last two are the ones a well-meaning edit breaks:
 
     - the HOST is the compose service name, not `db` and not `localhost`. muse runs
       on kit's `platform` network, and `localhost` inside a container is that
@@ -281,7 +281,20 @@ def test_the_service_reaches_the_cluster_by_service_name() -> None:
       another service* does: `identity` needs `?sslmode=disable` because Go's
       `lib/pq` defaults `sslmode` to `require`, and psycopg 3 defaults it to
       `prefer`. A parameter added here would be a no-op wearing the credit of a
-      decision, and the next reader would believe the cluster requires TLS.
+      decision, and the next reader would believe the cluster requires TLS;
+    - the ROLE is `muse_app`, and the OWNER is nowhere in this environment. kit's
+      cluster provisions both roles per service; `muse` owns every table and is
+      the role migrations run as, and `muse_app` owns nothing. This URL is the
+      application's, and until this assertion existed the test would have passed
+      unchanged with `muse` in front of the `:` — which is the defect
+      `tests/grant_surface_test.sh` records having found by hand, twice, in two
+      other services: a pool logged in as the owner, one `alter table … disable
+      row level security` away from a policy that means nothing. The owner's URL
+      still exists (`MUSE_MIGRATION_DATABASE_URL`, documented in the compose
+      header) and is deliberately NOT in this block: an owner DSN here would put
+      the migration credential and the request credential in the same
+      environment, one variable away from each other, and the running process is
+      exactly what the split exists to make weaker.
     """
     environment = compose_document()["services"]["muse"]["environment"]
     url = str(environment["MUSE_DATABASE_URL"])
@@ -298,6 +311,34 @@ def test_the_service_reaches_the_cluster_by_service_name() -> None:
         f"{url!r} changed scheme. psycopg accepts both spellings, so this breaks "
         "nothing — which is exactly why it must not drift away from the one muse's "
         "own tests and driver already use."
+    )
+    role = url.split("://", 1)[1].split(":", 1)[0]
+    assert role == "muse_app", (
+        f"MUSE_DATABASE_URL logs in as {role!r}, and the application must log in as "
+        "`muse_app`: `muse` owns every table, so as the owner this pool can drop "
+        "`vault_secrets` and can disable row level security on any table a later "
+        "change protects. The owner credential is the operator's "
+        "(MUSE_MIGRATION_DATABASE_URL) and this environment must not carry it."
+    )
+    assert "MUSE_MIGRATION_DATABASE_URL" not in environment, (
+        "the owner's DSN is in the service's environment. The split is the whole "
+        "point: the migration credential must not travel with the request "
+        "credential — see the note on MUSE_DATABASE_URL in docker-compose.yml."
+    )
+    owners = [
+        key
+        for key, value in environment.items()
+        if "postgres://muse:" in str(value) or "postgresql://muse:" in str(value)
+    ]
+    assert not owners, (
+        f"{owners} carry the OWNER role's URL. `muse` owns the database and every "
+        "table in it; only the operator's migration path may name it."
+    )
+    assert "MUSE_MIGRATION_DATABASE_URL" in compose_text(), (
+        "the owner's URL is not in the service's environment (correct) — and it "
+        "must still EXIST for the operator, named in this file's header: a service "
+        "that runs its own migrations cannot stop needing the owner credential, "
+        "and an owner URL documented nowhere is an owner URL nobody has."
     )
 
 

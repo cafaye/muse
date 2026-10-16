@@ -171,7 +171,7 @@ export MUSE_VAULT_KEY=$(uv run python -m muse.vault)
 export MUSE_IDENTITY_ISSUER=http://localhost:8901
 export MUSE_JWKS_URL=http://127.0.0.1:8901/.well-known/jwks.json
 export MUSE_IDENTITY_AUDIENCE=muse
-export MUSE_DATABASE_URL='postgres://muse:cafaye@localhost:15500/muse'   # kit's cluster
+export MUSE_DATABASE_URL='postgres://muse_app:cafaye@localhost:15500/muse'   # kit's cluster; the app role, not the owner
 
 uv run uvicorn --factory muse.main:create_app --port 8000
 ```
@@ -391,12 +391,15 @@ Without a stored key a route answers 503 naming `CredentialUnavailable` for ever
 candidate — a deploy mistake, reported as one, rather than a 401 from the vendor that
 reads like a wrong key.
 
-The tables come from this repository's two migrations, applied once against the
-database kit's init script provisioned:
+The tables come from this repository's three migrations, applied once — AS THE OWNER,
+which is what `MUSE_MIGRATION_DATABASE_URL` carries — against the database kit's init
+script provisioned. The service's own `MUSE_DATABASE_URL` is `muse_app`, which owns
+nothing and cannot create a table, so migrating with it fails at the first `create`.
 
 ```sh
-psql "$MUSE_DATABASE_URL" -f migrations/00001_outbox_events.sql
-psql "$MUSE_DATABASE_URL" -f migrations/00002_vault_secrets.sql
+psql "$MUSE_MIGRATION_DATABASE_URL" -f migrations/00001_outbox_events.sql
+psql "$MUSE_MIGRATION_DATABASE_URL" -f migrations/00002_vault_secrets.sql
+psql "$MUSE_MIGRATION_DATABASE_URL" -f migrations/00003_app_role_grants.sql
 ```
 
 ## 7. What this page has been checked against

@@ -544,6 +544,14 @@ def test_no_migration_carries_a_tenant_column():
         f"{path.name}: {line.strip()}"
         for path in sorted((REPO_ROOT / "migrations").glob("*.sql"))
         for line in path.read_text().splitlines()
+        # COMMENT LINES ARE NOT SCHEMA, and the scan reads the schema. A comment
+        # cannot carry a column, so a migration whose prose names the column it is
+        # explaining the absence of — `00003_app_role_grants.sql` does exactly
+        # that, to say why no policy is written here — would red this test without
+        # a tenant column existing anywhere. The property is unchanged: every
+        # executable line of every migration is still scanned, and there is no way
+        # to write `account_id` into DDL through a comment.
+        if not line.lstrip().startswith("--")
         if re.search(r"\baccount_id\b", line)
     ]
     assert not offenders, f"a migration introduced a tenant column: {offenders}"

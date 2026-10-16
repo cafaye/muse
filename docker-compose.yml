@@ -15,6 +15,14 @@
 #     -f ./docker-compose.yml exec -T postgres \
 #       psql -U muse -d muse < migrations/00001_outbox_events.sql
 #
+#   # …and the other two, in name order, the same way — as the OWNER, which is the
+#   # point rather than an oversight: `-U muse` is the role that owns every table,
+#   # and the URL the service itself runs with is `muse_app`, a login role that
+#   # owns nothing and cannot create a table. Host-side the same files apply with
+#   # the owner's URL: `psql "$MUSE_MIGRATION_DATABASE_URL" -f <the same path>`.
+#   #   migrations/00002_vault_secrets.sql
+#   #   migrations/00003_app_role_grants.sql
+#
 # `bin/dev` is what `billing`, `courier` and `identity` run, and it is kit's
 # `templates/bin/dev.sh` copied verbatim into each of them. **muse does not have
 # one yet.** Until it does, the two-file form above is the whole loop, and
@@ -106,6 +114,11 @@
 # WHAT THE REMOVAL BUYS, in the only terms that matter here: muse becomes a role
 # that owns one database and is refused at the door of the others.
 #
+# AND THE ROLE THE SERVICE LOGS IN AS IS NOT THAT ONE ANY MORE. `muse` owns the
+# database and applies the migrations; the running process logs in as
+# `muse_app`, which owns nothing. The note on `MUSE_DATABASE_URL` below is the
+# measurement and the reason.
+#
 #     $ psql "postgres://muse:<pw>@localhost:15500/muse" \
 #         -tAc "select rolname, rolsuper, rolcreatedb from pg_roles
 #                where rolname = 'muse'"
@@ -144,6 +157,7 @@
 #        # then, against the merged stack, with the migrations applied FIRST:
 #        docker compose … exec -T postgres psql -U muse -d muse < migrations/00001_outbox_events.sql
 #        docker compose … exec -T postgres psql -U muse -d muse < migrations/00002_vault_secrets.sql
+#        docker compose … exec -T postgres psql -U muse -d muse < migrations/00003_app_role_grants.sql
 #        docker compose … exec -T postgres \
 #          pg_restore -U muse -d muse --clean --if-exists < muse-17.dump
 #
@@ -329,13 +343,57 @@ services:
       # the developer and the host-side suite, and is not how the service reaches
       # its own database.
       #
-      # `muse:…` is the ROLE that `KIT_POSTGRES_DATABASES` above provisioned, and
-      # the `muse` at the end is that role's own database. The password is
-      # INTERPOLATED, and it used to be the literal `muse` to match the
-      # `POSTGRES_PASSWORD: muse` this file no longer sets. Every role
-      # `10-cluster.sh` creates takes the cluster's `POSTGRES_PASSWORD`, so that
-      # role's password is now kit's `${KIT_POSTGRES_PASSWORD:-cafaye}` and the
-      # pair this used to carry would have been a credential no role holds — an
+      # THE ROLE, AND IT IS `muse_app` RATHER THAN `muse`. kit's cluster provisions
+      # TWO roles for every name in `KIT_POSTGRES_DATABASES`: `muse` OWNS the
+      # database and every table in it and is the role the migrations are applied
+      # as; `muse_app` owns NOTHING and is the role the RUNNING SERVICE logs in
+      # as.
+      #
+      # WHY, when muse holds no customer rows to isolate: blast radius. The owner
+      # is the one role Postgres lets past its own row-level-security policies, and
+      # the one role that can DDL. As `muse` this process could
+      # `drop table vault_secrets` and take every provider credential the vault
+      # holds, and could `alter table … disable row level security` or
+      # `drop policy` on any table a later change protects. As `muse_app` it can
+      # do neither. Measured on the cluster this line was changed against:
+      #
+      #   $ psql "postgres://muse_app:<pw>@localhost:15500/muse" \
+      #       -tAc "alter table vault_secrets disable row level security"
+      #   ERROR:  must be owner of table vault_secrets
+      #
+      #   $ psql "postgres://muse_app:<pw>@localhost:15500/muse" \
+      #       -tAc "drop table vault_secrets"
+      #   ERROR:  must be owner of table vault_secrets
+      #
+      # `migrations/00003_app_role_grants.sql` — applied by that same shell as
+      # `muse` — is the whole of what `muse_app` may do: `select, insert, update`
+      # on `outbox_events`, `select, insert, update, delete` on `vault_secrets`,
+      # and no other verb on any object. A compromised connection string is then a
+      # login role that cannot unmake a policy, drop a table or truncate one.
+      #
+      # THE OWNER'S URL IS NOT IN THIS BLOCK, and that is a decision rather than
+      # an omission. A service that runs its own migrations cannot stop needing
+      # the owner credential, so there are TWO URLs and they are different roles:
+      #
+      #   MUSE_DATABASE_URL            this line — the APPLICATION's pool.
+      #   MUSE_MIGRATION_DATABASE_URL  the OWNER's — the credential for
+      #                                `psql "$MUSE_MIGRATION_DATABASE_URL" -f
+      #                                migrations/00003_app_role_grants.sql`
+      #                                (or the `exec -T postgres psql -U muse` form
+      #                                in the header). The operator exports it; it
+      #                                is never handed to this service.
+      #
+      # An owner DSN in this block would put the migration credential and the
+      # request credential in the same environment, one variable away from each
+      # other — and the running process is exactly the thing the split exists to
+      # make weaker. `identity`'s compose file states the same rule for the same
+      # reason, so this is the fleet's shape rather than muse's.
+      #
+      # The password is INTERPOLATED, and it used to be the literal `muse` to
+      # match the `POSTGRES_PASSWORD: muse` this file no longer sets. Every role
+      # `10-cluster.sh` creates takes the cluster's `POSTGRES_PASSWORD`, so BOTH
+      # roles' password is kit's `${KIT_POSTGRES_PASSWORD:-cafaye}` and the pair
+      # this used to carry would have been a credential no role holds — an
       # authentication failure at boot, not a security improvement. A cluster
       # password changed in `.env` cannot leave this file authenticating as a
       # password that no longer exists. (A password containing `@` or `/` will not
@@ -359,7 +417,7 @@ services:
       # this URL is the wrong place for it — it belongs in the `AsyncConnectionPool`
       # kwargs in `src/muse/db.py`. That is a change to the adapter and it is
       # deliberately NOT smuggled in here.
-      MUSE_DATABASE_URL: postgres://muse:${KIT_POSTGRES_PASSWORD:-cafaye}@postgres:5432/muse
+      MUSE_DATABASE_URL: postgres://muse_app:${KIT_POSTGRES_PASSWORD:-cafaye}@postgres:5432/muse
 
       # No default, on purpose. An empty value is a missing value, and muse treats a
       # missing key as a boot failure rather than a first-request failure.
