@@ -168,9 +168,7 @@ def _items(container: Any) -> list[tuple[str, Any]]:
     if isinstance(container, Sequence):
         return [(str(_read(answer, "name")), answer) for answer in container]
 
-    return [
-        (str(name), value) for name, value in getattr(container, "items", dict().items)()
-    ]
+    return [(str(name), value) for name, value in getattr(container, "items", dict().items)()]
 
 
 def _answer_fields(answer: Any) -> dict[str, Any]:
@@ -183,7 +181,6 @@ def _answer_fields(answer: Any) -> dict[str, Any]:
     if isinstance(answer, dict):
         return dict(answer)
     return dict(getattr(answer, "__dict__", {}))
-
 
 
 @dataclass(frozen=True, slots=True)

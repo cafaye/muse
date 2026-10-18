@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from datetime import datetime
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 #: Substrings the tests' queries are matched on. Kept as data so a renamed table or a

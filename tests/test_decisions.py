@@ -155,7 +155,10 @@ def test_a_choice_question_sent_with_choices_reaches_the_provider_with_them() ->
 
     (request,) = provider.decisions
     assert request.questions[0].choices == [{"value": "question"}, {"value": "feedback"}]
-    assert request.questions[0].as_wire()["choices"] == [{"value": "question"}, {"value": "feedback"}]
+    assert request.questions[0].as_wire()["choices"] == [
+        {"value": "question"},
+        {"value": "feedback"},
+    ]
 
 
 def _question(**overrides) -> DecisionQuestionBody:
@@ -359,7 +362,6 @@ async def test_the_outbox_publishes_the_decision_event() -> None:
     reading the row: a row that is in the table and cannot be rendered is a
     retained event nobody will ever receive, and that is invisible to a count.
     """
-    from muse.outbox import InMemoryTransport, OutboxPublisher
 
     database = FakeDatabase()
     async with asgi_client(app_for(answering(), database=database)) as client:
@@ -394,7 +396,9 @@ async def test_a_token_with_no_capability_is_a_403() -> None:
     interpret — which would be a 401 and would make this pass for the wrong
     reason."""
     async with asgi_client(app_for(answering())) as client:
-        response = await client.post(ROUTE, json=BODY, headers={"Authorization": f"Bearer {token(IDENTITY, scopes='')}"})
+        response = await client.post(
+            ROUTE, json=BODY, headers={"Authorization": f"Bearer {token(IDENTITY, scopes='')}"}
+        )
     assert response.status_code == 403
     assert response.json()["code"] == "forbidden"
 
@@ -546,7 +550,9 @@ async def test_a_failing_primary_falls_through_on_the_decisions_path() -> None:
         )
     )
     database = FakeDatabase()
-    async with asgi_client(build_test_app(registry=registry, database=database, table=table)) as client:
+    async with asgi_client(
+        build_test_app(registry=registry, database=database, table=table)
+    ) as client:
         response = await client.post(ROUTE, json=BODY, headers=AUTH_HEADERS)
 
     assert response.status_code == 200

@@ -681,17 +681,13 @@ async def test_a_decision_names_no_account_and_meters_once():
     database = FakeDatabase()
     async with asgi_client(app_for(database)) as client:
         for account in (ACCOUNT, OTHER_ACCOUNT, NO_SUCH_ACCOUNT):
-            response = await client.post(
-                "/v1/decisions", json=DECISION_BODY, headers=auth(account)
-            )
+            response = await client.post("/v1/decisions", json=DECISION_BODY, headers=auth(account))
             assert response.status_code == 200, f"/v1/decisions as {account}"
             assert account not in response.text, "the decision named the caller's account"
 
     assert len(database.outbox) == 3
     envelopes = {event["data"] for event in database.outbox}
-    assert len(envelopes) == 1, (
-        "one decision from three accounts metered three different ways"
-    )
+    assert len(envelopes) == 1, "one decision from three accounts metered three different ways"
 
 
 async def test_a_token_with_no_tenant_is_refused_rather_than_defaulted():

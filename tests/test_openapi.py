@@ -119,7 +119,12 @@ def test_a_non_breaking_addition_bumps_only_the_minor() -> None:
     assert document["info"]["version"] == "1.3.0"
     # The prefix is the API version and `/v1` was not mutated, so the major stays 1.
     assert document["info"]["version"].startswith("1.")
-    assert list(document["paths"]) == ["/v1/route", "/v1/chat/completions", "/v1/decisions", "/v1/models"]
+    assert list(document["paths"]) == [
+        "/v1/route",
+        "/v1/chat/completions",
+        "/v1/decisions",
+        "/v1/models",
+    ]
 
 
 def test_every_path_is_under_the_v1_prefix() -> None:
@@ -151,7 +156,12 @@ def test_the_documented_paths_are_exactly_the_three_muse_serves() -> None:
     and `GET /v1/models` arrived together with the alias packet, and the count is
     asserted rather than described so a fourth path has to be argued for.
     """
-    assert list(spec()["paths"]) == ["/v1/route", "/v1/chat/completions", "/v1/decisions", "/v1/models"]
+    assert list(spec()["paths"]) == [
+        "/v1/route",
+        "/v1/chat/completions",
+        "/v1/decisions",
+        "/v1/models",
+    ]
 
 
 def test_the_probe_endpoints_are_not_in_the_contract() -> None:

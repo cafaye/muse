@@ -35,7 +35,6 @@ from muse.errors import (
     ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
-    ProviderUnavailable,
     ResponseShapeError,
 )
 from muse.providers import (
@@ -794,7 +793,10 @@ async def test_a_decision_response_is_normalised_through_the_same_shape_checks()
     downstream can act on a partial result.
     """
     provider = make_provider(
-        decision={"answers": {"q1": {"type": "predicate", "predicate": 0.93}}, "usage": {"input_tokens": 12, "output_tokens": 4}}
+        decision={
+            "answers": {"q1": {"type": "predicate", "predicate": 0.93}},
+            "usage": {"input_tokens": 12, "output_tokens": 4},
+        }
     )
     served = await provider.decide(decide_ask())
 
@@ -837,7 +839,9 @@ async def test_a_decision_answer_that_is_not_a_mapping_is_read_as_fields() -> No
     fields rather than refusing, because litellm's own answer objects are the
     common case and a consumer written against litellm's docs expects to read
     `predicate` off it either way."""
-    provider = make_provider(decision={"answers": {"q1": object()}, "usage": {"input_tokens": 1, "output_tokens": 1}})
+    provider = make_provider(
+        decision={"answers": {"q1": object()}, "usage": {"input_tokens": 1, "output_tokens": 1}}
+    )
     served = await provider.decide(decide_ask())
 
     assert served.answers == {"q1": {}}
@@ -893,7 +897,9 @@ async def test_a_scripted_decision_error_is_raised_before_the_answer() -> None:
     is how the fallback tests are written — so the decisions half honours the same
     order the completions half does."""
     provider = ScriptedProvider(
-        name=OPENAI, errors=(ProviderUnavailable("primary is down"),), answers=({"type": "predicate", "predicate": 0.9},)
+        name=OPENAI,
+        errors=(ProviderUnavailable("primary is down"),),
+        answers=({"type": "predicate", "predicate": 0.9},),
     )
     ask = decide_ask()
 
@@ -924,13 +930,17 @@ def test_a_question_that_states_no_criteria_sends_neither_field() -> None:
 
     # The OpenAI dialect's own two option fields, carried through untouched.
     withchoices = DecisionsQuestion(
-        name="q1", type="choice", instructions="pick one",
+        name="q1",
+        type="choice",
+        instructions="pick one",
         choices=[{"value": "a"}, {"value": "b"}],
     )
     assert withchoices.as_wire()["choices"] == [{"value": "a"}, {"value": "b"}]
 
     withlevels = DecisionsQuestion(
-        name="q1", type="score", instructions="how much?",
+        name="q1",
+        type="score",
+        instructions="how much?",
         levels=["minor", "urgent"],
     )
     assert withlevels.as_wire()["levels"] == ["minor", "urgent"]
@@ -951,7 +961,7 @@ async def test_a_decision_answer_that_arrives_as_a_sequence_is_read_as_items() -
     answered. A read that silently returns nothing is the worst shape a helper
     can have.
     """
-    
+
     from litellm.types.decisions import OpenAIChoiceAnswer, OpenAIChoiceProbability
 
     provider = make_provider(
@@ -981,6 +991,7 @@ async def test_a_decision_answer_that_arrives_as_an_object_is_read_as_items() ->
     really returns and what the stub deliberately does not. The adapter normalises
     both through `_items` rather than assuming, because assuming is how it was burned
     the first time."""
+
     class Answers:
         def items(self):
             return [("q1", {"type": "predicate", "predicate": 0.9})]

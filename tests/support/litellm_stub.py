@@ -151,4 +151,3 @@ def make_stub(
     module.adecisions = adecisions  # type: ignore[attr-defined]
     module.get_model_info = get_model_info  # type: ignore[attr-defined]
     return module
-

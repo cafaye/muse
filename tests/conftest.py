@@ -17,9 +17,9 @@ import pytest
 import yaml
 
 from muse.main import VENDORS, create_app
-
 from muse.providers import ProviderRegistry
 from muse.providers.fake import FakeProvider
+
 from .support.jwks import token
 from .support.test_app import IDENTITY
 

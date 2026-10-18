@@ -41,7 +41,7 @@ from muse.errors import (
     RouteNotFound,
 )
 from muse.providers import Completion, Price, ProviderRegistry, UnregisteredProvider
-from muse.providers.fake import FakeProvider, ScriptedProvider
+from muse.providers.fake import ScriptedProvider
 from muse.redaction import Secret
 from muse.router import Router
 from muse.routes import (
@@ -758,7 +758,7 @@ def test_routes_load_from_yaml() -> None:
     )
     route = table.routes[0]
     assert route.model == "fast"
-    assert [candidate.provider for candidate in route.candidates][0] == "openai"
+    assert next(candidate.provider for candidate in route.candidates) == "openai"
 
 
 def test_a_candidate_without_a_model_inherits_the_routes_model() -> None:
