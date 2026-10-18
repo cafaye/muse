@@ -60,6 +60,7 @@ WORKDIR /app
 # on every start. Nothing ran the image; the suite never starts a server.
 COPY --chown=muse:muse config/ ./config/
 COPY --chown=muse:muse src/ ./src/
+COPY --chown=muse:muse migrations/ ./migrations/
 
 USER muse
 EXPOSE 8000
