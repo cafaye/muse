@@ -41,7 +41,7 @@ imagePullSecrets: muse-ghcr
 # value is rotated by replacing the secret and restarting the pods —
 # not by editing a generated file.
 secretName: muse-secrets
-migrationSecretName: muse-secrets
+migrationSecretName: muse-owner-secrets
 
 # How many copies of the service run. One is the default for a service
 # whose state is the cluster's, not the pod's; raise it when the
