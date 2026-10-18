@@ -154,7 +154,7 @@ info:
     email: muse@cafaye.com
 
 servers:
-  - url: https://muse.cafaye.com
+  - url: https://api.cafaye.com
     description: Production.
   - url: http://localhost:8000
     description: Local development.
