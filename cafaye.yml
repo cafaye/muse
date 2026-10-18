@@ -130,6 +130,18 @@ dependencies:
     version: ^0.1.0
     required: false
 
+env:
+  - name: MUSE_DATABASE_URL
+    required: true
+    secret: true
+    dev_default: "auto"
+    description: "Postgres DSN."
+  - name: MUSE_VAULT_KEY
+    required: true
+    secret: true
+    dev_default: "auto"
+    description: "Vault seal key, base64 32 bytes."
+
 repository:
   url: git@github.com:cafaye/muse.git
   defaultBranch: master

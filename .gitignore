@@ -29,3 +29,5 @@ coverage.json
 # --- local scratch (never committed) -------------------------------------
 tmp/
 *.log
+keyring/
+secrets/

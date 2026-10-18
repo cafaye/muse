@@ -576,3 +576,6 @@ Long commands get a `timeout`. Never push — the manager merges to `master`.
 `mise.toml` pins `python = "3.14"` and `uv = "0.12.20"`; `.python-version`
 pins 3.14. If a new interpreter release lands, bump `.python-version` and
 `mise.toml` together and re-run the gate.
+
+## Secrets
+- No `.env` files with values. Use `cafe secret set/get/list` (dev) and `cafe dev` (injects). See `docs/secrets.md`.
