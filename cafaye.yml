@@ -145,7 +145,7 @@ env:
 repository:
   url: git@github.com:cafaye/muse.git
   defaultBranch: master
-  visibility: public
+  visibility: private
 
 owner:
   team: muse

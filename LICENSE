@@ -1,66 +1,13 @@
-Business Source License 1.1
+Copyright (c) 2026 Cafaye. All rights reserved.
 
-Parameters
+This repository and its contents are the proprietary property of Cafaye.
+Access to this checkout alone grants no general permission to use, copy,
+modify, or redistribute it. Any rights beyond viewing exist only where a
+separate written Cafaye agreement expressly grants them.
 
-Licensor:             Cafaye
-Licensed Work:        muse
-Change Date:          2030-10-10
-Change License:       Apache-2.0
+Nothing here grants a right to use, copy, modify or redistribute any part of
+this repository, in source or binary form, for any purpose. There is no
+Business Source Licence in this file and no Change Date.
 
-Additional Use Grant: You may use the Licensed Work in production, on
-                      infrastructure you control, for your own products and
-                      services. You may not offer the Licensed Work, or a
-                      derivative of it, to third parties as a hosted or managed
-                      service that competes with a Cafaye offering.
-
-Notice
-
-The Business Source License (this document, or the "License") is not an Open
-Source license. However, the Licensed Work will eventually be made available
-under an Open Source License, as stated in this License.
-
-For more information on the Business Source License, please visit
-https://mariadb.com/bsl11/.
-
-Terms
-
-The Licensor hereby grants you the right to copy, modify, create derivative
-works, redistribute, and make non-production use of the Licensed Work. The
-Licensor may make an Additional Use Grant, above, permitting limited
-production use.
-
-Effective on the Change Date, or the fourth anniversary of the first publicly
-available distribution of a specific version of the Licensed Work under this
-License, whichever comes first, the Licensor hereby grants you rights under
-the terms of the Change License, and the rights granted in the paragraph
-above terminate.
-
-If your use of the Licensed Work does not comply with the requirements
-currently in effect as described in this License, you must purchase a
-commercial license from the Licensor, its affiliated entities, or authorized
-resellers, or you must refrain from using the Licensed Work.
-
-All copies of the original and modified Licensed Work, and derivative works
-of the Licensed Work, are subject to this License. Any distributed work based
-on the Licensed Work that you distribute must include the notice below.
-
-
-Notice
-
-  Business Source License 1.1
-
-  Parameters
-  ----------
-
-  Licensor:             Cafaye
-
-  Licensed Work:        muse
-  Change Date:          2030-10-10
-
-  Change License:       Apache-2.0
-
-  Additional Use Grant: (none)
-
-THE LICENSED WORK IS PROVIDED UNDER THE TERMS OF THIS BUSINESS SOURCE LICENSE
-AGREEMENT ("AGREEMENT"). ANY USE, REPRODUCTION OR DISTRIBUTION OF THE LICENSED
-WORK CONSTITUTES RECIPIENT'S ACCEPTANCE OF THIS AGREEMENT.
+Third-party components remain under their own licenses and notices, which
+are preserved in the applicable source files and manifests.
