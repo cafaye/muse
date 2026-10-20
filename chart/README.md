@@ -10,7 +10,7 @@ values commit edits.
 
 The chart is deployed by ArgoCD, pull-only, and the Application is
 not this chart's: the substrate owns it — one static Application
-per service, OCI-sourced, applied by install.sh (moon/DEPLOYMENT.md,
+per service, OCI-sourced, applied by install.sh (cafaye/notes/deployment.md,
 "Who owns the Application"). A service repository commits none.
 The only thing that can change the cluster is a commit: push a
 values commit, Argo syncs, the box agrees with git. A hand edit
