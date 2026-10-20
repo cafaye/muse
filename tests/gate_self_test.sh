@@ -46,7 +46,7 @@
 # rule is no sleeps, and a self-test whose runtime is thirteen suites is a
 # self-test nobody runs). It is NOT evidence that muse's gate works. That is
 # the other
-# half of this packet, run separately and recorded in REPORT-core-10-muse.md:
+# half of this packet, run separately and recorded in REPORT-core-10-muse:
 # `harness/bin/gate-check --prove .` against the REAL bin/prime, in both
 # directions. Read that report for the real counts; read this file for the
 # proof that the declaration can fail.

@@ -137,7 +137,7 @@ gate:
       # `1 failed, 972 passed`, and the one failure is
       # `test_the_vendored_schema_is_byte_identical_to_core` — PRE-EXISTING on
       # clean `d4d5128`, before this packet touched anything, reported in
-      # REPORT-gateway-rename-muse-01.md and deliberately not fixed here, because
+      # REPORT-gateway-rename-muse-01 and deliberately not fixed here, because
       # re-vendoring core's schema is core's call and not a rename's side effect.
       # 972 + 1 = 973 is the count when all four core-gated tests execute, which is
       # what this floor means.
@@ -300,7 +300,7 @@ gate:
     # `MUSE_CORE_SCHEMAS` in the `gate` job. `gate.ci-disagrees` reads the
     # workflow's `run:` bodies textually and an `env:` block is not in one,
     # so a workflow that dropped that variable would still pass this
-    # declaration's static phase. Named in REPORT-core-10-muse.md.
+    # declaration's static phase. Named in REPORT-core-10-muse.
 
 external:
   # false, and saying so is the point. `bin/prime` starts with

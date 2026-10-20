@@ -38,7 +38,7 @@ namespace. Two properties follow, and both are asserted rather than hoped for:
 
 `Meter` knows the caller's `account_id` and cannot write it, because core owns the
 payload schema. That is D9, recorded in `src/muse/metering.py` and in
-`REPORT-muse-09-isolation.md`. This suite asserts the absence is real *and named* —
+`REPORT-muse-09-isolation`. This suite asserts the absence is real *and named* —
 `test_a_metered_event_names_no_account` — rather than pretending the gap is closed. A
 test that implied it was closed would be the defect, not the coverage.
 """

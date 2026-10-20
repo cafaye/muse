@@ -728,7 +728,7 @@ Packet `muse-08`: the local stack moves from `postgres:18-alpine` to
 #### Findings — reported, not fixed, and deliberately so
 
 Both are **pre-existing and version-independent** — identical on 17 and on 18 —
-and neither is fixed here. See `REPORT-muse-08-pg17.md` for the reasoning and for
+and neither is fixed here. See `REPORT-muse-08-pg17` for the reasoning and for
 what a fix would have to decide.
 
 - **`OutboxPublisher` has never published a row against a real database.**
